@@ -1,0 +1,16 @@
+# Ripple: open this file in Blender's Text Editor (Text > Open) and pick it
+# on a BEX Wrangle node. Saving it from VS Code updates the nodes live.
+
+amp = chf("amplitude", 0.15)
+freq = chf("frequency", 6.0)
+speed = chf("speed", 2.0)
+
+d = length(@P)
+wave = sin(d * freq - @Time * speed)
+
+@P.z += wave * amp
+f@wave = fit(wave, -1, 1, 0, 1)
+
+if d > chf("radius", 1.5):
+    @P.z = 0
+    f@wave = 0

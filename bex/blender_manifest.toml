@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "bex"
+version = "0.1.0"
+name = "BEX"
+tagline = "VEX-style wrangle scripting for Geometry Nodes"
+maintainer = "Yonatan Bary"
+type = "add-on"
+tags = ["Geometry Nodes", "Node"]
+
+blender_version_min = "5.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+files = "Reload scripts that were edited and saved in an external editor"

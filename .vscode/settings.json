@@ -1,0 +1,15 @@
+{
+    "blender.executables": [
+        {
+            "path": "/Applications/Blender 5.2.app/Contents/MacOS/Blender",
+            "name": "Blender 5.2",
+            "isDebug": false
+        }
+    ],
+    "blender.addon.loadDirectory": "bex",
+    "blender.addon.sourceDirectory": "bex",
+    "blender.addon.reloadOnSave": true,
+    "files.associations": {
+        "*.bex": "python"
+    }
+}
