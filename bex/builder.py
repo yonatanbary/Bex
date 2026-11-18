@@ -34,7 +34,7 @@ def _set_default(sock, const):
 
 def sync_interface(tree, program, keep_stale=False):
     """Make the group's sockets match the script: the Geometry in/out, the three
-    extra geometry inputs "Input 1"-"Input 3" (always there, like a wrangle's four
+    extra geometry inputs "Input 2"-"Input 4" (always there, like a wrangle's four
     inputs), and the script's ch*() inputs.
 
     Sockets whose name and type are unchanged are kept, so links and values on
@@ -116,8 +116,8 @@ def build(tree, program, domain, keep_stale=False):
         return next(s for s in group_in.outputs if s.identifier == idents[("INPUT", name)])
 
     def geometry(n):
-        """Geometry input n: 0 is the node's Geometry, 1-3 are "Input N"."""
-        return group_input("Geometry" if n == 0 else f"Input {n}")
+        """Geometry input n: 0 is the node's Geometry, 1-3 are "Input 2"-"Input 4"."""
+        return group_input("Geometry" if n == 0 else INPUT_SOCKETS[n - 1])
 
     captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
 

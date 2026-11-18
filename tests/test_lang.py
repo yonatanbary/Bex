@@ -362,7 +362,7 @@ def test_other_inputs():
     fails('f@a = point(1, a, 0)', "attribute name in quotes")
     fails("@opinput1_P = 1", "cannot be written")
     fails("@numpt = 1", "read-only")
-    fails('chf("Input 1")', "cannot be used")
+    fails('chf("Input 2")', "cannot be used")
 
 
 if __name__ == "__main__":

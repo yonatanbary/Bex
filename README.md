@@ -88,8 +88,9 @@ else updates by event, with no polling.
 | Constants | `PI` / `pi`, `TAU` / `tau` |
 
 Inputs work like a Houdini wrangle's: the node has four geometry inputs, **Geometry** (input 0)
-and **Input 1**–**Input 3**. Only input 0 flows through to the output; the others are read with
-the functions above. Input 0 always means the geometry as it entered the node.
+and **Input 2**–**Input 4**. Sockets count from 1, like Houdini's input labels, while scripts count from 0
+as in VEX: `point(1, …)` reads **Input 2**. Only Geometry flows through to the output; the others are
+read with the functions above. Input 0 always means the geometry as it entered the node.
 
 Functions that take several nodes (the bounding box ones) build a node group, such as
 **BEX Relative Bounding Box**, instead of loose nodes. These are ordinary node groups:

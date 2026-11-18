@@ -52,7 +52,7 @@ def close(a, b, eps=1e-4):
 def test_position_and_channels():
     obj, node, text = make_setup('@P.z = sin(@P.x * chf("freq", 2.0)) * chf("amp", 0.5); @P.x += 1;')
     assert node.error == "", node.error
-    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "Input 1", "Input 2", "Input 3", "freq", "amp"], [s.name for s in node.inputs]
+    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "Input 2", "Input 3", "Input 4", "freq", "amp"], [s.name for s in node.inputs]
     mesh = evaluate(obj)
     for (x, y, z), v in zip(original_points(obj), mesh.vertices):
         assert close(v.co, (x + 1, y, math.sin(x * 2.0) * 0.5)), (tuple(v.co), x, y)
@@ -646,7 +646,7 @@ def test_write_plan():
 def test_other_inputs():
     obj, node, text = make_setup("f@m = 1")
     points = original_points(obj)
-    # Input 1: the same grid, moved up by 3 and with an attribute.
+    # Input 1 (the socket "Input 2"): the same grid, moved up by 3 and with an attribute.
     other = bpy.data.objects.new("Other", obj.data.copy())
     bpy.context.collection.objects.link(other)
     other.location.z = 3
@@ -657,12 +657,12 @@ def test_other_inputs():
                      'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
     node.sync()
     assert node.error == "", node.error
-    geometry_inputs = ["Geometry", "Input 1", "Input 2", "Input 3"]
+    geometry_inputs = ["Geometry", "Input 2", "Input 3", "Input 4"]
     assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
     tree = node.id_data
     info = tree.nodes.new("GeometryNodeObjectInfo")
     info.inputs["Object"].default_value = other
-    tree.links.new(info.outputs["Geometry"], node.inputs["Input 1"])
+    tree.links.new(info.outputs["Geometry"], node.inputs["Input 2"])
     mesh = evaluate(obj)
     count = len(points)
     for i, v in enumerate(mesh.vertices):
@@ -675,7 +675,7 @@ def test_other_inputs():
     text.from_string('f@m = chf("amount", 1)')
     node.sync()
     assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
-    assert node.inputs[1].name == "Input 1" and node.inputs[1].is_linked and node.inputs[4].name == "amount"
+    assert node.inputs[1].name == "Input 2" and node.inputs[1].is_linked and node.inputs[4].name == "amount"
 
 
 class pytest_approx(float):

@@ -199,7 +199,8 @@ BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox
 MAX_INPUT = 3
 SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
 COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
-INPUT_SOCKETS = tuple(f"Input {n}" for n in range(1, MAX_INPUT + 1))  # their socket names
+# Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
+INPUT_SOCKETS = tuple(f"Input {n + 1}" for n in range(1, MAX_INPUT + 1))
 OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
 
 FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset({
@@ -411,7 +412,8 @@ class Compiler:
     def input_number(self, v, fn):
         """The geometry input a function reads: a constant 0-3 (1-3 are recorded in `inputs`)."""
         if not (v.is_const and v.type == "int" and 0 <= v.const <= MAX_INPUT):
-            raise self.err(f"{fn}()'s first argument is the input number: 0 (this node's geometry), 1, 2 or 3")
+            raise self.err(f"{fn}()'s first argument is the input number: 0 (Geometry), "
+                           f"or 1, 2, 3 for the sockets Input 2, Input 3, Input 4")
         if v.const and v.const not in self.inputs:
             self.inputs.append(v.const)
         return v.const
