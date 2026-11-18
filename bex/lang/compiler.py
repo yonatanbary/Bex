@@ -55,6 +55,19 @@ class Program:
     group: object = None  # Val (bool) choosing the elements to write, None = all
     group_source: str = ""  # the Group expression, used to label its nodes
     warnings: list = field(default_factory=list)  # problems that don't stop the build (a bad Group)
+    stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
+    captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
+
+
+@dataclass
+class Store:
+    """One write node: Store Named Attribute, or Set Position for `P`."""
+    name: str
+    type: str
+    value: Val  # the value to write (Set Position: the Offset when `offset`)
+    selection: object = None  # bool Val: which elements are written, None = all
+    conds: list = field(default_factory=list)  # the bool Vals ANDed into `selection` (Group first)
+    offset: bool = False  # Set Position: `value` goes into Offset, not Position
 
 
 # Built-in attributes that read from a field node instead of a named attribute.
@@ -707,6 +720,132 @@ class Compiler:
                 prog.writes.append((name, type, val))
         return prog
 
+    # -- write plan ---------------------------------------------------------
+    # Every written value means "computed from the incoming geometry". The write
+    # nodes run one after another, so a value only needs a Capture when it reads
+    # something an earlier write node in the chain has already changed.
+
+    def plan_stores(self, prog, group=None):
+        """Fill `prog.stores` and `prog.captures` from `prog.writes`."""
+        written = {name for name, _, _ in prog.writes}
+        for name, type, val in prog.writes:
+            conds = [] if group is None else [group]
+            val = self._peel_selection(name, type, val, conds)
+            store = Store(name, type, val, conds=conds)
+            if name == "P" and "position" not in written:
+                off = self._position_offset(val)
+                if off is not None:
+                    store.value, store.offset = off, True
+            store.selection = self._and_all(conds)
+            prog.stores.append(store)
+        # Set Position goes last: nothing after it sees the moved points.
+        prog.stores.sort(key=lambda st: st.name == "P")
+        changed, seen = set(), set()
+        for st in prog.stores:
+            units = [(("@" + st.name) + (" offset" if st.offset else ""), st.type, st.value)]
+            units += [("Group" if group is not None and c is group else f"@{st.name} if", "bool", c)
+                      for c in st.conds]
+            for label, type, val in units:
+                key = (val.node, val.out)
+                if not val.is_const and key not in seen and _reads(val) & changed:
+                    seen.add(key)
+                    prog.captures.append((label, type, val))
+            changed |= _changes(st.name)
+
+    def _peel_selection(self, name, type, val, conds):
+        """`select(c, v, original)` writes `v` where `c`, which is the write node's
+        Selection: no Switch, no read of the old value."""
+        orig = self.read_original(name, type)
+        while not val.is_const and val.node.kind == "switch":
+            c, f, t = val.node.inputs
+            self.stmt_line = val.node.line
+            if _same(f, orig):
+                conds.append(c)
+                val = t
+            elif _same(t, orig):
+                conds.append(self.node("bmath", "bool", (c,), op="NOT"))
+                val = f
+            else:
+                break
+        return val
+
+    def _position_offset(self, val):
+        """The offset when `val` is the position plus something (`@P += x`,
+        `@P.z -= 1`), so Set Position's Offset input does the adding."""
+        if val.is_const:
+            return None
+        n, pos = val.node, self.read_original("P", "vector")
+        self.stmt_line = n.line
+        if n.kind == "vmath" and n.params.get("op") in ("ADD", "SUBTRACT"):
+            a, b = n.inputs
+            if _same(a, pos):
+                return b if n.params["op"] == "ADD" else self.negate(b)
+            if _same(b, pos) and n.params["op"] == "ADD":
+                return a
+            return None
+        if n.kind != "combine":
+            return None
+        parts = []
+        for i, c in enumerate(n.inputs):
+            if _is_component(c, pos, i):
+                parts.append(Val("float", 0.0))
+            elif not c.is_const and c.node.kind == "math" and c.node.params.get("op") in ("ADD", "SUBTRACT"):
+                a, b = c.node.inputs
+                self.stmt_line = c.node.line
+                if _is_component(a, pos, i):
+                    parts.append(b if c.node.params["op"] == "ADD" else self.negate(b))
+                elif _is_component(b, pos, i) and c.node.params["op"] == "ADD":
+                    parts.append(a)
+                else:
+                    return None
+            else:
+                return None
+        self.stmt_line = n.line
+        return self.combine(parts)
+
+    def _and_all(self, conds):
+        sel = None
+        for c in conds:
+            if not c.is_const:
+                self.stmt_line = c.node.line or self.stmt_line
+            sel = c if sel is None else self.logic("and", sel, c)
+        return sel
+
+
+def _same(a, b):
+    """The same node output (types may differ after an implicit conversion)."""
+    return not a.is_const and not b.is_const and a.node is b.node and a.out == b.out
+
+
+def _is_component(v, vec, i):
+    return not v.is_const and v.node.kind == "separate" and v.out == i and _same(v.node.inputs[0], vec)
+
+
+def _changes(name):
+    """Attribute names a write node changes, as `_reads` spells them."""
+    return {"P", "position"} if name in ("P", "position") else {name}
+
+
+# What each built-in input node reads from the geometry.
+_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"}}
+
+
+def _reads(val):
+    """Attribute names `val` reads from the geometry it is evaluated on.
+    Library groups measure the incoming geometry, so only their inputs count."""
+    found, seen, stack = set(), set(), [val.node]
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        if n.kind == "attr":
+            found.add(n.params["name"])
+        elif n.kind == "input":
+            found |= _INPUT_READS.get(n.params["name"], set())
+        stack.extend(v.node for v in n.inputs)
+    return found
+
 
 def _mark_groups(e):
     """In the Group field, a name used as a whole condition (`top`, `@top`,
@@ -754,4 +893,5 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
     prog = c.program()
     prog.source = src.splitlines()
     prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings
+    c.plan_stores(prog, selection)
     return prog

@@ -110,9 +110,13 @@ def build(tree, program, domain, keep_stale=False):
     def group_input(name):
         return next(s for s in group_in.outputs if s.identifier == idents[("INPUT", name)])
 
+    captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
+
     def connect(val, sock):
         if val.is_const:
             _set_default(sock, val.const)
+        elif (val.node, val.out) in captured:
+            links.new(captured[(val.node, val.out)], sock)
         else:
             links.new(realize(val.node)[val.out], sock)
 
@@ -243,49 +247,38 @@ def build(tree, program, domain, keep_stale=False):
             return [n.outputs[0], n.outputs[1]]
         raise RuntimeError(f"BEX builder: unknown IR node '{kind}'")
 
-    # -- geometry chain: capture every new value on the *input* geometry, then write.
+    # -- geometry chain: capture the values that need it (Program.captures) on the
+    # *input* geometry, then one write node per Program.stores entry.
     geo = group_input("Geometry")
-    fields = [(name, type, val) for name, type, val in program.writes if not val.is_const]
-    group = program.group
-    # Later writes see an already changed geometry, so the group is measured first too.
-    capture_group = group is not None and not group.is_const and len(program.writes) > 1
-    items = [("@" + name, type, val) for name, type, val in fields]
-    if capture_group:
-        items.append(("Group", "bool", group))
-    captured = {}  # item label -> captured output
-    if len(items) > 1 or capture_group:
+    if program.captures:
         cap = new("GeometryNodeCaptureAttribute")
         cap.domain = domain
         links.new(geo, cap.inputs["Geometry"])
-        for i, (label, type, val) in enumerate(items):
+        for i, (label, type, val) in enumerate(program.captures):
             cap.capture_items.new(SOCKET_TYPE[type], label)
             connect(val, cap.inputs[2 + i])
-            captured[label] = cap.outputs[2 + i]
+        # From here on these values come from the Capture node.
+        for i, (_, _, val) in enumerate(program.captures):
+            captured[(val.node, val.out)] = cap.outputs[2 + i]
         geo = cap.outputs["Geometry"]
 
-    for name, type, val in program.writes:
-        if name == "P":
+    for st in program.stores:
+        if st.name == "P":
             n = new("GeometryNodeSetPosition")
-            target = n.inputs["Position"]
+            if st.offset:
+                connect(st.value, n.inputs["Offset"])
+            else:
+                connect_field(st.value, n.inputs["Position"])
         else:
             n = new("GeometryNodeStoreNamedAttribute")
-            n.data_type = ATTR_TYPE[type]
+            n.data_type = ATTR_TYPE[st.type]
             n.domain = domain
-            n.inputs["Name"].default_value = name
-            n.label = "@" + name
-            target = _enabled(n.inputs, "Value")[0]
+            n.inputs["Name"].default_value = st.name
+            n.label = "@" + st.name
+            connect(st.value, _enabled(n.inputs, "Value")[0])
         links.new(geo, n.inputs["Geometry"])
-        if "@" + name in captured:
-            links.new(captured["@" + name], target)
-        elif name == "P":
-            connect_field(val, target)
-        else:
-            connect(val, target)
-        if group is not None:  # only the Group's elements are written
-            if "Group" in captured:
-                links.new(captured["Group"], n.inputs["Selection"])
-            else:
-                connect(group, n.inputs["Selection"])
+        if st.selection is not None:
+            connect(st.selection, n.inputs["Selection"])
         geo = n.outputs["Geometry"]
 
     links.new(geo, next(s for s in group_out.inputs if s.identifier == idents[("OUTPUT", "Geometry")]))

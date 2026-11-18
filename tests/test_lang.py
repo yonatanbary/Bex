@@ -282,6 +282,63 @@ def test_group_prefix_in_scripts():
     fails("f@group_top = 1", "is a group")
 
 
+def plan(src, group=""):
+    p = compile_source(src, group=group)
+    return {st.name: st for st in p.stores}, [label for label, _, _ in p.captures], p
+
+
+def test_write_plan_selection():
+    # A conditional write uses the write node's Selection: no Switch, no read of the old value.
+    st, caps, _ = plan("if @P.z > 0:\n    f@m = 1")
+    assert st["m"].value.const == 1.0 and st["m"].selection.node.kind == "compare" and caps == []
+    # Written only in the else branch: Selection is NOT the condition.
+    st, _, _ = plan("if @P.z > 0:\n    pass\nelse:\n    f@m = 1")
+    assert st["m"].value.const == 1.0 and st["m"].selection.node.params["op"] == "NOT"
+    # Nested ifs AND their conditions; the Group comes first.
+    st, _, _ = plan("if @P.z > 0:\n    if @P.x > 0:\n        f@m = 1", group="@P.y > 0")
+    sel = st["m"].selection
+    assert st["m"].value.const == 1.0 and len(st["m"].conds) == 3 and sel.node.params["op"] == "AND"
+    # Written in both branches: still a Switch.
+    st, _, _ = plan("if @P.z > 0:\n    f@m = 1\nelse:\n    f@m = 2")
+    assert st["m"].value.node.kind == "switch" and st["m"].selection is None
+
+
+def test_write_plan_position_offset():
+    for src in ("@P += @N * 0.5", "@P = @N * 0.5 + @P", "@P.z += 1", "@P.z = @P.z - 1",
+                "v = @P\nv.x += @ptnum\n@P = v"):
+        st, _, _ = plan(src)
+        assert st["P"].offset, src
+    st, _, _ = plan("@P.z += 1")
+    assert st["P"].value.const == (0.0, 0.0, 1.0)
+    st, _, _ = plan("@P -= (1, 2, 3)")
+    assert st["P"].offset and st["P"].value.const == (-1.0, -2.0, -3.0)
+    st, _, _ = plan("if @P.x > 0:\n    @P.z += 1")
+    assert st["P"].offset and st["P"].value.const == (0.0, 0.0, 1.0) and st["P"].selection is not None
+    for src in ("@P = @P * 2", "@P.z = 1 - @P.z", "@P = @N"):
+        st, _, _ = plan(src)
+        assert not st["P"].offset, src
+
+
+def test_write_plan_captures_only_when_needed():
+    # Independent writes need no Capture; Set Position goes last.
+    st, caps, p = plan("@P.z += 1\nf@a = @P.x\nf@b = @N.y")
+    assert caps == [] and [s.name for s in p.stores] == ["a", "b", "P"]
+    # A value read before an earlier write changed it is captured (only that one).
+    _, caps, _ = plan("t = @a\nf@a = 5\nf@b = t\nf@c = @P.x")
+    assert caps == ["@b"]
+    # The swap: the second write reads what the first changed.
+    _, caps, _ = plan("t = @a\n@a = @b\n@b = t")
+    assert caps == ["@b"]
+    # Set Position reading an attribute stored before it.
+    _, caps, _ = plan("t = @a\nf@a = 1\n@P.z = t")
+    assert caps == ["@P"]
+    # The Group is captured once it reads something a write before it changed.
+    _, caps, _ = plan("b@top = False\nf@x = 5", group="top")
+    assert caps == ["Group"]
+    _, caps, _ = plan("f@x = 5\nf@y = 6", group="top")
+    assert caps == []
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

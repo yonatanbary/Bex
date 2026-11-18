@@ -585,6 +585,71 @@ def test_layout_has_no_overlaps():
         assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
 
 
+def test_write_plan():
+    def kinds(node):
+        return [n.bl_idname for n in node.node_tree.nodes]
+
+    def attr(mesh, name):
+        return [d.value for d in mesh.attributes[name].data]
+
+    obj, node, text = make_setup("f@m = @P.x")
+    points = original_points(obj)
+    # A conditional write keeps the old values where the condition is false.
+    text.from_string("f@m = @P.x\nif @P.y > 0:\n    f@m = 7")
+    node.sync()
+    assert node.error == "", node.error
+    assert attr(evaluate(obj), "m") == [pytest_approx(7.0 if y > 0 else x) for x, y, z in points]
+    # Upstream value on another domain: an earlier wrangle writes m per face.
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.domain = "FACE"
+    first.script.from_string("f@m = 3")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("if @P.y > 0:\n    f@m = 7")
+    node.sync()
+    mesh = evaluate(obj)
+    assert mesh.attributes["m"].domain == "POINT"
+    assert attr(mesh, "m") == [pytest_approx(7.0 if y > 0 else 3.0) for x, y, z in points]
+    tree.links.new(gin.outputs[0], node.inputs[0])
+    tree.nodes.remove(first)
+    # @P += x is one Set Position with Offset; under an if it uses Selection.
+    text.from_string("if @P.x > 0:\n    @P.z += 2")
+    node.sync()
+    setpos = next(n for n in node.node_tree.nodes if n.bl_idname == "GeometryNodeSetPosition")
+    assert "GeometryNodeSwitch" not in kinds(node) and not setpos.inputs["Position"].is_linked
+    assert tuple(setpos.inputs["Offset"].default_value) == (0, 0, 2) and setpos.inputs["Selection"].is_linked
+    mesh = evaluate(obj)
+    for v, (x, y, z) in zip(mesh.vertices, points):
+        assert close(v.co, (x, y, z + (2 if x > 0 else 0))), (tuple(v.co), x)
+    # Independent writes: no Capture. A value read before its attribute changed: captured.
+    text.from_string("f@a = @P.x\n@P.z = 1\nf@b = @P.y")
+    node.sync()
+    assert "GeometryNodeCaptureAttribute" not in kinds(node)
+    mesh = evaluate(obj)
+    assert attr(mesh, "a") == [pytest_approx(x) for x, y, z in points]
+    assert attr(mesh, "b") == [pytest_approx(y) for x, y, z in points]
+    # A value read before its attribute changed is captured: @a comes from an earlier wrangle.
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("f@a = @P.x")
+    first.sync(force=True)
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("t = @a\nf@a = 5\nf@c = t")
+    node.sync()
+    assert "GeometryNodeCaptureAttribute" in kinds(node)
+    mesh = evaluate(obj)
+    assert attr(mesh, "c") == [pytest_approx(x) for x, y, z in points] and set(attr(mesh, "a")) == {5.0}
+
+class pytest_approx(float):
+    def __eq__(self, other):
+        return abs(self - other) < 1e-4
+
+    __hash__ = float.__hash__
+
+
 failed = 0
 for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("test_")):
     try:
