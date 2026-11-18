@@ -74,17 +74,22 @@ else updates by event, with no polling.
 | Syntax | Python: indented blocks after `:`, `#` comments, one statement per line (`;` also separates). No declarations: `x = 1` creates a variable, its type follows the value; `x: int = 2.7` converts |
 | Types | `float` `int` `vector` `bool`, `True` `False` |
 | Attributes | `@name` (float by default), `f@` `i@` `v@` `b@` to set the type. `@group_name` is the bool attribute `name`, as in Houdini |
-| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@index`) `@id` `@Time` `@Frame` |
+| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@index`) `@id` `@Time` `@Frame`, `@numpt` `@numprim` `@numvtx` (element counts) |
 | Node properties | `chf("name", default)` `chi` `chv` `chb` |
 | Vectors | `(x, y, z)` or `[x, y, z]`, `vector(x, y, z)`, `.x .y .z` (`.r .g .b`, `.0 .1 .2`), `v[0]` … `v[-1]` |
 | Operators | `+ - * / // % **` (`/` always divides exactly, `//` floors), comparisons (chains like `0 < x <= 1`), `and or not`, `a if cond else b`, `+= -= *= /= //= %= **=` |
 | Control flow | `if / elif / else` (becomes a per-element Switch), `for i in range(n)` and `while` (unrolled; the range / condition must be known at compile time), `pass` |
 | Math | `sin cos tan asin acos atan atan2 sinh cosh tanh sqrt pow exp log log10 abs floor ceil round trunc frac sign mod min max clamp snap pingpong radians degrees` |
 | Mapping | `lerp/mix fit efit fit01 fit11 smoothstep/smooth smootherstep wrap(x, lo, hi)`. `fit` and `wrap` also take vectors (per component) |
-| Bounding box | `getbbox_min() getbbox_max() getbbox_size() getbbox_center() relbbox(p)` (0–1 inside the box). Of the geometry entering the node; `getbbox_min(0)` also works, as in VEX |
+| Bounding box | `getbbox_min() getbbox_max() getbbox_size() getbbox_center() relbbox(p)` (0–1 inside the box). Of the geometry entering the node; `getbbox_max(1)` measures input 1 |
+| Other inputs | `point(1, "P", i)` `prim(1, "f@area", i)` `vertex(…)`: an attribute of element `i` on an input (type from the prefix in the name, else float; `P`/`N` are vectors). `@opinput1_name`: the same element number on input 1. `npoints(1)` `nprims(1)` `nvertices(1)`, `nearpoint(1, pos)` |
 | Vector | `length distance dot cross normalize` |
 | Random | `noise(p)` `vnoise(p)` `rand(seed)` `vrand(seed)` |
 | Constants | `PI` / `pi`, `TAU` / `tau` |
+
+Inputs work like a Houdini wrangle's: input 0 is the node's **Geometry**, and using input 1, 2 or 3
+adds an **Input N** socket to the node (it goes away when the script stops using it). Input 0
+always means the geometry as it entered the node.
 
 Functions that take several nodes (the bounding box ones) build a node group, such as
 **BEX Relative Bounding Box**, instead of loose nodes. These are ordinary node groups:

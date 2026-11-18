@@ -88,7 +88,10 @@ def _from_output(node, socket, tree, stack, seen, depth):
     if idname == "GeometryNodeObjectInfo":
         obj = node.inputs["Object"].default_value if not node.inputs["Object"].is_linked else None
         return _object_attributes(obj) if obj else {}
-    found = upstream()
+    if idname == "GeometryNodeBexWrangle":  # passes on its Geometry, not "Input 1"...
+        found = _from_input(node.inputs[0], tree, stack, seen, depth)
+    else:
+        found = upstream()
     if idname == "GeometryNodeStoreNamedAttribute":
         name = _const(node.inputs.get("Name"))
         if name:

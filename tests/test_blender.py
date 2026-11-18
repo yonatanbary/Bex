@@ -643,6 +643,39 @@ def test_write_plan():
     mesh = evaluate(obj)
     assert attr(mesh, "c") == [pytest_approx(x) for x, y, z in points] and set(attr(mesh, "a")) == {5.0}
 
+def test_other_inputs():
+    obj, node, text = make_setup("f@m = 1")
+    points = original_points(obj)
+    # Input 1: the same grid, moved up by 3 and with an attribute.
+    other = bpy.data.objects.new("Other", obj.data.copy())
+    bpy.context.collection.objects.link(other)
+    other.location.z = 3
+    for i, v in enumerate(other.data.vertices):
+        v.co.z = i * 0.5
+    other.data.attributes.new("w", "FLOAT", "POINT").data.foreach_set("value", [i * 2.0 for i in range(len(points))])
+    text.from_string('@P.z = point(1, "P", @ptnum).z\nf@w = @opinput1_w\ni@n = npoints(1)\n'
+                     'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
+    node.sync()
+    assert node.error == "", node.error
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == ["Geometry", "Input 1"]
+    tree = node.id_data
+    info = tree.nodes.new("GeometryNodeObjectInfo")
+    info.inputs["Object"].default_value = other
+    tree.links.new(info.outputs["Geometry"], node.inputs["Input 1"])
+    mesh = evaluate(obj)
+    count = len(points)
+    for i, v in enumerate(mesh.vertices):
+        assert abs(v.co.z - i * 0.5) < 1e-4  # Object Info is in local space (Original)
+    assert [d.value for d in mesh.attributes["w"].data] == [i * 2.0 for i in range(count)]
+    assert {d.value for d in mesh.attributes["n"].data} == {count}
+    assert {d.value for d in mesh.attributes["near"].data} == {count - 1}  # the highest point
+    assert all(close(d.vector, (1, 1, (count - 1) * 0.5)) for d in mesh.attributes["top"].data)
+    # The socket goes away when the script stops using it.
+    text.from_string("f@m = 1")
+    node.sync()
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == ["Geometry"]
+
+
 class pytest_approx(float):
     def __eq__(self, other):
         return abs(self - other) < 1e-4

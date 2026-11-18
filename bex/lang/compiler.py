@@ -9,9 +9,10 @@ the end of the script.
 """
 
 import math
+import re
 from dataclasses import dataclass, field
 
-from .lexer import BexError
+from .lexer import _PREFIX_TYPES, BexError
 from .parser import N, parse, parse_group
 
 MAX_LOOP_ITERATIONS = 1024
@@ -55,6 +56,7 @@ class Program:
     group: object = None  # Val (bool) choosing the elements to write, None = all
     group_source: str = ""  # the Group expression, used to label its nodes
     warnings: list = field(default_factory=list)  # problems that don't stop the build (a bad Group)
+    inputs: list = field(default_factory=list)  # extra geometry inputs used (1-3), sorted
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
 
@@ -83,7 +85,9 @@ BUILTINS = {
     "Time": ("float", "time", 0),
     "Frame": ("float", "time", 1),
 }
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame"}
+# Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
+COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
+READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
 
 
@@ -190,11 +194,20 @@ CHANNELS = {"chf": "float", "chi": "int", "chv": "vector", "chb": "bool"}
 # is the input number, as in VEX (only input 0 exists).
 BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox")
 # Every function name Compiler.call accepts (used by the editor's highlighter). Keep in sync with call().
+# Geometry inputs, like a wrangle's four: 0 is the incoming geometry, 1-3 are extra
+# Geometry sockets that appear when the script uses them.
+MAX_INPUT = 3
+SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
+COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
+INPUT_SOCKETS = tuple(f"Input {n}" for n in range(1, MAX_INPUT + 1))  # their socket names
+OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
+
 FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset({
     "log", "log10", "clamp", "lerp", "mix", "fit", "efit", "fit01", "fit11", "smoothstep",
     "length", "normalize", "dot", "cross", "distance", "set", "vector", "float", "bool", "int",
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
-}) | frozenset(BBOX)
+    "nearpoint",
+}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS)
 
 
 class Compiler:
@@ -217,6 +230,7 @@ class Compiler:
         self.line = 0  # line used for error messages
         self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
         self.bare_attributes = False
+        self.inputs = []  # extra geometry inputs (1-3) the script reads, first-use order
 
     # -- IR construction ---------------------------------------------------
     def err(self, msg):
@@ -384,21 +398,67 @@ class Compiler:
         """Bounding box of the incoming geometry: getbbox_min/max/size/center(), relbbox(p)."""
         n = 1 if name == "relbbox" else 0
         want(n, n + 1)
+        geo = 0
         if len(a) == n + 1:
-            if not (a[0].is_const and a[0].type == "int" and a[0].const == 0):
-                raise self.err(f"{name}() reads the node's input geometry, so its first argument can only be 0")
+            geo = self.input_number(a[0], name)
             a = a[1:]
         if name == "relbbox":
-            return self.node("group", "vector", (self.conv(a[0], "vector"),), name="relbbox")
+            return self.node("group", "vector", (self.conv(a[0], "vector"),), name="relbbox", input=geo)
         out = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center").index(name)
-        return self.node("group", "vector", (), out=out, name="bbox")
+        return self.node("group", "vector", (), out=out, name="bbox", input=geo)
+
+    # -- other inputs ---------------------------------------------------------
+    def input_number(self, v, fn):
+        """The geometry input a function reads: a constant 0-3. Using 1-3 adds that socket."""
+        if not (v.is_const and v.type == "int" and 0 <= v.const <= MAX_INPUT):
+            raise self.err(f"{fn}()'s first argument is the input number: 0 (this node's geometry), 1, 2 or 3")
+        if v.const and v.const not in self.inputs:
+            self.inputs.append(v.const)
+        return v.const
+
+    def read_input(self, n, name, type):
+        """A field that reads `name` on input `n`. Its own IR node (`src`), so it is
+        never mixed up with, or captured as, the same read on this node's geometry."""
+        if name in BUILTINS:
+            _, kind, out = BUILTINS[name]
+            return self.node("input", type, (), out=out, name=kind, src=n)
+        return self.node("attr", type, (), name=name, dtype=type, src=n)
+
+    def sample(self, n, name, type, index, domain):
+        value = self.read_input(n, name, type)
+        index = self.conv(index, "int")
+        return self.node("sample", type, (value, index), input=n, domain=domain, dtype=type)
+
+    def sample_call(self, fn, args):
+        """point(1, "P", i) / prim() / vertex(): an attribute of element i on an input."""
+        if len(args) != 3 or args[1].kind != "str":
+            raise self.err(f'{fn}() takes an input number, an attribute name in quotes and an index, '
+                           f'e.g. {fn}(1, "P", @ptnum)')
+        n = self.input_number(self.eval(args[0]), fn)
+        name, type = _typed_name(args[1].value)
+        if not name:
+            raise self.err(f"{fn}() needs an attribute name")
+        if type is None:
+            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+        return self.sample(n, name, type, self.eval(args[2]), SAMPLE_FUNCS[fn])
+
+    def count(self, n, domain):
+        return self.node("count", "int", (), input=n, domain=domain)
+
+    def read_opinput(self, n, name, prefix_type):
+        if n > MAX_INPUT:
+            raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
+        self.input_number(Val("int", n), f"@opinput{n}")
+        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or KNOWN_TYPES.get(name, "float")
+        index = self.read_original("index", "int")
+        return self.sample(n, name, type, index, self.domain)
 
     def channel(self, name, args):
         type = CHANNELS[name]
         if not args or args[0].kind != "str":
             raise self.err(f'{name}() needs a name in quotes, e.g. {name}("amount")')
         label = args[0].value.strip()
-        if not label or label == "Geometry":
+        if not label or label == "Geometry" or label in INPUT_SOCKETS:
             raise self.err(f"'{label}' cannot be used as a {name}() name")
         if len(args) > 2:
             raise self.err(f"{name}() takes a name and an optional default value")
@@ -421,6 +481,8 @@ class Compiler:
     def call(self, name, arg_nodes):
         if name in CHANNELS:
             return self.channel(name, arg_nodes)
+        if name in SAMPLE_FUNCS:
+            return self.sample_call(name, arg_nodes)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
 
@@ -478,6 +540,13 @@ class Compiler:
                 return self.fold("vector", _wrap, x, hi, lo) or self.node("vmath", "vector", (x, hi, lo), op="WRAP")
             x, lo, hi = floats()
             return self.fold("float", _wrap, x, hi, lo) or self.node("math", "float", (x, hi, lo), op="WRAP")
+        if name in COUNT_FUNCS:
+            want(1)
+            return self.count(self.input_number(a[0], name), COUNT_FUNCS[name])
+        if name == "nearpoint":
+            want(2)
+            n = self.input_number(a[0], name)
+            return self.node("nearest", "int", (self.conv(a[1], "vector"),), input=n, domain="POINT")
         if name in BBOX:
             return self.bbox(name, a, want)
         if name in ("length", "normalize"):
@@ -572,6 +641,8 @@ class Compiler:
             self.half_set.pop(target.name, None)
             return
         name = target.name
+        if OPINPUT_RE.match(name):
+            raise self.err(f"@{name} reads another input, it cannot be written")
         type = self.attr_type(name, target.type)
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
@@ -594,6 +665,11 @@ class Compiler:
         if k == "var":
             return self.lookup(e.name)
         if k == "attr":
+            m = OPINPUT_RE.match(e.name)
+            if m:
+                return self.read_opinput(int(m.group(1)), m.group(2), e.type)
+            if e.name in COUNT_ATTRS:
+                return self.count(0, COUNT_ATTRS[e.name])
             return self.read_attr(e.name, self.attr_type(e.name, e.type))
         if k == "member":
             v = self.eval(e.obj)
@@ -713,7 +789,7 @@ class Compiler:
 
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
-                       reads=list(self.reads))
+                       reads=list(self.reads), inputs=sorted(self.inputs))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
@@ -812,6 +888,12 @@ class Compiler:
         return sel
 
 
+def _typed_name(text):
+    """`"v@vel"` -> ("vel", "vector"); `"P"` or `"@P"` -> ("P", None)."""
+    prefix, _, name = text.strip().rpartition("@")
+    return name.strip(), _PREFIX_TYPES.get(prefix.strip())
+
+
 def _same(a, b):
     """The same node output (types may differ after an implicit conversion)."""
     return not a.is_const and not b.is_const and a.node is b.node and a.out == b.out
@@ -839,6 +921,8 @@ def _reads(val):
         if n is None or id(n) in seen:
             continue
         seen.add(id(n))
+        if "src" in n.params:  # evaluated on another input, not on this geometry
+            continue
         if n.kind == "attr":
             found.add(n.params["name"])
         elif n.kind == "input":

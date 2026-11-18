@@ -138,7 +138,7 @@ def test_bbox_and_mapping():
     assert w["lo"].node is w["hi"].node is w["c"].node  # one group node, shared
     assert w["r"].node.params["name"] == "relbbox" and w["h"].node.kind == "separate"
     assert w["s"].node.inputs[0].out == 2 and w["s"].out == 1
-    fails("v@a = getbbox_min(1)", "only be 0")
+    fails("v@a = getbbox_min(4)", "input number")
     fails("v@a = relbbox()", "takes 1 or 2")
     # folding and vector support
     w = writes("@a = fit(5, 0, 10, 0, 1); @b = smooth(0, 1, 0.5); @c = wrap(5.5, 0, 2); @d = snap(7, 3);"
@@ -337,6 +337,32 @@ def test_write_plan_captures_only_when_needed():
     assert caps == ["Group"]
     _, caps, _ = plan("f@x = 5\nf@y = 6", group="top")
     assert caps == []
+
+
+def test_other_inputs():
+    p = compile_source('v@a = point(1, "P", @ptnum)\nf@b = prim(3, "f@area", 0)\ni@n = npoints(1)')
+    assert p.inputs == [1, 3]
+    a = {n: v for n, _, v in p.writes}
+    assert a["a"].node.kind == "sample" and a["a"].node.params["domain"] == "POINT" and a["a"].type == "vector"
+    assert a["b"].node.params == {"input": 3, "domain": "FACE", "dtype": "float"}
+    assert a["n"].node.kind == "count" and a["n"].type == "int"
+    # Input 0 is this node's geometry: no extra socket.
+    p = compile_source('f@x = point(0, "x", 3) + npoints(0) + @numpt\nv@c = getbbox_max(2)')
+    assert p.inputs == [2] and not any(st.offset for st in p.stores)
+    # @opinput1_name reads the same element number on input 1; the type comes from the prefix.
+    w = writes("v@c = v@opinput1_Cd\nf@d = @opinput2_mass")
+    assert w["c"].type == "vector" and w["c"].node.params["input"] == 1
+    assert w["d"].node.inputs[1].node.kind == "input"  # the index of this element
+    w = writes("i@k = nearpoint(1, @P)")
+    assert w["k"].node.kind == "nearest" and w["k"].type == "int"
+    # Reading another input never needs a Capture, even after a write to the same name.
+    _, caps, _ = plan('f@a = 5\nf@b = point(0, "a", 0) + @opinput0_a')
+    assert caps == []
+    fails('f@a = point(4, "a", 0)', "input number")
+    fails('f@a = point(1, a, 0)', "attribute name in quotes")
+    fails("@opinput1_P = 1", "cannot be written")
+    fails("@numpt = 1", "read-only")
+    fails('chf("Input 1")', "cannot be used")
 
 
 if __name__ == "__main__":

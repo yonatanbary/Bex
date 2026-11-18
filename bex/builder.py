@@ -32,39 +32,44 @@ def _set_default(sock, const):
 
 
 def sync_interface(tree, program, keep_stale=False):
-    """Make the group's sockets match the script's ch*() inputs.
+    """Make the group's sockets match the script: the Geometry in/out, an
+    "Input N" geometry socket per extra input it reads, and its ch*() inputs.
 
     Sockets whose name and type are unchanged are kept, so links and values on
     the wrangle node survive a recompile. With `keep_stale` (a line is still being
     typed) unused inputs are kept too, so they don't vanish mid-edit.
-    Every input shows only its connector: the node draws the values above the code.
+    Every value input shows only its connector: the node draws the values above the code.
     """
     iface = tree.interface
+    geometry = "NodeSocketGeometry"
 
     def sockets():
         return [i for i in iface.items_tree if i.item_type == "SOCKET"]
 
-    def find(in_out, name=None):
-        for i in sockets():
-            is_geo = i.socket_type == "NodeSocketGeometry"
-            if i.in_out == in_out and (is_geo if name is None else (not is_geo and i.name == name)):
-                return i
-        return None
+    def find(in_out, name):
+        return next((i for i in sockets() if i.in_out == in_out and i.name == name), None)
 
-    if find("OUTPUT") is None:
-        iface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
-    if find("INPUT") is None:
-        iface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    def is_main(i):
+        return i.name == "Geometry" and i.socket_type == geometry
 
-    wanted = {name: SOCKET_IDNAME[type] for name, type, _ in program.params}
+    for in_out in ("OUTPUT", "INPUT"):
+        if find(in_out, "Geometry") is None:
+            iface.new_socket("Geometry", in_out=in_out, socket_type=geometry)
+
+    extra = [f"Input {n}" for n in program.inputs]
+    wanted = {name: geometry for name in extra}
+    wanted.update({name: SOCKET_IDNAME[type] for name, type, _ in program.params})
     stale = [
         i for i in sockets()
-        if i.socket_type != "NodeSocketGeometry" and not (i.in_out == "INPUT" and wanted.get(i.name) == i.socket_type)
+        if not is_main(i) and not (i.in_out == "INPUT" and wanted.get(i.name) == i.socket_type)
         and not (keep_stale and i.in_out == "INPUT" and i.name not in wanted)
     ]
     for item in stale:
         iface.remove(item)
 
+    for name in extra:
+        if find("INPUT", name) is None:
+            iface.new_socket(name, in_out="INPUT", socket_type=geometry)
     created = []
     for name, type, default in program.params:
         if find("INPUT", name) is None:
@@ -72,10 +77,11 @@ def sync_interface(tree, program, keep_stale=False):
             item.default_value = default
             created.append((name, default))
     for item in sockets():
-        if item.in_out == "INPUT" and item.socket_type != "NodeSocketGeometry":
+        if item.in_out == "INPUT" and item.socket_type != geometry:
             item.hide_value = True
 
-    order = [find("OUTPUT"), find("INPUT")] + [find("INPUT", name) for name, _, _ in program.params]
+    names = ["Geometry"] + extra + [name for name, _, _ in program.params]
+    order = [find("OUTPUT", "Geometry")] + [find("INPUT", name) for name in names]
     for position, item in enumerate(order):
         if item.position != position:
             iface.move(item, position)
@@ -93,10 +99,7 @@ def build(tree, program, domain, keep_stale=False):
     group_in = nodes.new("NodeGroupInput")
     group_out = nodes.new("NodeGroupOutput")
     group_out.is_active_output = True
-    idents = {
-        (i.in_out, "Geometry" if i.socket_type == "NodeSocketGeometry" else i.name): i.identifier
-        for i in tree.interface.items_tree if i.item_type == "SOCKET"
-    }
+    idents = {(i.in_out, i.name): i.identifier for i in tree.interface.items_tree if i.item_type == "SOCKET"}
     built = {}  # IRNode -> [output sockets]
     # Node name -> source line it belongs to. None is the geometry chain along the top.
     line_of = {group_in.name: None, group_out.name: None}
@@ -109,6 +112,10 @@ def build(tree, program, domain, keep_stale=False):
 
     def group_input(name):
         return next(s for s in group_in.outputs if s.identifier == idents[("INPUT", name)])
+
+    def geometry(n):
+        """Geometry input n: 0 is the node's Geometry, 1-3 are "Input N"."""
+        return group_input("Geometry" if n == 0 else f"Input {n}")
 
     captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
 
@@ -224,12 +231,33 @@ def build(tree, program, domain, keep_stale=False):
             vals = iter(ins)
             for spec, sock in zip(d.inputs, n.inputs):
                 if spec.type == "NodeSocketGeometry":
-                    links.new(group_input("Geometry"), sock)
+                    links.new(geometry(p.get("input", 0)), sock)
                 elif spec.default_input != "VALUE":
                     connect_field(next(vals), sock)
                 else:
                     connect(next(vals), sock)
             return list(n.outputs)
+        if kind == "sample":  # point(1, "P", i): the value of element i on an input
+            n = new("GeometryNodeSampleIndex")
+            n.data_type = ATTR_TYPE[p["dtype"]]
+            n.domain = p["domain"]
+            links.new(geometry(p["input"]), n.inputs["Geometry"])
+            connect(ins[0], _enabled(n.inputs, "Value")[0])
+            connect(ins[1], n.inputs["Index"])
+            return _enabled(n.outputs, "Value")
+        if kind == "nearest":  # nearpoint(1, pos)
+            n = new("GeometryNodeSampleNearest")
+            n.domain = p["domain"]
+            links.new(geometry(p["input"]), n.inputs["Geometry"])
+            connect_field(ins[0], n.inputs["Sample Position"])
+            return [n.outputs["Index"]]
+        if kind == "count":  # npoints(1): sums 1 over the domain, across mesh, points and curves
+            n = new("GeometryNodeAttributeStatistic")
+            n.data_type = "FLOAT"
+            n.domain = p["domain"]
+            links.new(geometry(p["input"]), n.inputs["Geometry"])
+            n.inputs["Attribute"].default_value = 1.0
+            return [n.outputs["Sum"]]
         if kind == "noise":
             n = new("ShaderNodeTexNoise")
             n.noise_dimensions = "3D"
@@ -347,6 +375,9 @@ BUTTON_ROWS = {
     "GeometryNodeStoreNamedAttribute": 2,
     "GeometryNodeCaptureAttribute": 1,
     "FunctionNodeInputVector": 3,
+    "GeometryNodeSampleIndex": 3,
+    "GeometryNodeSampleNearest": 1,
+    "GeometryNodeAttributeStatistic": 2,
 }
 
 
