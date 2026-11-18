@@ -43,6 +43,8 @@ BAR_MARGIN = 3.0        # gap between a scrollbar and the box edge
 BAR_BOTTOM = 6.0        # gap under the horizontal scrollbar (a bit more, easier to grab)
 BAR_HIT = 4.0           # extra grab area around a scrollbar (kept inside the box)
 BAR_MIN = 12.0          # shortest scrollbar thumb
+GUTTER_PAD = 0.8        # line-number column: space on each side of the numbers, in characters
+MIN_DIGITS = 2          # the column is never narrower than this many digits
 
 # The info strip under the code (attributes read / written). It sits inside the
 # reserved block, so it needs no layout measuring of its own.
@@ -55,6 +57,10 @@ INFO_GAP = 4.0
 # A calm palette: mostly neutral text, colour only where it helps you read.
 PALETTE = {
     "back": (0.105, 0.105, 0.11, 1.0),
+    "gutter": (0.135, 0.135, 0.14, 1.0),       # line-number column
+    "gutter_current": (0.175, 0.175, 0.18, 1.0),  # its row of the cursor line
+    "line_number": (0.42, 0.42, 0.43, 1.0),
+    "line_number_current": (0.72, 0.72, 0.73, 1.0),
     "focus": (0.36, 0.52, 0.78, 1.0),
     "evaluated": (0.36, 0.62, 0.42, 0.85),
     "error": (0.80, 0.36, 0.34, 0.9),
@@ -259,7 +265,7 @@ def scrollbars(node, rect, lines, view):
     x0, y0, x1, y1, px = rect
     line_h, char_w = _metrics(px, node.code_scale)
     rows = visible_rows(len(lines))
-    cols = max(1, int((x1 - x0 - 2 * PAD * px) / char_w))
+    cols = max(1, int((x1 - text_left(x0, len(lines), char_w, px) - PAD * px) / char_w))
     v_total, h_total = len(lines), max(map(len, lines)) + 1  # +1: the cursor after the last char
     has_v, has_h = v_total > rows, h_total > cols
     w, m, mb = BAR_W * px, BAR_MARGIN * px, BAR_BOTTOM * px
@@ -271,7 +277,7 @@ def scrollbars(node, rect, lines, view):
             track = (x1 - m - w, bottom, x1 - m, top)
             bars["v"] = (track, (track[0], top - t[0] - t[1], track[2], top - t[0]), v_total, rows)
     if has_h:
-        left, right = x0 + m, x1 - m - (w + m if has_v else 0)
+        left, right = x0 + gutter_width(len(lines), char_w) + m, x1 - m - (w + m if has_v else 0)
         t = thumb(h_total, cols, view.left, right - left, BAR_MIN * px)
         if t:
             track = (left, y0 + mb, right, y0 + mb + w)
@@ -287,6 +293,16 @@ def _shows_code(node):
 def _metrics(px, scale):
     blf.size(FONT_ID, FONT_SIZE * scale * px)
     return LINE_H * scale * px, blf.dimensions(FONT_ID, "M" * 10)[0] / 10
+
+
+def gutter_width(line_count, char_w):
+    """Width of the line-number column: wide enough for the last line's number."""
+    return (max(MIN_DIGITS, len(str(line_count))) + 2 * GUTTER_PAD) * char_w
+
+
+def text_left(x0, line_count, char_w, px):
+    """Region x where column 0 of the code starts (after the line numbers)."""
+    return x0 + gutter_width(line_count, char_w) + PAD * px
 
 
 # -- session -------------------------------------------------------------------
@@ -421,9 +437,9 @@ def _draw_node(node, region, vx, vy):
     _draw_info(node, region, x0, info_y0, x1, y0, px, vx, vy)
     line_h, char_w = _metrics(px, scale)
     pad = PAD * px
-    left, top = x0 + pad, y1 - pad
+    left, top = text_left(x0, len(lines), char_w, px), y1 - pad
     rows = visible_rows(len(lines))
-    cols = max(1, int((x1 - x0 - 2 * pad) / char_w))
+    cols = max(1, int((x1 - left - pad) / char_w))
     if editing:
         _session.cols = cols
     view.clamp(len(lines), rows)
@@ -475,6 +491,21 @@ def _draw_node(node, region, vx, vy):
             y_top = top - (row - first) * line_h
             w = max(1.0, 1.5 * px)
             _rect(col_x(col), y_top - line_h, col_x(col) + w, y_top, PALETTE["cursor"])
+    # Line numbers, painted last so code scrolled sideways slides under them.
+    gutter_r = x0 + gutter_width(len(lines), char_w)
+    _rect(x0, y0, gutter_r, y1, PALETTE["gutter"])
+    current = _session.buf.cursor[0] if editing else -1
+    if first <= current < last:
+        y_top = top - (current - first) * line_h
+        _rect(x0, y_top - line_h, gutter_r, y_top, PALETTE["gutter_current"])
+    blf.size(FONT_ID, font_px)
+    for row in range(first, last):
+        number = str(row + 1)
+        y = top - (row - first + 1) * line_h + descent
+        blf.color(FONT_ID, *PALETTE["line_number_current" if row == current else "line_number"])
+        blf.position(FONT_ID, gutter_r - GUTTER_PAD * char_w - blf.dimensions(FONT_ID, number)[0], y, 0)
+        blf.draw(FONT_ID, number)
+    gpu.state.blend_set("ALPHA")
     for axis, (track, knob, _total, _visible) in scrollbars(node, (x0, y0, x1, y1, px), lines, view).items():
         _rect(*track, PALETTE["bar_track"])
         active = editing and _session.bar is not None and _session.bar[0] == axis
@@ -518,6 +549,15 @@ def _attr_label(name, type):
     return _TYPE_PREFIX.get(type, "") + "@" + name
 
 
+def _fit(text, width):
+    """`text` cut short with "…" so it is at most `width` wide (current blf size)."""
+    if blf.dimensions(FONT_ID, text)[0] <= width:
+        return text
+    while text and blf.dimensions(FONT_ID, text + "…")[0] > width:
+        text = text[:-1]
+    return text + "…" if text else ""
+
+
 def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
     if not _clip(region, vx, vy, x0, y0, x1, y1):
         return
@@ -532,10 +572,21 @@ def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
         blf.draw(FONT_ID, line)
         y -= line_h
     blf.size(FONT_ID, INFO_FONT * px)
+    status = ""
+    if is_editing(node):  # where the cursor is, right-aligned on the first line
+        row, col = _session.buf.cursor
+        status = f"Line {row + 1}, Col {col + 1}"
+        status_w = blf.dimensions(FONT_ID, status)[0]
+        blf.color(FONT_ID, *PALETTE["dim"])
+        blf.position(FONT_ID, x1 - PAD * px - status_w, y, 0)
+        blf.draw(FONT_ID, status)
     for label, value in info_lines(node):
         blf.color(FONT_ID, *PALETTE["comment"])
         blf.position(FONT_ID, x0 + PAD * px, y, 0)
         blf.draw(FONT_ID, label)
+        if status:  # leave room for it
+            value = _fit(value, x1 - x0 - 2 * PAD * px - label_w - status_w - 2 * INFO_FONT * px)
+            status = ""
         blf.color(FONT_ID, *PALETTE["dim"])
         blf.position(FONT_ID, x0 + PAD * px + label_w, y, 0)
         blf.draw(FONT_ID, value)
@@ -699,7 +750,8 @@ class BEX_OT_code_edit(bpy.types.Operator):
         x0, _y0, _x1, y1, px = rect
         mx, my = event.mouse_region_x, event.mouse_region_y
         line_h, char_w = _metrics(px, node.code_scale)
-        row, col = _session.view.hit(mx - x0 - PAD * px, y1 - PAD * px - my, line_h, char_w)
+        code_x = text_left(x0, len(buf.lines), char_w, px)
+        row, col = _session.view.hit(mx - code_x, y1 - PAD * px - my, line_h, char_w)
         version, row_before = buf.version, buf.cursor[0]
         _session.suggestion = ""
         if drag:
@@ -713,7 +765,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
             cols = _session.cols
             longest = max(map(len, buf.lines)) + 1
             # `hit` clamps to the first visible column; here the mouse may be left of it.
-            mouse_col = left + int(round((mx - x0 - PAD * px) / char_w))
+            mouse_col = left + int(round((mx - code_x) / char_w))
             if mouse_col > left + cols:
                 left = min(mouse_col - cols, max(left, longest - cols))
             elif mouse_col < left:
