@@ -13,6 +13,7 @@ INPUT_NODES = {
     "index": "GeometryNodeInputIndex",
     "id": "GeometryNodeInputID",
     "time": "GeometryNodeInputSceneTime",
+    "spline_parameter": "GeometryNodeSplineParameter",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
 

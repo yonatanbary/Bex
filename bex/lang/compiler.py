@@ -84,10 +84,12 @@ BUILTINS = {
     "id": ("int", "id", 0),
     "Time": ("float", "time", 0),
     "Frame": ("float", "time", 1),
+    "curveu": ("float", "spline_parameter", 0),  # 0-1 along each curve (Spline Parameter's Factor)
+    "curvelength": ("float", "spline_parameter", 1),  # distance along the curve from its start
 }
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame"} | set(COUNT_ATTRS)
+READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
 
 
@@ -911,7 +913,8 @@ def _changes(name):
 
 
 # What each built-in input node reads from the geometry.
-_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"}}
+_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"},
+                "spline_parameter": {"P", "position"}}
 
 
 def _reads(val):

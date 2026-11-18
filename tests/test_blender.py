@@ -717,6 +717,25 @@ def test_other_inputs():
     assert node.inputs[1].name == "Input 2" and node.inputs[1].is_linked and node.inputs[4].name == "amount"
 
 
+def test_curve_builtins():
+    # A 5-point line (Curve Line → Resample) through the wrangle, then to a mesh to read it back.
+    obj, node, text = make_setup("f@u = @curveu\nf@l = @curvelength")
+    tree = node.id_data
+    line, res, to_mesh = (tree.nodes.new(i) for i in (
+        "GeometryNodeCurvePrimitiveLine", "GeometryNodeResampleCurve", "GeometryNodeCurveToMesh"))
+    line.inputs["End"].default_value = (2, 0, 0)
+    res.inputs["Count"].default_value = 5
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(line.outputs[0], res.inputs[0])
+    tree.links.new(res.outputs[0], node.inputs[0])
+    tree.links.new(node.outputs[0], to_mesh.inputs[0])
+    tree.links.new(to_mesh.outputs[0], out.inputs[0])
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert [d.value for d in mesh.attributes["u"].data] == [pytest_approx(v) for v in (0, 0.25, 0.5, 0.75, 1)]
+    assert [d.value for d in mesh.attributes["l"].data] == [pytest_approx(v) for v in (0, 0.5, 1, 1.5, 2)]
+
+
 class pytest_approx(float):
     def __eq__(self, other):
         return abs(self - other) < 1e-4

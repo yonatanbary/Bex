@@ -365,6 +365,12 @@ def test_other_inputs():
     fails('chf("Input 2")', "cannot be used")
 
 
+def test_curve_builtins():
+    w = writes("f@u = @curveu\nf@l = @curvelength")
+    assert w["u"].node.params["name"] == "spline_parameter" and w["u"].out == 0 and w["l"].out == 1
+    fails("@curveu = 1", "read-only")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
