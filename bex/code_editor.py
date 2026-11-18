@@ -32,7 +32,7 @@ FONT_ID = 1             # Blender's built-in monospace font
 FONT_SIZE = 11.0        # all sizes are node-editor units at zoom 1, before UI scale
 LINE_H = 15.0
 PAD = 5.0
-MIN_ROWS = 3
+MIN_ROWS = 10           # an empty box still has room to write
 MAX_ROWS = 16           # longer scripts scroll inside the box
 UNIT_Y = 20.0           # height of one layout row (Blender's UI_UNIT_Y)
 CLICK_SLOP = 5.0        # px (× UI scale): presses closer than this count as the same spot
@@ -43,6 +43,7 @@ BAR_MARGIN = 3.0        # gap between a scrollbar and the box edge
 BAR_BOTTOM = 6.0        # gap under the horizontal scrollbar (a bit more, easier to grab)
 BAR_HIT = 4.0           # extra grab area around a scrollbar (kept inside the box)
 BAR_MIN = 12.0          # shortest scrollbar thumb
+BAR_STRIP = BAR_BOTTOM + BAR_W + BAR_MARGIN  # room under the code for the horizontal bar
 GUTTER_PAD = 0.8        # line-number column: space on each side of the numbers, in characters
 MIN_DIGITS = 2          # the column is never narrower than this many digits
 
@@ -182,7 +183,9 @@ def visible_rows(line_count):
 
 
 def box_height(line_count, scale=1.0):
-    return visible_rows(line_count) * LINE_H * scale + 2 * PAD
+    """The code rows, padding on top and, at the bottom, a strip that is always
+    kept for the horizontal scrollbar, so it never covers the last line."""
+    return visible_rows(line_count) * LINE_H * scale + PAD + BAR_STRIP
 
 
 def _wrap(node, text):
@@ -428,11 +431,16 @@ def _draw_node(node, region, vx, vy):
         edge = PALETTE["evaluated"]
     else:
         edge = None
-    if edge:
-        w = max(1.0, px)
-        for r in ((x0, y0, x1, y0 + w), (x0, y1 - w, x1, y1), (x0, y0, x0 + w, y1), (x1 - w, y0, x1, y1)):
-            _rect(*r, edge)
+
+    def outline():  # drawn last, over the line numbers and scrollbars
+        if edge:
+            w = max(1.0, px)
+            gpu.state.scissor_test_set(False)
+            for r in ((x0, y0, x1, y0 + w), (x0, y1 - w, x1, y1), (x0, y0, x0 + w, y1), (x1 - w, y0, x1, y1)):
+                _rect(*r, edge)
+
     if FONT_SIZE * scale * px < 3:  # too far out to read
+        outline()
         return
     _draw_info(node, region, x0, info_y0, x1, y0, px, vx, vy)
     line_h, char_w = _metrics(px, scale)
@@ -444,6 +452,7 @@ def _draw_node(node, region, vx, vy):
         _session.cols = cols
     view.clamp(len(lines), rows)
     if not _clip(region, vx, vy, x0, y0, x1, y1):
+        outline()
         return
 
     def col_x(col):
@@ -510,6 +519,7 @@ def _draw_node(node, region, vx, vy):
         _rect(*track, PALETTE["bar_track"])
         active = editing and _session.bar is not None and _session.bar[0] == axis
         _rect(*knob, PALETTE["bar_active" if active else "bar"])
+    outline()
 
 
 def _split_spans(spans, col):
