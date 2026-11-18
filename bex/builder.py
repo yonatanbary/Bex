@@ -1,6 +1,7 @@
 """Turns a compiled BEX `Program` into real nodes inside a geometry node group."""
 
 from . import library
+from .lang.compiler import INPUT_SOCKETS
 
 SOCKET_IDNAME = {"float": "NodeSocketFloat", "int": "NodeSocketInt", "vector": "NodeSocketVector", "bool": "NodeSocketBool"}
 ATTR_TYPE = {"float": "FLOAT", "int": "INT", "vector": "FLOAT_VECTOR", "bool": "BOOLEAN"}
@@ -32,8 +33,9 @@ def _set_default(sock, const):
 
 
 def sync_interface(tree, program, keep_stale=False):
-    """Make the group's sockets match the script: the Geometry in/out, an
-    "Input N" geometry socket per extra input it reads, and its ch*() inputs.
+    """Make the group's sockets match the script: the Geometry in/out, the three
+    extra geometry inputs "Input 1"-"Input 3" (always there, like a wrangle's four
+    inputs), and the script's ch*() inputs.
 
     Sockets whose name and type are unchanged are kept, so links and values on
     the wrangle node survive a recompile. With `keep_stale` (a line is still being
@@ -56,7 +58,7 @@ def sync_interface(tree, program, keep_stale=False):
         if find(in_out, "Geometry") is None:
             iface.new_socket("Geometry", in_out=in_out, socket_type=geometry)
 
-    extra = [f"Input {n}" for n in program.inputs]
+    extra = list(INPUT_SOCKETS)
     wanted = {name: geometry for name in extra}
     wanted.update({name: SOCKET_IDNAME[type] for name, type, _ in program.params})
     stale = [

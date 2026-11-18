@@ -87,9 +87,9 @@ else updates by event, with no polling.
 | Random | `noise(p)` `vnoise(p)` `rand(seed)` `vrand(seed)` |
 | Constants | `PI` / `pi`, `TAU` / `tau` |
 
-Inputs work like a Houdini wrangle's: input 0 is the node's **Geometry**, and using input 1, 2 or 3
-adds an **Input N** socket to the node (it goes away when the script stops using it). Input 0
-always means the geometry as it entered the node.
+Inputs work like a Houdini wrangle's: the node has four geometry inputs, **Geometry** (input 0)
+and **Input 1**–**Input 3**. Only input 0 flows through to the output; the others are read with
+the functions above. Input 0 always means the geometry as it entered the node.
 
 Functions that take several nodes (the bounding box ones) build a node group, such as
 **BEX Relative Bounding Box**, instead of loose nodes. These are ordinary node groups:

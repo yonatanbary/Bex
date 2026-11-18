@@ -56,7 +56,7 @@ class Program:
     group: object = None  # Val (bool) choosing the elements to write, None = all
     group_source: str = ""  # the Group expression, used to label its nodes
     warnings: list = field(default_factory=list)  # problems that don't stop the build (a bad Group)
-    inputs: list = field(default_factory=list)  # extra geometry inputs used (1-3), sorted
+    inputs: list = field(default_factory=list)  # extra geometry inputs the script reads (1-3), sorted
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
 
@@ -194,8 +194,8 @@ CHANNELS = {"chf": "float", "chi": "int", "chv": "vector", "chb": "bool"}
 # is the input number, as in VEX (only input 0 exists).
 BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox")
 # Every function name Compiler.call accepts (used by the editor's highlighter). Keep in sync with call().
-# Geometry inputs, like a wrangle's four: 0 is the incoming geometry, 1-3 are extra
-# Geometry sockets that appear when the script uses them.
+# Geometry inputs, like a wrangle's four: 0 is the incoming geometry, 1-3 are the
+# node's "Input N" sockets (always there).
 MAX_INPUT = 3
 SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
 COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
@@ -409,7 +409,7 @@ class Compiler:
 
     # -- other inputs ---------------------------------------------------------
     def input_number(self, v, fn):
-        """The geometry input a function reads: a constant 0-3. Using 1-3 adds that socket."""
+        """The geometry input a function reads: a constant 0-3 (1-3 are recorded in `inputs`)."""
         if not (v.is_const and v.type == "int" and 0 <= v.const <= MAX_INPUT):
             raise self.err(f"{fn}()'s first argument is the input number: 0 (this node's geometry), 1, 2 or 3")
         if v.const and v.const not in self.inputs:

@@ -52,7 +52,7 @@ def close(a, b, eps=1e-4):
 def test_position_and_channels():
     obj, node, text = make_setup('@P.z = sin(@P.x * chf("freq", 2.0)) * chf("amp", 0.5); @P.x += 1;')
     assert node.error == "", node.error
-    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "freq", "amp"], [s.name for s in node.inputs]
+    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "Input 1", "Input 2", "Input 3", "freq", "amp"], [s.name for s in node.inputs]
     mesh = evaluate(obj)
     for (x, y, z), v in zip(original_points(obj), mesh.vertices):
         assert close(v.co, (x + 1, y, math.sin(x * 2.0) * 0.5)), (tuple(v.co), x, y)
@@ -657,7 +657,8 @@ def test_other_inputs():
                      'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
     node.sync()
     assert node.error == "", node.error
-    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == ["Geometry", "Input 1"]
+    geometry_inputs = ["Geometry", "Input 1", "Input 2", "Input 3"]
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
     tree = node.id_data
     info = tree.nodes.new("GeometryNodeObjectInfo")
     info.inputs["Object"].default_value = other
@@ -670,10 +671,11 @@ def test_other_inputs():
     assert {d.value for d in mesh.attributes["n"].data} == {count}
     assert {d.value for d in mesh.attributes["near"].data} == {count - 1}  # the highest point
     assert all(close(d.vector, (1, 1, (count - 1) * 0.5)) for d in mesh.attributes["top"].data)
-    # The socket goes away when the script stops using it.
-    text.from_string("f@m = 1")
+    # The four inputs are always there, like a wrangle's, and keep their links.
+    text.from_string('f@m = chf("amount", 1)')
     node.sync()
-    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == ["Geometry"]
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
+    assert node.inputs[1].name == "Input 1" and node.inputs[1].is_linked and node.inputs[4].name == "amount"
 
 
 class pytest_approx(float):
