@@ -315,6 +315,35 @@ def test_code_editor_compiles_on_focus_loss():
     assert close(evaluate(obj).vertices[0].co, (2, -1, 1))
 
 
+def test_code_editor_esc_hides_signature_first():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1;")
+    ce._session = ce.Session(node)
+    op = types.SimpleNamespace()
+    for name in ("_key", "_after_change", "_end"):
+        setattr(op, name, getattr(ce.BEX_OT_code_edit, name).__get__(op))
+
+    def press(key, ch=""):
+        ev = types.SimpleNamespace(type=key, unicode=ch, ctrl=False, shift=False, alt=False, oskey=False)
+        return op._key(bpy.context, node, ev)
+
+    ce._session.buf.move_doc_end()
+    for ch in " h = fit(":
+        press(ch.upper() if ch.isalpha() else ch, ch)
+    assert ce._session.signature().name == "fit"
+    assert press("ESC") is None and ce._session is not None   # hides the help, keeps focus
+    assert ce._session.signature() is None
+    press("A", "a")
+    assert ce._session.signature() is None                    # stays hidden inside that call
+    press(")", ")")                                           # out of the call
+    assert ce._session.signature() is None
+    press("BACK_SPACE")                                       # back in: it shows again
+    assert ce._session.signature().name == "fit"
+    press("ESC")
+    assert press("ESC") == {"FINISHED"} and ce._session is None  # the second Esc leaves
+
 def test_code_editor_undo_survives_refocus():
     import types
     from bex import code_editor as ce

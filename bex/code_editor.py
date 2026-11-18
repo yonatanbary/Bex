@@ -25,6 +25,7 @@ from gpu_extras.batch import batch_for_shader
 from .editor.buffer import TextBuffer, is_word_char
 from .editor.complete import suggest
 from .editor.highlight import highlight
+from .editor.signature import signature_at
 from .upstream import incoming_attributes
 from .lang.compiler import BUILTINS
 from .editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, View, handle_key, thumb, thumb_first
@@ -89,7 +90,17 @@ PALETTE = {
     "bar_active": (0.50, 0.50, 0.50, 1.0),
     "arrow": (0.62, 0.62, 0.62, 1.0),
     "arrow_off": (0.32, 0.32, 0.32, 1.0),      # nothing to scroll that way
+    "sig_back": (0.065, 0.065, 0.07, 0.97),    # signature help popup
+    "sig_edge": (0.30, 0.30, 0.32, 1.0),
+    "sig_param": (0.58, 0.58, 0.60, 1.0),
+    "sig_active": (1.0, 1.0, 1.0, 1.0),
+    "sig_summary": (0.62, 0.62, 0.64, 1.0),
 }
+SIG_PAD = 6.0           # signature popup: inner padding
+SIG_GAP = 2.0           # between the cursor line and the popup
+SIG_MARGIN = 8.0        # kept free between the popup and the region edge
+SIG_SUMMARY = 0.9       # summary font size relative to the code
+SIG_WRAP = 60           # the summary wraps after this many characters
 _COLOR_OF = {
     "comment": "comment", "string": "string", "number": "number", "constant": "number",
     "attr": "attr", "function": "function", "channel": "function",
@@ -109,6 +120,7 @@ MAC = sys.platform == "darwin"
 _session = None          # the Session being edited, if any
 _draw_handle = None
 _highlight_cache = {}    # text -> highlighted spans
+_popup = None            # signature help to draw over everything, set by _draw_node
 _buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
 _views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
 
@@ -384,6 +396,7 @@ class Session:
         self.clicks = 0                # presses in the current multi-click run (1, 2, 3)
         self.last_press = None         # (time, x, y) of the last press, to count multi-clicks
         self.suggestion = ""           # inline completion shown after the cursor
+        self.sig_hidden = None         # (row, col) of the call whose signature help Esc hid
         self.bar = None                # ("v" | "h", grab offset) while dragging a scrollbar
         self.repeat = None             # [axis, step, pressed, last tick, carry] while an arrow is held
 
@@ -400,6 +413,15 @@ class Session:
         if src != self.written:
             self.buf.set_text(src)
             self.written = src
+
+    def signature(self):
+        """The signature help to show at the cursor, or None. Esc hides it for
+        the call it belongs to; it comes back once the cursor leaves that call."""
+        sig = signature_at(self.buf.lines, *self.buf.cursor)
+        if sig is None or (sig.row, sig.col) != self.sig_hidden:
+            self.sig_hidden = None
+            return sig
+        return None
 
     def push(self, node):
         if self.buf.text != self.written:
@@ -443,13 +465,18 @@ def _draw():
     tree = getattr(context.space_data, "edit_tree", None)
     if tree is None or tree.bl_idname != "GeometryNodeTree":
         return
+    global _popup
     gpu.state.blend_set("ALPHA")
     old_scissor = gpu.state.scissor_get()
     vx, vy = gpu.state.viewport_get()[:2]
+    _popup = None
     try:
         for node in tree.nodes:
             if _shows_code(node):
                 _draw_node(node, context.region, vx, vy)
+        if _popup:  # after every node, so no other code box covers it
+            gpu.state.scissor_test_set(False)
+            _draw_signature(context.region, _free_x(context.area, context.region), *_popup)
     finally:
         gpu.state.scissor_set(*old_scissor)
         gpu.state.scissor_test_set(False)
@@ -470,6 +497,7 @@ def _clip(region, vx, vy, x0, y0, x1, y1):
 
 
 def _draw_node(node, region, vx, vy):
+    global _popup
     outer = box_rect(node, region)
     ox0, oy0, ox1, _oy1, px = outer
     x0, y0, x1, y1, _ = code_rect(outer)
@@ -563,6 +591,9 @@ def _draw_node(node, region, vx, vy):
             y_top = top - (row - first) * line_h
             w = max(1.0, 1.5 * px)
             _rect(col_x(col), y_top - line_h, col_x(col) + w, y_top, PALETTE["cursor"])
+            sig = _session.signature()
+            if sig:
+                _popup = (sig, max(left, col_x(sig.col)), y_top - line_h, y_top, font_px, px)
     # Line numbers, painted last so code scrolled sideways slides under them.
     gutter_r = x0 + gutter_width(len(lines), char_w)
     _rect(x0, y0, gutter_r, y1, PALETTE["gutter"])
@@ -579,6 +610,73 @@ def _draw_node(node, region, vx, vy):
         blf.draw(FONT_ID, number)
     _draw_bars(node, region, outer, lines, view, editing)
     outline()
+
+
+def _free_x(area, region):
+    """The part of `region` (x0, x1) not covered by the toolbar or the sidebar,
+    which Blender draws over the node editor."""
+    x0, x1 = 0, region.width
+    for other in area.regions:
+        if other.type not in ("UI", "TOOLS") or other.width <= 1 or other.height <= 1:
+            continue
+        if other.x >= region.x + region.width / 2:
+            x1 = min(x1, other.x - region.x)
+        else:
+            x0 = max(x0, other.x + other.width - region.x)
+    return x0, x1
+
+
+def _draw_signature(region, free, sig, x, line_y0, line_y1, font_px, px):
+    """The signature help popup: the call's parameters, the one being typed
+    bright, and a one-line summary under them. It opens below the cursor line
+    with its text under the function name, slides left at the region's right
+    edge, and opens above the line when there's no room below."""
+    pad, gap, margin = SIG_PAD * px, SIG_GAP * px, SIG_MARGIN * px
+    blf.size(FONT_ID, font_px)
+    parts = [(text, blf.dimensions(FONT_ID, text)[0], role) for text, role in sig.parts()]
+    sig_w = sum(w for _t, w, _r in parts)
+    line_h = font_px * 1.45
+    small = font_px * SIG_SUMMARY
+    blf.size(FONT_ID, small)
+    char_w = blf.dimensions(FONT_ID, "M" * 10)[0] / 10
+    free_x0, free_x1 = free
+    max_w = free_x1 - free_x0 - 2 * margin - 2 * pad
+    # The summary sets the width up to SIG_WRAP characters, then wraps.
+    width = min(max_w, max(sig_w, min(blf.dimensions(FONT_ID, sig.summary)[0], SIG_WRAP * char_w)))
+    summary = textwrap.wrap(sig.summary, max(10, int(width / char_w))) if sig.summary else []
+    width = min(max_w, max(sig_w, *(blf.dimensions(FONT_ID, s)[0] for s in summary or [""])))
+    small_h = small * 1.45
+    w = width + 2 * pad
+    h = line_h + len(summary) * small_h + (pad * 0.5 if summary else 0) + 2 * pad
+    x0 = min(x - pad, free_x1 - margin - w)
+    x0 = max(free_x0 + margin, x0)
+    y1 = line_y0 - gap
+    if y1 - h < margin and line_y1 + gap + h <= region.height - margin:
+        y1 = line_y1 + gap + h   # no room below: open above the line
+    y0 = y1 - h
+    edge = max(1.0, px)
+    _rect(x0, y0, x0 + w, y1, PALETTE["sig_edge"])
+    _rect(x0 + edge, y0 + edge, x0 + w - edge, y1 - edge, PALETTE["sig_back"])
+    color = {"name": PALETTE["function"], "punct": PALETTE["dim"],
+             "param": PALETTE["sig_param"], "active": PALETTE["sig_active"]}
+    blf.size(FONT_ID, font_px)
+    tx, ty = x0 + pad, y1 - pad - line_h + (line_h - font_px) * 0.5 + 0.2 * font_px
+    for text, tw, role in parts:
+        blf.color(FONT_ID, *color[role])
+        blf.position(FONT_ID, tx, ty, 0)
+        blf.draw(FONT_ID, text)
+        if role == "active":  # underline the argument being typed
+            gpu.state.blend_set("ALPHA")
+            _rect(tx, ty - 0.25 * font_px, tx + tw, ty - 0.25 * font_px + edge, PALETTE["sig_active"])
+        tx += tw
+    blf.size(FONT_ID, small)
+    blf.color(FONT_ID, *PALETTE["sig_summary"])
+    ty = y1 - pad - line_h - pad * 0.5
+    for text in summary:
+        ty -= small_h
+        blf.position(FONT_ID, x0 + pad, ty + (small_h - small) * 0.5 + 0.2 * small, 0)
+        blf.draw(FONT_ID, text)
+    gpu.state.blend_set("ALPHA")
 
 
 def _split_spans(spans, col):
@@ -778,6 +876,11 @@ class BEX_OT_code_edit(bpy.types.Operator):
     def _key(self, context, node, event):
         buf = _session.buf
         version, row_before = buf.version, buf.cursor[0]
+        if event.type == "ESC":
+            sig = _session.signature()
+            if sig:  # the first Esc only hides the signature help; the next one leaves
+                _session.sig_hidden = (sig.row, sig.col)
+                return None
         if event.type == "TAB" and not event.shift and _session.suggestion and not buf.has_selection:
             buf.insert(_session.suggestion)  # accept the inline completion
             _session.suggestion = ""

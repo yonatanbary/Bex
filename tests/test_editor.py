@@ -464,6 +464,43 @@ def test_view_follow_and_hit():
     assert v.top == 10
 
 
+
+def test_signature_at():
+    from bex.editor.signature import signature_at
+
+    def at(text):  # "|" marks the cursor
+        lines = text.split("\n")
+        row = next(r for r, l in enumerate(lines) if "|" in l)
+        col = lines[row].index("|")
+        lines[row] = lines[row].replace("|", "")
+        sig = signature_at(lines, row, col)
+        return sig and (sig.name, sig.active, sig.row, sig.col)
+
+    assert at("x = fit(|") == ("fit", 0, 0, 4)
+    assert at("x = fit(@P.y, 0, |") == ("fit", 2, 0, 4)
+    assert at("x = fit(a, b|)") == ("fit", 1, 0, 4)
+    assert at("x = fit(a, b)|") is None                 # past the closing paren
+    assert at("x = fit|(") is None
+    assert at("x = fit(sin(a, b), |") == ("fit", 1, 0, 4)   # nested commas don't count
+    assert at("x = fit((a + b), [1, 2], |") == ("fit", 2, 0, 4)
+    assert at("x = fit((a|") == ("fit", 0, 0, 4)       # plain parens are looked through
+    assert at("x = fit(foo(|") is None                  # inside an unknown function
+    assert at("x = fit(sin(|") == ("sin", 0, 0, 8)      # the innermost call wins
+    assert at('x = fit(",(", |') == ("fit", 1, 0, 4)    # strings skipped
+    assert at("x = fit(a, # (,\n  b, |") == ("fit", 2, 0, 4)  # comments; over lines
+    assert at("@fit(|") is None and at("f@fit(|") is None
+    assert at("# fit(|") is None
+    sig = signature_at(["fit(a, "], 0, 7)
+    assert [r for _t, r in sig.parts()].count("active") == 1
+    assert "".join(t for t, _r in sig.parts()) == "fit(value, old_min, old_max, new_min, new_max)"
+
+
+def test_every_function_has_a_signature():
+    from bex.lang.compiler import FUNCTION_NAMES, SIGNATURES
+    assert set(SIGNATURES) == FUNCTION_NAMES, set(SIGNATURES) ^ FUNCTION_NAMES
+    for name, (params, summary) in SIGNATURES.items():
+        assert params and summary.endswith("."), name
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

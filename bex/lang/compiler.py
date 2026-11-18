@@ -233,6 +233,95 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint",
 }) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS)
 
+# Signature help shown while typing a call: name -> (parameters, one-line summary).
+# BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
+# Keep the summaries short and plain: what it gives you, in a few words.
+SIGNATURES = {
+    # Math
+    "sin": (("angle",), "Sine of an angle in radians."),
+    "cos": (("angle",), "Cosine of an angle in radians."),
+    "tan": (("angle",), "Tangent of an angle in radians."),
+    "asin": (("value",), "Inverse sine, in radians."),
+    "acos": (("value",), "Inverse cosine, in radians."),
+    "atan": (("value",), "Inverse tangent, in radians."),
+    "atan2": (("y", "x"), "Angle of the point (x, y), in radians."),
+    "sinh": (("value",), "Hyperbolic sine."),
+    "cosh": (("value",), "Hyperbolic cosine."),
+    "tanh": (("value",), "Hyperbolic tangent."),
+    "radians": (("degrees",), "Degrees to radians."),
+    "degrees": (("radians",), "Radians to degrees."),
+    "sqrt": (("value",), "Square root. 0 for negative numbers."),
+    "pow": (("base", "exponent"), "base to the power of exponent."),
+    "exp": (("value",), "e to the power of value."),
+    "log": (("value",), "Natural logarithm."),
+    "log10": (("value",), "Base 10 logarithm."),
+    "abs": (("value",), "Drops the minus sign."),
+    "sign": (("value",), "-1, 0 or 1, depending on the sign."),
+    "floor": (("value",), "Rounds down."),
+    "ceil": (("value",), "Rounds up."),
+    "round": (("value",), "Rounds to the nearest whole number."),
+    "trunc": (("value",), "Cuts off the decimals."),
+    "frac": (("value",), "Just the decimals: frac(2.75) is 0.75."),
+    "min": (("a", "b"), "The smaller of the two."),
+    "max": (("a", "b"), "The larger of the two."),
+    "clamp": (("value", "min", "max"), "Keeps value between min and max."),
+    "mod": (("value", "divisor"), "Remainder after division. Never negative for a positive divisor."),
+    "fmod": (("value", "divisor"), "Same as mod()."),
+    "wrap": (("value", "min", "max"), "Wraps value around to stay between min and max."),
+    "snap": (("value", "step"), "Rounds down to a multiple of step."),
+    "pingpong": (("value", "length"), "Goes from 0 to length and back, over and over."),
+    # Ranges and blending
+    "fit": (("value", "old_min", "old_max", "new_min", "new_max"),
+            "Moves value from the old range to the new one, clamped."),
+    "efit": (("value", "old_min", "old_max", "new_min", "new_max"),
+             "Like fit(), but not clamped."),
+    "fit01": (("value", "new_min", "new_max"), "Moves value from 0 to 1 into the new range."),
+    "fit11": (("value", "new_min", "new_max"), "Moves value from -1 to 1 into the new range."),
+    "smoothstep": (("min", "max", "value"), "0 below min, 1 above max, a smooth curve between."),
+    "smooth": (("min", "max", "value"), "Same as smoothstep()."),
+    "smootherstep": (("min", "max", "value"), "Like smoothstep(), with softer ends."),
+    "lerp": (("a", "b", "t"), "Blends from a (t = 0) to b (t = 1)."),
+    "mix": (("a", "b", "t"), "Same as lerp()."),
+    # Vectors
+    "set": (("x", "y", "z"), "Makes a vector."),
+    "length": (("vector",), "How long the vector is."),
+    "normalize": (("vector",), "Same direction, length 1."),
+    "dot": (("a", "b"), "Dot product of two vectors."),
+    "cross": (("a", "b"), "A vector at right angles to both."),
+    "distance": (("a", "b"), "Distance between two points."),
+    # Types
+    "vector": (("x", "y", "z"), "Makes a vector. With one value, all three are set to it."),
+    "float": (("value",), "Turns value into a float."),
+    "int": (("value",), "Turns value into a whole number, cutting off the decimals."),
+    "bool": (("value",), "True unless value is 0."),
+    # Noise and random
+    "noise": (("position",), "Smooth noise, roughly between 0 and 1."),
+    "vnoise": (("position",), "Smooth noise as a vector, one value per axis."),
+    "rand": (("seed",), "Random number between 0 and 1. Same seed, same number."),
+    "vrand": (("seed",), "Random vector, each axis between 0 and 1."),
+    # Node values
+    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed."),
+    "chi": (("name", "[default]"), "A whole number value on the node."),
+    "chv": (("name", "[default]"), "A vector value on the node."),
+    "chb": (("name", "[default]"), "A checkbox on the node."),
+    # Bounding box
+    "getbbox_min": (("[input]",), "Lowest corner of the geometry's bounding box."),
+    "getbbox_max": (("[input]",), "Highest corner of the geometry's bounding box."),
+    "getbbox_size": (("[input]",), "Size of the geometry's bounding box."),
+    "getbbox_center": (("[input]",), "Center of the geometry's bounding box."),
+    "relbbox": (("[input]", "position"), "Where position sits in the bounding box, 0 to 1 on each axis."),
+    # Other inputs
+    "point": (("input", "name", "index"), 'Reads a point attribute from an input: point(1, "P", 0).'),
+    "prim": (("input", "name", "index"), "Reads a face attribute from an input."),
+    "vertex": (("input", "name", "index"), "Reads a corner attribute from an input."),
+    "npoints": (("input",), "Number of points on an input."),
+    "nprims": (("input",), "Number of faces on an input."),
+    "nvertices": (("input",), "Number of corners on an input."),
+    "nearpoint": (("input", "position"), "Index of the point on the input closest to position."),
+    # Loops
+    "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
+}
+
 
 class Compiler:
     def __init__(self, domain="POINT", pending_line=None, known_params=()):
