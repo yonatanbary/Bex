@@ -734,6 +734,19 @@ def test_curve_builtins():
     mesh = evaluate(obj)
     assert [d.value for d in mesh.attributes["u"].data] == [pytest_approx(v) for v in (0, 0.25, 0.5, 0.75, 1)]
     assert [d.value for d in mesh.attributes["l"].data] == [pytest_approx(v) for v in (0, 0.5, 1, 1.5, 2)]
+    # Two curves: @curvenum is the curve of each point, @ptnum counts all points.
+    join = tree.nodes.new("GeometryNodeJoinGeometry")
+    res2 = tree.nodes.new("GeometryNodeResampleCurve")
+    res2.inputs["Count"].default_value = 5
+    tree.links.new(line.outputs[0], res2.inputs[0])
+    tree.links.new(res.outputs[0], join.inputs[0])
+    tree.links.new(res2.outputs[0], join.inputs[0])
+    tree.links.new(join.outputs[0], node.inputs[0])
+    text.from_string("i@c = @curvenum\ni@p = @ptnum")
+    node.sync()
+    mesh = evaluate(obj)
+    assert sorted(d.value for d in mesh.attributes["c"].data) == [0] * 5 + [1] * 5
+    assert sorted(d.value for d in mesh.attributes["p"].data) == list(range(10))
 
 
 class pytest_approx(float):

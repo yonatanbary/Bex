@@ -80,6 +80,9 @@ BUILTINS = {
     "ptnum": ("int", "index", 0),
     "elemnum": ("int", "index", 0),
     "primnum": ("int", "index", 0),
+    "curvenum": ("int", "index", 0),
+    "vtxnum": ("int", "index", 0),
+    "edgenum": ("int", "index", 0),
     "index": ("int", "index", 0),
     "id": ("int", "id", 0),
     "Time": ("float", "time", 0),
@@ -87,9 +90,27 @@ BUILTINS = {
     "curveu": ("float", "spline_parameter", 0),  # 0-1 along each curve (Spline Parameter's Factor)
     "curvelength": ("float", "spline_parameter", 1),  # distance along the curve from its start
 }
+# Index built-ins that depend on the Run Over domain, like Formula to Nodes / Houdini:
+# name -> {domain: (input kind, output)}. @elemnum / @index are always the element's index.
+DOMAIN_INDEX = {
+    "ptnum": {"POINT": ("index", 0), "INSTANCE": ("index", 0), "CORNER": ("vertex_of_corner", 0)},
+    "primnum": {"FACE": ("index", 0), "CURVE": ("index", 0), "CORNER": ("face_of_corner", 0)},
+    "curvenum": {"CURVE": ("index", 0), "POINT": ("curve_of_point", 0)},
+    "vtxnum": {"CORNER": ("index", 0)},
+    "edgenum": {"EDGE": ("index", 0)},
+}
+INDEX_HINTS = {
+    "ptnum": "@ptnum is a point's number; this runs over {d}. Use @elemnum for this element's index",
+    "primnum": "@primnum is a face's or curve's number, and a point can belong to several faces. "
+               "On curve points use @curvenum, or set Run Over to Faces or Curves",
+    "curvenum": "@curvenum is the curve a point belongs to; run over Points or Curves",
+    "vtxnum": "@vtxnum is a face corner's number; run over Corners",
+    "edgenum": "@edgenum is an edge's number; run over Edges",
+}
+
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
+READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
 
 
@@ -608,6 +629,11 @@ class Compiler:
         return known
 
     def read_original(self, name, type):
+        if name in DOMAIN_INDEX:
+            found = DOMAIN_INDEX[name].get(self.domain)
+            if found is None:
+                raise self.err(INDEX_HINTS[name].format(d=self.domain.lower() + "s"))
+            return self.node("input", "int", (), out=found[1], name=found[0])
         if name in BUILTINS:
             _, kind, out = BUILTINS[name]
             return self.node("input", type, (), out=out, name=kind)

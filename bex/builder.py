@@ -14,6 +14,9 @@ INPUT_NODES = {
     "id": "GeometryNodeInputID",
     "time": "GeometryNodeInputSceneTime",
     "spline_parameter": "GeometryNodeSplineParameter",
+    "curve_of_point": "GeometryNodeCurveOfPoint",
+    "face_of_corner": "GeometryNodeFaceOfCorner",
+    "vertex_of_corner": "GeometryNodeVertexOfCorner",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
 

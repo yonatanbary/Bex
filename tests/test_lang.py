@@ -371,6 +371,24 @@ def test_curve_builtins():
     fails("@curveu = 1", "read-only")
 
 
+def test_domain_indices():
+    def kind(src, domain):
+        v = writes(src, domain)["a"]
+        return v.node.params["name"], v.out
+    assert kind("i@a = @ptnum", "POINT") == ("index", 0)
+    assert kind("i@a = @ptnum", "CORNER") == ("vertex_of_corner", 0)
+    assert kind("i@a = @primnum", "FACE") == ("index", 0) == kind("i@a = @primnum", "CURVE")
+    assert kind("i@a = @primnum", "CORNER") == ("face_of_corner", 0)
+    assert kind("i@a = @curvenum", "POINT") == ("curve_of_point", 0)
+    assert kind("i@a = @curvenum", "CURVE") == ("index", 0)
+    assert kind("i@a = @vtxnum", "CORNER") == kind("i@a = @edgenum", "EDGE") == ("index", 0)
+    assert kind("i@a = @elemnum", "FACE") == ("index", 0)
+    fails("i@a = @primnum", "@curvenum", domain="POINT")
+    fails("i@a = @ptnum", "@elemnum", domain="FACE")
+    fails("i@a = @vtxnum", "Corners", domain="POINT")
+    fails("@curvenum = 1", "read-only")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
