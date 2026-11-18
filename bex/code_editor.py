@@ -12,6 +12,7 @@ compiler's `pending_line`). The inputs appear once the cursor leaves the line
 """
 
 import json
+from collections import namedtuple
 import sys
 import textwrap
 import time
@@ -38,12 +39,13 @@ UNIT_Y = 20.0           # height of one layout row (Blender's UI_UNIT_Y)
 CLICK_SLOP = 5.0        # px (× UI scale): presses closer than this count as the same spot
 DEBUG_CLICKS = False    # show each click's count / position / selection in the status bar
 ZOOM_STEP = 0.1
-BAR_W = 5.0             # scrollbar thickness
-BAR_MARGIN = 3.0        # gap between a scrollbar and the box edge
-BAR_BOTTOM = 6.0        # gap under the horizontal scrollbar (a bit more, easier to grab)
-BAR_HIT = 4.0           # extra grab area around a scrollbar (kept inside the box)
+# Scrollbars sit outside the code box, like Houdini's: a column on its right and a
+# row under it, each with an arrow button at both ends.
+BAR_SIZE = 12.0         # width of the bar column / height of the bar row (and of an arrow button)
+BAR_GAP = 2.0           # between the code box and a bar
+BAR_W = 4.0             # thickness of the track and thumb
 BAR_MIN = 12.0          # shortest scrollbar thumb
-BAR_STRIP = BAR_BOTTOM + BAR_W + BAR_MARGIN  # room under the code for the horizontal bar
+ARROW = 3.0             # half-size of an arrow's chevron
 GUTTER_PAD = 0.8        # line-number column: space on each side of the numbers, in characters
 MIN_DIGITS = 2          # the column is never narrower than this many digits
 
@@ -77,9 +79,11 @@ PALETTE = {
     "selection": (0.30, 0.42, 0.62, 0.55),
     "cursor": (0.90, 0.90, 0.90, 1.0),
     "ghost": (0.50, 0.50, 0.52, 0.85),
-    "bar_track": (0.45, 0.52, 0.64, 0.10),
-    "bar": (0.50, 0.58, 0.72, 0.40),
-    "bar_active": (0.36, 0.52, 0.78, 0.85),
+    "bar_track": (0.17, 0.17, 0.17, 1.0),     # Houdini-style greys
+    "bar": (0.38, 0.38, 0.38, 1.0),
+    "bar_active": (0.50, 0.50, 0.50, 1.0),
+    "arrow": (0.62, 0.62, 0.62, 1.0),
+    "arrow_off": (0.32, 0.32, 0.32, 1.0),      # nothing to scroll that way
 }
 _COLOR_OF = {
     "comment": "comment", "string": "string", "number": "number", "constant": "number",
@@ -183,9 +187,9 @@ def visible_rows(line_count):
 
 
 def box_height(line_count, scale=1.0):
-    """The code rows, padding on top and, at the bottom, a strip that is always
-    kept for the horizontal scrollbar, so it never covers the last line."""
-    return visible_rows(line_count) * LINE_H * scale + PAD + BAR_STRIP
+    """The editor's height: the code box (rows plus padding) and the horizontal
+    scrollbar row under it."""
+    return visible_rows(line_count) * LINE_H * scale + 2 * PAD + BAR_GAP + BAR_SIZE
 
 
 def _wrap(node, text):
@@ -261,31 +265,74 @@ def wrangle_at(context, x, y):
     return None, None
 
 
-def scrollbars(node, rect, lines, view):
-    """The code box's scrollbars: {"v"/"h": (track, thumb, total, visible)}, where
-    track and thumb are (x0, y0, x1, y1) in region pixels. A bar is left out when
-    everything fits that way."""
+def code_rect(rect):
+    """The code box inside the editor rect from `box_rect`: the scrollbars take a
+    column on the right and a row at the bottom."""
     x0, y0, x1, y1, px = rect
+    bar = (BAR_SIZE + BAR_GAP) * px
+    return x0, y0 + bar, x1 - bar, y1, px
+
+
+Bar = namedtuple("Bar", "area track thumb minus plus total visible")
+
+
+def scrollbars(node, rect, lines, view):
+    """Both scrollbars: {"v"/"h": Bar}. Rects are (x0, y0, x1, y1) in region pixels:
+    `area` is the whole bar (arrows included), `track` the line between the arrows,
+    `minus` / `plus` the arrow buttons (up / down, left / right). `thumb` is None
+    when everything fits that way: then the bar is drawn dim and does nothing."""
+    x0, y0, x1, y1, px = rect
+    cx0, cy0, cx1, cy1, _ = code_rect(rect)
     line_h, char_w = _metrics(px, node.code_scale)
     rows = visible_rows(len(lines))
-    cols = max(1, int((x1 - text_left(x0, len(lines), char_w, px) - PAD * px) / char_w))
+    cols = max(1, int((cx1 - text_left(cx0, len(lines), char_w, px) - PAD * px) / char_w))
     v_total, h_total = len(lines), max(map(len, lines)) + 1  # +1: the cursor after the last char
-    has_v, has_h = v_total > rows, h_total > cols
-    w, m, mb = BAR_W * px, BAR_MARGIN * px, BAR_BOTTOM * px
+    size, half, gap = BAR_SIZE * px, BAR_W * px / 2, BAR_GAP * px
     bars = {}
-    if has_v:
-        top, bottom = y1 - m, y0 + (mb + w + m if has_h else m)
-        t = thumb(v_total, rows, view.top, top - bottom, BAR_MIN * px)
-        if t:
-            track = (x1 - m - w, bottom, x1 - m, top)
-            bars["v"] = (track, (track[0], top - t[0] - t[1], track[2], top - t[0]), v_total, rows)
-    if has_h:
-        left, right = x0 + gutter_width(len(lines), char_w) + m, x1 - m - (w + m if has_v else 0)
-        t = thumb(h_total, cols, view.left, right - left, BAR_MIN * px)
-        if t:
-            track = (left, y0 + mb, right, y0 + mb + w)
-            bars["h"] = (track, (left + t[0], track[1], left + t[0] + t[1], track[3]), h_total, cols)
+    # Vertical: right of the code box, as tall as it.
+    bx0, mid = cx1 + gap, cx1 + gap + size / 2
+    track = (mid - half, cy0 + size, mid + half, cy1 - size)
+    t = thumb(v_total, rows, view.top, track[3] - track[1], BAR_MIN * px) if v_total > rows else None
+    knob = (track[0], track[3] - t[0] - t[1], track[2], track[3] - t[0]) if t else None
+    bars["v"] = Bar((bx0, cy0, x1, cy1), track, knob, (bx0, cy1 - size, x1, cy1), (bx0, cy0, x1, cy0 + size),
+                    v_total, rows)
+    # Horizontal: under the code box, as wide as it.
+    by1, mid = cy0 - gap, cy0 - gap - size / 2
+    track = (cx0 + size, mid - half, cx1 - size, mid + half)
+    t = thumb(h_total, cols, view.left, track[2] - track[0], BAR_MIN * px) if h_total > cols else None
+    knob = (track[0] + t[0], track[1], track[0] + t[0] + t[1], track[3]) if t else None
+    bars["h"] = Bar((cx0, y0, cx1, by1), track, knob, (cx0, y0, cx0 + size, by1), (cx1 - size, y0, cx1, by1),
+                    h_total, cols)
     return bars
+
+
+def _chevron(region, r, direction, color, px):
+    """A small arrow ("up" "down" "left" "right") centred in rect r."""
+    cx, cy, a = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2, ARROW * px
+    pts = {"up": [(cx - a, cy - a / 2), (cx, cy + a / 2), (cx + a, cy - a / 2)],
+           "down": [(cx - a, cy + a / 2), (cx, cy - a / 2), (cx + a, cy + a / 2)],
+           "left": [(cx + a / 2, cy - a), (cx - a / 2, cy), (cx + a / 2, cy + a)],
+           "right": [(cx - a / 2, cy - a), (cx + a / 2, cy), (cx - a / 2, cy + a)]}[direction]
+    shader = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
+    shader.uniform_float("viewportSize", (region.width, region.height))
+    shader.uniform_float("lineWidth", max(1.0, 1.2 * px))
+    shader.uniform_float("color", color)
+    batch_for_shader(shader, "LINE_STRIP", {"pos": pts}).draw(shader)
+
+
+def _draw_bars(node, region, rect, lines, view, editing):
+    gpu.state.scissor_test_set(False)
+    for axis, bar in scrollbars(node, rect, lines, view).items():
+        on = bar.thumb is not None
+        _rect(*bar.track, PALETTE["bar_track"])
+        if on:
+            active = editing and _session.bar is not None and _session.bar[0] == axis
+            _rect(*bar.thumb, PALETTE["bar_active" if active else "bar"])
+        color = PALETTE["arrow" if on else "arrow_off"]
+        minus, plus = ("up", "down") if axis == "v" else ("left", "right")
+        _chevron(region, bar.minus, minus, color, rect[4])
+        _chevron(region, bar.plus, plus, color, rect[4])
+    gpu.state.blend_set("ALPHA")
 
 
 def _shows_code(node):
@@ -409,9 +456,11 @@ def _clip(region, vx, vy, x0, y0, x1, y1):
 
 
 def _draw_node(node, region, vx, vy):
-    x0, y0, x1, y1, px = box_rect(node, region)
-    info_y0 = y0 - info_height(node) * px
-    if x1 < 0 or y1 < 0 or x0 > region.width or info_y0 > region.height or x1 - x0 < 4:
+    outer = box_rect(node, region)
+    ox0, oy0, ox1, _oy1, px = outer
+    x0, y0, x1, y1, _ = code_rect(outer)
+    info_y0 = oy0 - info_height(node) * px
+    if ox1 < 0 or y1 < 0 or ox0 > region.width or info_y0 > region.height or x1 - x0 < 4:
         return
     gpu.state.scissor_test_set(False)  # the previous node's clip must not cut this one
     gpu.state.blend_set("ALPHA")       # nor its text drawing switch blending off
@@ -442,7 +491,7 @@ def _draw_node(node, region, vx, vy):
     if FONT_SIZE * scale * px < 3:  # too far out to read
         outline()
         return
-    _draw_info(node, region, x0, info_y0, x1, y0, px, vx, vy)
+    _draw_info(node, region, ox0, info_y0, ox1, oy0, px, vx, vy)
     line_h, char_w = _metrics(px, scale)
     pad = PAD * px
     left, top = text_left(x0, len(lines), char_w, px), y1 - pad
@@ -514,11 +563,7 @@ def _draw_node(node, region, vx, vy):
         blf.color(FONT_ID, *PALETTE["line_number_current" if row == current else "line_number"])
         blf.position(FONT_ID, gutter_r - GUTTER_PAD * char_w - blf.dimensions(FONT_ID, number)[0], y, 0)
         blf.draw(FONT_ID, number)
-    gpu.state.blend_set("ALPHA")
-    for axis, (track, knob, _total, _visible) in scrollbars(node, (x0, y0, x1, y1, px), lines, view).items():
-        _rect(*track, PALETTE["bar_track"])
-        active = editing and _session.bar is not None and _session.bar[0] == axis
-        _rect(*knob, PALETTE["bar_active" if active else "bar"])
+    _draw_bars(node, region, outer, lines, view, editing)
     outline()
 
 
@@ -813,35 +858,48 @@ class BEX_OT_code_edit(bpy.types.Operator):
         self._after_change(node, version, row_before)
 
     def _bar_press(self, node, rect, event):
-        """A press on a scrollbar: grab the thumb, or jump there when on the track."""
+        """A press on a scrollbar: an arrow scrolls one line / character, the thumb
+        is grabbed, the track jumps there. A bar with nothing to scroll ignores it."""
         x, y = event.mouse_region_x, event.mouse_region_y
-        hit = BAR_HIT * rect[4]
-        for axis, (track, knob, _total, _visible) in scrollbars(node, rect, _session.buf.lines, _session.view).items():
-            # The grab area is bigger than the drawn bar, but stays inside the box.
-            hx0, hy0 = max(track[0] - hit, rect[0]), max(track[1] - hit, rect[1])
-            hx1, hy1 = min(track[2] + hit, rect[2]), min(track[3] + hit, rect[3])
-            if hx0 <= x <= hx1 and hy0 <= y <= hy1:
+        view, lines = _session.view, _session.buf.lines
+
+        def inside(r):
+            return r[0] <= x <= r[2] and r[1] <= y <= r[3]
+
+        for axis, bar in scrollbars(node, rect, lines, view).items():
+            if not inside(bar.area):
+                continue
+            if bar.thumb is None:
+                return True  # nothing to scroll: the press does nothing
+            _session.suggestion = ""
+            step = -1 if inside(bar.minus) else 1 if inside(bar.plus) else 0
+            if step:
                 if axis == "v":
-                    y = min(max(y, track[1]), track[3])
-                    on = knob[1] <= y <= knob[3]
-                    grab = knob[3] - y if on else (knob[3] - knob[1]) / 2
+                    view.scroll(step, bar.total, bar.visible)
                 else:
-                    x = min(max(x, track[0]), track[2])
-                    on = knob[0] <= x <= knob[2]
-                    grab = x - knob[0] if on else (knob[2] - knob[0]) / 2
-                _session.bar = (axis, grab)
-                _session.suggestion = ""
-                self._bar_drag(node, rect, event)
+                    view.left = max(0, min(view.left + step, bar.total - bar.visible))
                 return True
+            track, knob = bar.track, bar.thumb
+            if axis == "v":
+                y = min(max(y, track[1]), track[3])
+                on = knob[1] <= y <= knob[3]
+                grab = knob[3] - y if on else (knob[3] - knob[1]) / 2
+            else:
+                x = min(max(x, track[0]), track[2])
+                on = knob[0] <= x <= knob[2]
+                grab = x - knob[0] if on else (knob[2] - knob[0]) / 2
+            _session.bar = (axis, grab)
+            self._bar_drag(node, rect, event)
+            return True
         return False
 
     def _bar_drag(self, node, rect, event):
         axis, grab = _session.bar
         view, lines = _session.view, _session.buf.lines
-        bar = scrollbars(node, rect, lines, view).get(axis)
-        if bar is None:
+        bar = scrollbars(node, rect, lines, view)[axis]
+        if bar.thumb is None:
             return
-        track, knob, total, visible = bar
+        track, knob, total, visible = bar.track, bar.thumb, bar.total, bar.visible
         if axis == "v":
             size = knob[3] - knob[1]
             view.top = thumb_first(track[3] - event.mouse_region_y - grab, size, total, visible, track[3] - track[1])

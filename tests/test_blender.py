@@ -382,6 +382,31 @@ def test_code_box_scrolls():
     ce._session = ce.Session(node)
     assert ce._session.view is view
     ce._session = None
+    # Scrollbar arrows step one line / one character; a bar with nothing to scroll ignores presses.
+    text.from_string("\n".join(f"@P.z = {i}  # " + "x" * 80 for i in range(40)))
+    ce._session = ce.Session(node)
+    view.top = view.left = 0
+    rect = (0.0, 0.0, 300.0, 400.0, 1.0)
+    op = types.SimpleNamespace(_bar_drag=lambda *a: ce.BEX_OT_code_edit._bar_drag(op, *a))
+    def press(r):
+        event = types.SimpleNamespace(mouse_region_x=(r[0] + r[2]) / 2, mouse_region_y=(r[1] + r[3]) / 2)
+        return ce.BEX_OT_code_edit._bar_press(op, node, rect, event)
+    bars = ce.scrollbars(node, rect, ce._session.buf.lines, view)
+    assert bars["v"].thumb and bars["h"].thumb
+    assert bars["v"].area[0] >= ce.code_rect(rect)[2] and bars["h"].area[3] <= ce.code_rect(rect)[1]  # outside the box
+    assert press(bars["v"].plus) and view.top == 1
+    assert press(bars["v"].minus) and press(bars["v"].minus) and view.top == 0  # stops at the top
+    assert press(bars["h"].plus) and press(bars["h"].plus) and view.left == 2
+    assert press(bars["h"].minus) and view.left == 1
+    ce._session.bar = None
+    text.from_string("@P.z = 1")
+    ce._session.pull(node)
+    view.left = 0
+    bars = ce.scrollbars(node, rect, ce._session.buf.lines, view)
+    assert bars["v"].thumb is None and bars["h"].thumb is None
+    assert press(bars["v"].plus) and view.top == 0 and press(bars["h"].plus) and view.left == 0
+    assert ce._session.bar is None  # nothing grabbed
+    ce._session = None
     # A short script has nothing to scroll: the wheel goes to the Node Editor.
     short = make_setup("@P.z = 1")[1]
     assert not ce.scroll_code(short, None, wheel("WHEELDOWNMOUSE"))
