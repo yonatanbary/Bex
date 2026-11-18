@@ -46,6 +46,11 @@ BAR_GAP = 2.0           # between the code box and a bar
 BAR_W = 4.0             # thickness of the track and thumb
 BAR_MIN = 12.0          # shortest scrollbar thumb
 ARROW = 3.0             # half-size of an arrow's chevron
+REPEAT_DELAY = 0.35     # s an arrow is held before it starts repeating
+REPEAT_RATE = 12.0      # lines / characters per second when it starts repeating...
+REPEAT_MAX = 60.0       # ...speeding up to this
+REPEAT_RAMP = 1.5       # s from REPEAT_RATE to REPEAT_MAX
+REPEAT_TICK = 0.02      # s between timer events while an arrow is held
 GUTTER_PAD = 0.8        # line-number column: space on each side of the numbers, in characters
 MIN_DIGITS = 2          # the column is never narrower than this many digits
 
@@ -306,6 +311,14 @@ def scrollbars(node, rect, lines, view):
     return bars
 
 
+def _scroll_bar(view, axis, bar, delta):
+    """Scroll by `delta` lines (vertical bar) or characters (horizontal), clamped."""
+    if axis == "v":
+        view.scroll(delta, bar.total, bar.visible)
+    else:
+        view.left = max(0, min(view.left + delta, bar.total - bar.visible))
+
+
 def _chevron(region, r, direction, color, px):
     """A small arrow ("up" "down" "left" "right") centred in rect r."""
     cx, cy, a = (r[0] + r[2]) / 2, (r[1] + r[3]) / 2, ARROW * px
@@ -372,6 +385,7 @@ class Session:
         self.last_press = None         # (time, x, y) of the last press, to count multi-clicks
         self.suggestion = ""           # inline completion shown after the cursor
         self.bar = None                # ("v" | "h", grab offset) while dragging a scrollbar
+        self.repeat = None             # [axis, step, pressed, last tick, carry] while an arrow is held
 
     def node(self):
         tree = bpy.data.node_groups.get(self.tree_name)
@@ -693,8 +707,10 @@ class BEX_OT_code_edit(bpy.types.Operator):
         area = context.area
         self._area = (area.x, area.y, area.width, area.height)
         self._select(context, node)
+        self._timer = None
         if not self._bar_press(node, rect, event):
             self._click(context, node, rect, event)
+        self._sync_timer(context)
         context.window_manager.modal_handler_add(self)
         _redraw(context)
         return {"RUNNING_MODAL"}
@@ -705,6 +721,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
             return self._end(context, None, {"CANCELLED"})
         _session.pull(node)
         result = self._event(context, node, event)
+        self._sync_timer(context)
         if result is not None:
             return result
         _redraw(context)
@@ -713,6 +730,9 @@ class BEX_OT_code_edit(bpy.types.Operator):
     def _event(self, context, node, event):
         kind, value = event.type, event.value
         x, y = event.mouse_region_x, event.mouse_region_y
+        if kind == "TIMER" and _session.repeat is not None:
+            self._repeat(node, box_rect(node, context.region), event)
+            return None
         if kind in _PASS:
             if kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"):
                 hit, _ = wrangle_at(context, x, y)
@@ -731,6 +751,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
             if value == "RELEASE":
                 _session.dragging = False
                 _session.bar = None
+                _session.repeat = None
                 return None
             hit, rect = wrangle_at(context, x, y)
             if hit is None:  # click outside: finish and let the click through
@@ -874,10 +895,9 @@ class BEX_OT_code_edit(bpy.types.Operator):
             _session.suggestion = ""
             step = -1 if inside(bar.minus) else 1 if inside(bar.plus) else 0
             if step:
-                if axis == "v":
-                    view.scroll(step, bar.total, bar.visible)
-                else:
-                    view.left = max(0, min(view.left + step, bar.total - bar.visible))
+                _scroll_bar(view, axis, bar, step)
+                now = time.monotonic()
+                _session.repeat = [axis, step, now, now, 0.0]  # held down, it repeats (_repeat)
                 return True
             track, knob = bar.track, bar.thumb
             if axis == "v":
@@ -892,6 +912,37 @@ class BEX_OT_code_edit(bpy.types.Operator):
             self._bar_drag(node, rect, event)
             return True
         return False
+
+    def _repeat(self, node, rect, event):
+        """A timer tick while an arrow is held: after REPEAT_DELAY it keeps scrolling,
+        faster the longer it is held, while the mouse stays on the arrow."""
+        axis, step, pressed, last, carry = _session.repeat
+        now = time.monotonic()
+        _session.repeat[3] = now
+        held = now - pressed
+        if held < REPEAT_DELAY:
+            return
+        rate = REPEAT_RATE + (REPEAT_MAX - REPEAT_RATE) * min(1.0, (held - REPEAT_DELAY) / REPEAT_RAMP)
+        carry += rate * (now - max(last, pressed + REPEAT_DELAY))
+        n = int(carry)
+        _session.repeat[4] = carry - n
+        if not n:
+            return
+        bar = scrollbars(node, rect, _session.buf.lines, _session.view)[axis]
+        r = bar.minus if step < 0 else bar.plus
+        x, y = event.mouse_region_x, event.mouse_region_y
+        if bar.thumb is not None and r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+            _scroll_bar(_session.view, axis, bar, step * n)
+
+    def _sync_timer(self, context):
+        """Run a timer only while an arrow is held (it drives _repeat)."""
+        want = _session is not None and _session.repeat is not None
+        timer = getattr(self, "_timer", None)
+        if want and timer is None:
+            self._timer = context.window_manager.event_timer_add(REPEAT_TICK, window=context.window)
+        elif not want and timer is not None:
+            context.window_manager.event_timer_remove(timer)
+            self._timer = None
 
     def _bar_drag(self, node, rect, event):
         axis, grab = _session.bar
@@ -922,6 +973,11 @@ class BEX_OT_code_edit(bpy.types.Operator):
 
     def _end(self, context, node, result):
         global _session
+        if _session is not None:
+            _session.repeat = None
+        if getattr(self, "_timer", None) is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
         if node is not None:
             _session.push(node)
             node.sync()  # losing focus is when the code is evaluated

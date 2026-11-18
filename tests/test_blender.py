@@ -398,10 +398,24 @@ def test_code_box_scrolls():
     assert press(bars["v"].minus) and press(bars["v"].minus) and view.top == 0  # stops at the top
     assert press(bars["h"].plus) and press(bars["h"].plus) and view.left == 2
     assert press(bars["h"].minus) and view.left == 1
+    # Held down, an arrow repeats after a short delay, faster the longer it is held.
+    view.top = 0
+    assert press(bars["v"].plus) and view.top == 1 and ce._session.repeat is not None
+    def hold(seconds):
+        ce._session.repeat[2] -= seconds  # pretend it was pressed earlier
+        ce._session.repeat[3] -= seconds
+        r = bars["v"].plus
+        ce.BEX_OT_code_edit._repeat(op, node, rect, types.SimpleNamespace(
+            mouse_region_x=(r[0] + r[2]) / 2, mouse_region_y=(r[1] + r[3]) / 2))
+    hold(0.2)
+    assert view.top == 1  # not yet
+    hold(0.4)
+    assert view.top > 2
+    ce._session.repeat = None
     ce._session.bar = None
     text.from_string("@P.z = 1")
     ce._session.pull(node)
-    view.left = 0
+    view.top = view.left = 0
     bars = ce.scrollbars(node, rect, ce._session.buf.lines, view)
     assert bars["v"].thumb is None and bars["h"].thumb is None
     assert press(bars["v"].plus) and view.top == 0 and press(bars["h"].plus) and view.left == 0
