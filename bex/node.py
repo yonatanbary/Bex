@@ -112,7 +112,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         row.prop(self, "domain", text="")
         row.prop(self, "show_code", text="", icon="HIDE_OFF" if self.show_code else "HIDE_ON")
         row.operator("bex.edit_nodes", text="", icon="NODETREE")
-        if self.error:
+        if self.error and not (self.show_code and self.script):  # else it's shown under the code
             col = layout.column(align=True)
             col.alert = True
             col.label(text=self.error, icon="ERROR")

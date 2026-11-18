@@ -259,9 +259,23 @@ def test_mouse():
     b.click(1, 1, select=True)
     assert b.anchor == (0, 0) and b.cursor == (1, 1)
     b.select_line(0)
-    assert b.selected_text() == "v@x = @P * 2.5;\n"
+    assert b.selected_text() == "v@x = @P * 2.5;" and b.cursor == (0, 15)
     b.select_line(1)
     assert b.selected_text() == "foo"
+
+
+def test_scrollbar_thumb():
+    from bex.editor.keys import thumb, thumb_first
+    assert thumb(10, 10, 0, 100) is None            # everything fits
+    assert thumb(100, 25, 0, 100) == (0, 25)
+    assert thumb(100, 25, 75, 100) == (75, 25)      # at the end
+    assert thumb(100, 25, 999, 100) == (75, 25)     # clamped
+    assert thumb(1000, 10, 0, 100, min_size=12) == (0, 12)
+    for first in (0, 10, 37, 75):
+        off, size = thumb(100, 25, first, 100)
+        assert thumb_first(off, size, 100, 25, 100) == first
+    assert thumb_first(-50, 25, 100, 25, 100) == 0
+    assert thumb_first(500, 25, 100, 25, 100) == 75
 
 
 def test_version_increments():

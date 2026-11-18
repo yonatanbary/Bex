@@ -107,6 +107,25 @@ def handle_key(buf, key, text="", ctrl=False, shift=False, alt=False, cmd=False,
     return False
 
 
+def thumb(total, visible, first, length, min_size=0.0):
+    """Scrollbar thumb `(offset, size)` on a track of `length`, for `visible` of
+    `total` rows (or columns) starting at `first`. None when everything fits."""
+    if total <= visible or length <= 0:
+        return None
+    size = min(length, max(min_size, length * visible / total))
+    span = total - visible
+    offset = (length - size) * min(max(first, 0), span) / span
+    return offset, size
+
+
+def thumb_first(offset, size, total, visible, length):
+    """Inverse of `thumb`: the first row (or column) for a thumb at `offset`."""
+    if total <= visible or length <= size:
+        return 0
+    frac = min(max(offset / (length - size), 0.0), 1.0)
+    return int(round(frac * (total - visible)))
+
+
 class View:
     """Which part of the buffer is visible, and the point <-> (row, col) mapping.
 

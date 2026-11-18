@@ -13,6 +13,7 @@ compiler's `pending_line`). The inputs appear once the cursor leaves the line
 
 import json
 import sys
+import textwrap
 import time
 
 import blf
@@ -23,8 +24,9 @@ from gpu_extras.batch import batch_for_shader
 from .editor.buffer import TextBuffer, is_word_char
 from .editor.complete import suggest
 from .editor.highlight import highlight
+from .upstream import incoming_attributes
 from .lang.compiler import BUILTINS
-from .editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, View, handle_key
+from .editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, View, handle_key, thumb, thumb_first
 
 FONT_ID = 1             # Blender's built-in monospace font
 FONT_SIZE = 11.0        # all sizes are node-editor units at zoom 1, before UI scale
@@ -33,14 +35,21 @@ PAD = 5.0
 MIN_ROWS = 3
 MAX_ROWS = 40           # longer scripts scroll inside the box
 UNIT_Y = 20.0           # height of one layout row (Blender's UI_UNIT_Y)
-TRIPLE_CLICK = 0.45     # seconds after a double-click in which a click selects the line
+CLICK_SLOP = 5.0        # px (× UI scale): presses closer than this count as the same spot
+DEBUG_CLICKS = False    # show each click's count / position / selection in the status bar
 ZOOM_STEP = 0.1
+BAR_W = 5.0             # scrollbar thickness
+BAR_MARGIN = 3.0        # gap between a scrollbar and the box edge
+BAR_BOTTOM = 6.0        # gap under the horizontal scrollbar (a bit more, easier to grab)
+BAR_HIT = 4.0           # extra grab area around a scrollbar (kept inside the box)
+BAR_MIN = 12.0          # shortest scrollbar thumb
 
 # The info strip under the code (attributes read / written). It sits inside the
 # reserved block, so it needs no layout measuring of its own.
 INFO_FONT = 9.0
 INFO_LINE_H = 12.0
-INFO_LINES = 2
+INFO_LINES = 3         # input, reads, writes
+ERROR_MAX_LINES = 4     # a long error wraps onto at most this many lines
 INFO_GAP = 4.0
 
 # A calm palette: mostly neutral text, colour only where it helps you read.
@@ -53,13 +62,16 @@ PALETTE = {
     "dim": (0.52, 0.52, 0.53, 1.0),
     "comment": (0.44, 0.47, 0.44, 1.0),
     "keyword": (0.56, 0.67, 0.84, 1.0),
-    "attr": (0.55, 0.78, 0.74, 1.0),
-    "number": (0.84, 0.70, 0.55, 1.0),
-    "string": (0.67, 0.78, 0.58, 1.0),
+    "attr": (0.96, 0.78, 0.55, 1.0),       # light orange: @attributes
+    "number": (0.93, 0.58, 0.30, 1.0),     # orange
+    "string": (0.55, 0.82, 0.45, 1.0),     # green
     "function": (0.88, 0.86, 0.78, 1.0),
     "selection": (0.30, 0.42, 0.62, 0.55),
     "cursor": (0.90, 0.90, 0.90, 1.0),
     "ghost": (0.50, 0.50, 0.52, 0.85),
+    "bar_track": (0.45, 0.52, 0.64, 0.10),
+    "bar": (0.50, 0.58, 0.72, 0.40),
+    "bar_active": (0.36, 0.52, 0.78, 0.85),
 }
 _COLOR_OF = {
     "comment": "comment", "string": "string", "number": "number", "constant": "number",
@@ -91,14 +103,29 @@ def box_height(line_count, scale=1.0):
     return visible_rows(line_count) * LINE_H * scale + 2 * PAD
 
 
-def info_height():
-    return INFO_GAP + INFO_LINES * INFO_LINE_H
+def error_lines(node):
+    """The node's error wrapped to the code box width (in the strip's font), or []."""
+    if not node.error:
+        return []
+    blf.size(FONT_ID, INFO_FONT)
+    char_w = blf.dimensions(FONT_ID, "M" * 10)[0] / 10 or INFO_FONT * 0.6
+    width = max(10, int((node.width - 2 * SIDE - 2 * PAD) / char_w))
+    lines = textwrap.wrap(node.error, width) or [node.error]
+    if len(lines) > ERROR_MAX_LINES:
+        lines = lines[:ERROR_MAX_LINES]
+        lines[-1] = lines[-1][:width - 1] + "…"
+    return lines
+
+
+def info_height(node):
+    """The strip under the code: the error (if any), then reads / writes."""
+    return INFO_GAP + (len(error_lines(node)) + INFO_LINES) * INFO_LINE_H
 
 
 def reserve(layout, node):
     """Empty block in the node body the size of the code box plus the info strip."""
     col = layout.column()
-    col.scale_y = (box_height(len(node.script.lines), node.code_scale) + info_height()) / UNIT_Y
+    col.scale_y = (box_height(len(node.script.lines), node.code_scale) + info_height(node)) / UNIT_Y
     col.label(text="")
 
 
@@ -113,7 +140,7 @@ def _zoom(region):
 
 def box_rect(node, region):
     """(x0, y0, x1, y1, px) of the code box in region pixels; px = pixels per unit.
-    The info strip is the `info_height()` just below y0."""
+    The info strip is the `info_height(node)` just below y0."""
     s = _ui_scale()
     px = _zoom(region) / 1000.0 * s
     loc = node.location_absolute
@@ -123,7 +150,7 @@ def box_rect(node, region):
     v2d = region.view2d
     x0, y_bottom_node = v2d.view_to_region(left_v, bottom_v, clip=False)
     x1 = v2d.view_to_region(left_v + node.width * s, 0, clip=False)[0]
-    y0 = y_bottom_node + (BOTTOM_PAD + inputs * SOCKET_ROW + info_height()) * px
+    y0 = y_bottom_node + (BOTTOM_PAD + inputs * SOCKET_ROW + info_height(node)) * px
     y1 = y0 + box_height(len(node.script.lines), node.code_scale) * px
     return x0 + SIDE * px, y0, x1 - SIDE * px, y1, px
 
@@ -139,6 +166,33 @@ def wrangle_at(context, x, y):
             if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
                 return node, rect
     return None, None
+
+
+def scrollbars(node, rect, lines, view):
+    """The code box's scrollbars: {"v"/"h": (track, thumb, total, visible)}, where
+    track and thumb are (x0, y0, x1, y1) in region pixels. A bar is left out when
+    everything fits that way."""
+    x0, y0, x1, y1, px = rect
+    line_h, char_w = _metrics(px, node.code_scale)
+    rows = visible_rows(len(lines))
+    cols = max(1, int((x1 - x0 - 2 * PAD * px) / char_w))
+    v_total, h_total = len(lines), max(map(len, lines)) + 1  # +1: the cursor after the last char
+    has_v, has_h = v_total > rows, h_total > cols
+    w, m, mb = BAR_W * px, BAR_MARGIN * px, BAR_BOTTOM * px
+    bars = {}
+    if has_v:
+        top, bottom = y1 - m, y0 + (mb + w + m if has_h else m)
+        t = thumb(v_total, rows, view.top, top - bottom, BAR_MIN * px)
+        if t:
+            track = (x1 - m - w, bottom, x1 - m, top)
+            bars["v"] = (track, (track[0], top - t[0] - t[1], track[2], top - t[0]), v_total, rows)
+    if has_h:
+        left, right = x0 + m, x1 - m - (w + m if has_v else 0)
+        t = thumb(h_total, cols, view.left, right - left, BAR_MIN * px)
+        if t:
+            track = (left, y0 + mb, right, y0 + mb + w)
+            bars["h"] = (track, (left + t[0], track[1], left + t[0] + t[1], track[3]), h_total, cols)
+    return bars
 
 
 def _shows_code(node):
@@ -163,8 +217,10 @@ class Session:
         self.view = View()
         self.cols = 40                 # visible columns, updated on draw
         self.dragging = False
-        self.last_double = None        # (time, row) of the last double-click, for triple-click
+        self.clicks = 0                # presses in the current multi-click run (1, 2, 3)
+        self.last_press = None         # (time, x, y) of the last press, to count multi-clicks
         self.suggestion = ""           # inline completion shown after the cursor
+        self.bar = None                # ("v" | "h", grab offset) while dragging a scrollbar
 
     def node(self):
         tree = bpy.data.node_groups.get(self.tree_name)
@@ -235,11 +291,26 @@ def _draw():
         gpu.state.blend_set("NONE")
 
 
+def _clip(region, vx, vy, x0, y0, x1, y1):
+    """Clip drawing to a box, clamped to the region. Metal (macOS) drops the whole
+    draw when the scissor reaches outside the region, e.g. a node half off-screen.
+    Returns False when nothing of the box is visible."""
+    cx0, cy0 = max(0, int(x0)), max(0, int(y0))
+    cx1, cy1 = min(region.width, int(x1) + 1), min(region.height, int(y1) + 1)
+    if cx1 <= cx0 or cy1 <= cy0:
+        return False
+    gpu.state.scissor_test_set(True)
+    gpu.state.scissor_set(int(vx) + cx0, int(vy) + cy0, cx1 - cx0, cy1 - cy0)
+    return True
+
+
 def _draw_node(node, region, vx, vy):
     x0, y0, x1, y1, px = box_rect(node, region)
-    info_y0 = y0 - info_height() * px
+    info_y0 = y0 - info_height(node) * px
     if x1 < 0 or y1 < 0 or x0 > region.width or info_y0 > region.height or x1 - x0 < 4:
         return
+    gpu.state.scissor_test_set(False)  # the previous node's clip must not cut this one
+    gpu.state.blend_set("ALPHA")       # nor its text drawing switch blending off
     editing = is_editing(node)
     if editing:
         lines, view = _session.buf.lines, _session.view
@@ -262,7 +333,7 @@ def _draw_node(node, region, vx, vy):
             _rect(*r, edge)
     if FONT_SIZE * scale * px < 3:  # too far out to read
         return
-    _draw_info(node, x0, info_y0, x1, y0, px, vx, vy)
+    _draw_info(node, region, x0, info_y0, x1, y0, px, vx, vy)
     line_h, char_w = _metrics(px, scale)
     pad = PAD * px
     left, top = x0 + pad, y1 - pad
@@ -271,8 +342,8 @@ def _draw_node(node, region, vx, vy):
     if editing:
         _session.cols = cols
         view.clamp(len(lines), rows)
-    gpu.state.scissor_test_set(True)
-    gpu.state.scissor_set(int(vx + x0), int(vy + y0), int(x1 - x0) + 1, int(y1 - y0) + 1)
+    if not _clip(region, vx, vy, x0, y0, x1, y1):
+        return
 
     def col_x(col):
         return left + (col - view.left) * char_w
@@ -284,8 +355,10 @@ def _draw_node(node, region, vx, vy):
             y_top = top - (row - first) * line_h
             if sel and sel[0][0] <= row <= sel[1][0]:
                 c0 = sel[0][1] if row == sel[0][0] else 0
-                c1 = sel[1][1] if row == sel[1][0] else len(lines[row]) + 1
-                _rect(col_x(c0), y_top - line_h, col_x(c1), y_top, PALETTE["selection"])
+                # A row whose line break is selected fills to the box's right edge,
+                # so empty lines inside a selection show as full rows.
+                right = col_x(sel[1][1]) if row == sel[1][0] else x1 - pad
+                _rect(col_x(c0), y_top - line_h, right, y_top, PALETTE["selection"])
     spans = _spans(lines)
     ghost = _session.suggestion if editing else ""
     ghost_row, ghost_col = _session.buf.cursor if editing else (-1, 0)
@@ -310,12 +383,17 @@ def _draw_node(node, region, vx, vy):
             blf.color(FONT_ID, *PALETTE[_COLOR_OF.get(kind, "text")])
             blf.position(FONT_ID, col_x(start + offset), y, 0)
             blf.draw(FONT_ID, line[start:end])
+    gpu.state.blend_set("ALPHA")  # blf text drawing turns blending off
     if editing:
         row, col = _session.buf.cursor
         if first <= row < last:
             y_top = top - (row - first) * line_h
             w = max(1.0, 1.5 * px)
             _rect(col_x(col), y_top - line_h, col_x(col) + w, y_top, PALETTE["cursor"])
+    for axis, (track, knob, _total, _visible) in scrollbars(node, (x0, y0, x1, y1, px), lines, view).items():
+        _rect(*track, PALETTE["bar_track"])
+        active = editing and _session.bar is not None and _session.bar[0] == axis
+        _rect(*knob, PALETTE["bar_active" if active else "bar"])
 
 
 def _split_spans(spans, col):
@@ -330,8 +408,9 @@ def _split_spans(spans, col):
 
 
 def info_lines(node):
-    """The two lines under the code: attributes read from the incoming geometry,
-    and attributes written plus the node count."""
+    """The lines under the code: named attributes on the incoming geometry (a
+    static guess, see upstream.py), attributes the script reads, and attributes
+    written plus the node count."""
     try:
         info = json.loads(node.info) if node.info else {}
     except ValueError:
@@ -340,11 +419,12 @@ def info_lines(node):
     def names(pairs):
         return "  ".join(_attr_label(n, t) for n, t in pairs) or "–"
 
+    incoming = names(incoming_attributes(node))
     reads = names(info.get("reads", []))
     writes = names(info.get("writes", []))
     count = info.get("nodes")
     tail = f"   ·  {count} nodes" if count is not None else ""
-    return [("reads", reads), ("writes", writes + tail)]
+    return [("input", incoming), ("reads", reads), ("writes", writes + tail)]
 
 
 def _attr_label(name, type):
@@ -353,13 +433,20 @@ def _attr_label(name, type):
     return _TYPE_PREFIX.get(type, "") + "@" + name
 
 
-def _draw_info(node, x0, y0, x1, y1, px, vx, vy):
-    gpu.state.scissor_test_set(True)
-    gpu.state.scissor_set(int(vx + x0), int(vy + y0), int(x1 - x0) + 1, int(y1 - y0) + 1)
+def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
+    if not _clip(region, vx, vy, x0, y0, x1, y1):
+        return
     blf.size(FONT_ID, INFO_FONT * px)
     label_w = blf.dimensions(FONT_ID, "writes  ")[0]
     line_h = INFO_LINE_H * px
     y = y1 - INFO_GAP * px - line_h + (line_h - INFO_FONT * px) * 0.5 + 0.2 * INFO_FONT * px
+    blf.color(FONT_ID, *PALETTE["error"][:3], 1.0)
+    for line in error_lines(node):
+        blf.size(FONT_ID, INFO_FONT * px)
+        blf.position(FONT_ID, x0 + PAD * px, y, 0)
+        blf.draw(FONT_ID, line)
+        y -= line_h
+    blf.size(FONT_ID, INFO_FONT * px)
     for label, value in info_lines(node):
         blf.color(FONT_ID, *PALETTE["comment"])
         blf.position(FONT_ID, x0 + PAD * px, y, 0)
@@ -415,7 +502,8 @@ class BEX_OT_code_edit(bpy.types.Operator):
         area = context.area
         self._area = (area.x, area.y, area.width, area.height)
         self._select(context, node)
-        self._click(context, node, rect, event)
+        if not self._bar_press(node, rect, event):
+            self._click(context, node, rect, event)
         context.window_manager.modal_handler_add(self)
         _redraw(context)
         return {"RUNNING_MODAL"}
@@ -438,11 +526,20 @@ class BEX_OT_code_edit(bpy.types.Operator):
             if kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE"):
                 hit, _ = wrangle_at(context, x, y)
                 lines = len(_session.buf.lines)
+                if hit == node and event.shift:  # Shift+wheel scrolls sideways
+                    view = _session.view
+                    longest = max(map(len, _session.buf.lines)) + 1
+                    step = -3 if kind == "WHEELUPMOUSE" else 3
+                    view.left = max(0, min(view.left + step, max(view.left, longest - _session.cols)))
+                    return None
                 if hit == node and lines > MAX_ROWS:
                     _session.view.scroll(-3 if kind == "WHEELUPMOUSE" else 3, lines, MAX_ROWS)
                     return None
             return {"PASS_THROUGH"}
         if kind == "MOUSEMOVE":
+            if _session.bar is not None:
+                self._bar_drag(node, box_rect(node, context.region), event)
+                return None
             if _session.dragging:
                 self._click(context, node, box_rect(node, context.region), event, drag=True)
                 return None
@@ -450,6 +547,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
         if kind == "LEFTMOUSE":
             if value == "RELEASE":
                 _session.dragging = False
+                _session.bar = None
                 return None
             hit, rect = wrangle_at(context, x, y)
             if hit is None:  # click outside: finish and let the click through
@@ -458,7 +556,10 @@ class BEX_OT_code_edit(bpy.types.Operator):
                 self._end(context, node, {"FINISHED"})
                 self._start_on(context, hit, rect, event)
                 return None
-            self._click(context, node, rect, event, double=value == "DOUBLE_CLICK")
+            if self._bar_press(node, rect, event):
+                return None
+            # Blender's DOUBLE_CLICK is treated as a plain press: we count clicks ourselves.
+            self._click(context, node, rect, event)
             return None
         if kind == "RIGHTMOUSE" and value == "PRESS":
             return self._end(context, node, {"FINISHED", "PASS_THROUGH"})
@@ -496,7 +597,8 @@ class BEX_OT_code_edit(bpy.types.Operator):
         # anything else hides it.
         changed = buf.version != version
         if changed and (typed and is_word_char(event.unicode[-1:]) or event.type == "BACK_SPACE"):
-            _session.suggestion = suggest(buf.lines, *buf.cursor)
+            incoming = [name for name, _type in incoming_attributes(node)]
+            _session.suggestion = suggest(buf.lines, *buf.cursor, attributes=incoming)
         else:
             _session.suggestion = ""
         if done in (ZOOM_IN, ZOOM_OUT, ZOOM_RESET):
@@ -515,40 +617,105 @@ class BEX_OT_code_edit(bpy.types.Operator):
             _session.push(node)   # keep the Text current; compiling waits for focus loss
         _session.follow()
 
-    def _click(self, context, node, rect, event, double=False, drag=False):
+    def _click(self, context, node, rect, event, drag=False):
         buf = _session.buf
         x0, _y0, _x1, y1, px = rect
+        mx, my = event.mouse_region_x, event.mouse_region_y
         line_h, char_w = _metrics(px, node.code_scale)
-        row, col = _session.view.hit(event.mouse_region_x - x0 - PAD * px, y1 - PAD * px - event.mouse_region_y,
-                                     line_h, char_w)
+        row, col = _session.view.hit(mx - x0 - PAD * px, y1 - PAD * px - my, line_h, char_w)
         version, row_before = buf.version, buf.cursor[0]
         _session.suggestion = ""
+        if drag:
+            view = _session.view
+            left = view.left
+            buf.click(row, col, select=True)
+            self._after_change(node, version, row_before)
+            # Sideways, a drag follows the mouse, not the cursor: on a short row the
+            # cursor stops at the line end, but the view still scrolls toward the
+            # mouse once it passes the box edge (up to the longest line).
+            cols = _session.cols
+            longest = max(map(len, buf.lines)) + 1
+            # `hit` clamps to the first visible column; here the mouse may be left of it.
+            mouse_col = left + int(round((mx - x0 - PAD * px) / char_w))
+            if mouse_col > left + cols:
+                left = min(mouse_col - cols, max(left, longest - cols))
+            elif mouse_col < left:
+                left = max(0, mouse_col)
+            view.left = left
+            return
+        # Count clicks: a press soon after the last one, at about the same spot, continues the run.
+        now = time.monotonic()
+        last = _session.last_press
+        double_time = context.preferences.inputs.mouse_double_click_time / 1000.0
+        slop = CLICK_SLOP * px
+        if last is not None and now - last[0] < 0.01:
+            return  # the same press reported twice (PRESS + DOUBLE_CLICK)
+        near = last is not None and abs(mx - last[1]) <= slop and abs(my - last[2]) <= slop
+        _session.clicks = _session.clicks % 3 + 1 if near and now - last[0] < double_time else 1
+        _session.last_press = (now, mx, my)
         # Past the end of a line (or below the last one): the click is "outside" the text.
         past_end = row >= len(buf.lines) or col > len(buf.lines[max(row, 0)])
-        last = _session.last_double
-        triple = (not double and not drag and last is not None
-                  and time.monotonic() - last[0] < TRIPLE_CLICK and last[1] == row)
-        if double:
-            _session.last_double = (time.monotonic(), row)
-            if past_end:
-                buf.select_line(min(row, len(buf.lines) - 1))
-            else:
-                buf.select_at(row, col)
-        elif triple:
-            _session.last_double = None
-            buf.select_line(row)
-        else:
-            if not drag:
-                _session.last_double = None
-            buf.click(row, col, select=drag or event.shift)
-            _session.dragging = not drag or _session.dragging
+        line_row = min(max(row, 0), len(buf.lines) - 1)
+        if event.shift and _session.clicks == 1:
+            buf.click(row, col, select=True)
+        elif _session.clicks == 1:
+            buf.click(row, col)
+            _session.dragging = True
+        elif _session.clicks == 2 and not past_end:
+            buf.select_at(row, col)
+        else:  # double-click past the end, or triple-click: the whole line
+            buf.select_line(line_row)
+        if DEBUG_CLICKS:
+            msg = (f"BEX click x{_session.clicks} [{event.value}] row {row} col {col}"
+                   f"{' past-end' if past_end else ''} -> {buf.selection_range()!r} "
+                   f"{buf.selected_text()!r}  (double-click time {double_time:.2f}s)")
+            print(msg)
+            context.workspace.status_text_set(msg)
         self._after_change(node, version, row_before)
+
+    def _bar_press(self, node, rect, event):
+        """A press on a scrollbar: grab the thumb, or jump there when on the track."""
+        x, y = event.mouse_region_x, event.mouse_region_y
+        hit = BAR_HIT * rect[4]
+        for axis, (track, knob, _total, _visible) in scrollbars(node, rect, _session.buf.lines, _session.view).items():
+            # The grab area is bigger than the drawn bar, but stays inside the box.
+            hx0, hy0 = max(track[0] - hit, rect[0]), max(track[1] - hit, rect[1])
+            hx1, hy1 = min(track[2] + hit, rect[2]), min(track[3] + hit, rect[3])
+            if hx0 <= x <= hx1 and hy0 <= y <= hy1:
+                if axis == "v":
+                    y = min(max(y, track[1]), track[3])
+                    on = knob[1] <= y <= knob[3]
+                    grab = knob[3] - y if on else (knob[3] - knob[1]) / 2
+                else:
+                    x = min(max(x, track[0]), track[2])
+                    on = knob[0] <= x <= knob[2]
+                    grab = x - knob[0] if on else (knob[2] - knob[0]) / 2
+                _session.bar = (axis, grab)
+                _session.suggestion = ""
+                self._bar_drag(node, rect, event)
+                return True
+        return False
+
+    def _bar_drag(self, node, rect, event):
+        axis, grab = _session.bar
+        view, lines = _session.view, _session.buf.lines
+        bar = scrollbars(node, rect, lines, view).get(axis)
+        if bar is None:
+            return
+        track, knob, total, visible = bar
+        if axis == "v":
+            size = knob[3] - knob[1]
+            view.top = thumb_first(track[3] - event.mouse_region_y - grab, size, total, visible, track[3] - track[1])
+        else:
+            size = knob[2] - knob[0]
+            view.left = thumb_first(event.mouse_region_x - track[0] - grab, size, total, visible, track[2] - track[0])
 
     def _start_on(self, context, node, rect, event):
         global _session
         _session = Session(node)
         self._select(context, node)
-        self._click(context, node, rect, event)
+        if not self._bar_press(node, rect, event):
+            self._click(context, node, rect, event)
 
     def _select(self, context, node):
         tree = node.id_data
@@ -562,6 +729,8 @@ class BEX_OT_code_edit(bpy.types.Operator):
             _session.push(node)
             node.sync()  # losing focus is when the code is evaluated
         _session = None
+        if DEBUG_CLICKS:
+            context.workspace.status_text_set(None)
         _redraw(context)
         if node is not None:
             try:

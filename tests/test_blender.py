@@ -279,6 +279,53 @@ def test_code_editor_compiles_on_focus_loss():
     assert close(evaluate(obj).vertices[0].co, (2, -1, 1))
 
 
+def test_incoming_attributes():
+    from bex import upstream
+    upstream.CACHE_SECONDS = 0
+    obj, node, text = make_setup("@P.z = 0")
+    obj.data.attributes.new("weight", "FLOAT", "POINT")
+    tree = node.id_data
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("weight") == "float" and "position" not in got, got
+
+    # Store Named Attribute and an upstream wrangle add names; Remove takes one away.
+    store = tree.nodes.new("GeometryNodeStoreNamedAttribute")
+    store.data_type = "FLOAT_VECTOR"
+    store.inputs["Name"].default_value = "vel"
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("i@count = 3")
+    first.sync(force=True)
+    remove = tree.nodes.new("GeometryNodeRemoveAttribute")
+    remove.inputs["Name"].default_value = "weight"
+    tree.links.new(gin.outputs[0], store.inputs["Geometry"])
+    tree.links.new(store.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], remove.inputs["Geometry"])
+    tree.links.new(remove.outputs[0], node.inputs[0])
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("vel") == "vector" and got.get("count") == "int" and "weight" not in got, got
+
+    # Through a group node: the group's own Store Named Attribute, and its Group Input
+    # maps back to the outer link.
+    inner = bpy.data.node_groups.new("Inner", "GeometryNodeTree")
+    inner.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    inner.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    i_in, i_out = inner.nodes.new("NodeGroupInput"), inner.nodes.new("NodeGroupOutput")
+    i_store = inner.nodes.new("GeometryNodeStoreNamedAttribute")
+    i_store.inputs["Name"].default_value = "inside"
+    inner.links.new(i_in.outputs[0], i_store.inputs["Geometry"])
+    inner.links.new(i_store.outputs[0], i_out.inputs[0])
+    group = tree.nodes.new("GeometryNodeGroup")
+    group.node_tree = inner
+    tree.links.new(remove.outputs[0], group.inputs[0])
+    tree.links.new(group.outputs[0], node.inputs[0])
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("inside") == "float" and got.get("vel") == "vector" and "weight" not in got, got
+
+    from bex import code_editor
+    assert code_editor.info_lines(node)[0][0] == "input"
+
+
 def test_layout_has_no_overlaps():
     from bex import builder
 

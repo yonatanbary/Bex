@@ -346,10 +346,9 @@ class TextBuffer:
         self._select(row, start, row, end)
 
     def select_line(self, row):
+        """Select the line's text; the cursor stays on it, at its end (not on the next line)."""
         row = self._clamp((row, 0))[0]
-        self._group = self._pref_col = None
-        self.anchor = (row, 0)
-        self.cursor = (row + 1, 0) if row + 1 < len(self.lines) else (row, len(self.lines[row]))
+        self._select(row, 0, row, len(self.lines[row]))
 
     def _select(self, r0, c0, r1, c1):
         self._group = self._pref_col = None

@@ -24,7 +24,7 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
 - one 1 s timer (`_watch`) for the only sources Blender sends no event for: Blender's Text Editor and files on disk. It does nothing for scripts that are neither open in a Text Editor nor linked to a file.
 
 - `bex/lang/` and `bex/editor/` (its pure-Python core) have no `bpy` import, so they can be tested outside Blender.
-- `bex/builder.py`, `bex/library.py`, `bex/code_editor.py` and `bex/node.py` need `bpy`.
+- `bex/builder.py`, `bex/library.py`, `bex/upstream.py`, `bex/code_editor.py` and `bex/node.py` need `bpy`.
 
 ## Files
 
@@ -42,6 +42,7 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
 | `bex/editor/complete.py` | Inline autocomplete: `suggest()` |
 | `bex/editor/keys.py` | Key events → buffer actions (`handle_key()`), scroll/hit-test (`View`) |
 | `bex/code_editor.py` | On-node editor, Blender side: draw handler, `BEX_OT_code_edit` modal, compile on focus loss |
+| `bex/upstream.py` | Static guess of the named attributes reaching a wrangle's input (`incoming_attributes()`) |
 | `bex/library.py` | Library node groups (`GROUPS`, `ensure()`), and the **Add → BEX** menu |
 | `bex/builder.py` | IR → nodes (`sync_interface()`, `build()`), plus per-row Group Inputs (`_split_group_inputs()`) and auto-layout (`_layout()`) |
 | `bex/node.py` | The node class, channel fields, operators, Add-menu entry, update events |
@@ -117,11 +118,11 @@ Model and highlighter for the code editor drawn on the node. The Blender drawing
   - Selection: `has_selection`, `selection_range()` (ordered or `None`), `selected_text()`, `select_all()`, `clear_selection()`.
   - Editing (replaces the selection): `insert(s)` (tabs → spaces; typing the `:` of `else:` / `elif …:` lines it up with its `if`, `_dedent_else`), `newline()` (copies indent, +1 level after a trailing `:` `(` `[`, -1 after `pass`, splits `(|)` onto three lines), `backspace(word=False)` (in leading whitespace it goes back to the previous indent stop), `delete(word=False)`, `indent()` / `dedent()` (all touched lines when there is a selection), `toggle_comment()` (`# `), `set_text(text)` (external change; undoable, no-op if equal).
   - Movement, all with `select=False` (shift-extends from `anchor`): `move_left/right(word=False)` (collapse a selection without `select`), `move_up/down` (remembered preferred column), `page_up/down(n)`, `move_home` (smart home), `move_end`, `move_doc_start/end`.
-  - Mouse: `click(row, col, select=False)` (clamps), `select_word_at(row, col)` (word = `[A-Za-z0-9_@]`), `select_line(row)`.
+  - Mouse: `click(row, col, select=False)` (clamps), `select_word_at(row, col)` (word = `[A-Za-z0-9_@]`), `select_line(row)` (the line's text, cursor at its end, not on the next line).
   - `select_at(row, col)`: double-click selection like VS Code. It selects the word (just after a word counts as on it; `f@mask` is one word), the whole number (`0.25`), a whole string when on a quote, up to the matching bracket when on a bracket (across lines, ignoring brackets in strings; `_match_bracket`), an operator run (`+=`), or a run of spaces.
   - Undo: `undo()` / `redo()` return True if they changed something. Snapshots of text + cursor + anchor, capped at 200. Consecutive typed word characters coalesce into one step.
 - `complete.py` — `suggest(lines, row, col, attributes=())` → the text completing the word before the cursor with the best match, or "". After `@` (optionally `f@` …) it offers attributes: the script's own (most used first), then `attributes` (meant for names read from the incoming geometry), then built-ins and `KNOWN_TYPES`. Otherwise identifiers: the script's own (most used first, comments and strings skipped via the highlighter), then language names (functions, ch*, keywords, types, constants; shortest first). Returns "" mid-word or when the word is already a complete name.
-- `keys.py` — `handle_key(buf, key, text, ctrl, shift, alt, cmd, mac, page, clipboard)` applies one key (Blender event type names) and returns `EXIT`, True (handled) or False (unknown; the caller passes modifier shortcuts and F-keys on to Blender). `mac=True`: Cmd = command key, Option = word moves; elsewhere Ctrl does both. Esc and Ctrl/Cmd+Enter return `EXIT`; Ctrl or Cmd with `+` `-` `0` return `ZOOM_IN` / `ZOOM_OUT` / `ZOOM_RESET`. `Clipboard` is a stand-in; `View` keeps the scroll (`top`, `left`), `follow()` keeps the cursor visible, `hit()` maps a local point to `(row, col)`.
+- `keys.py` — `handle_key(buf, key, text, ctrl, shift, alt, cmd, mac, page, clipboard)` applies one key (Blender event type names) and returns `EXIT`, True (handled) or False (unknown; the caller passes modifier shortcuts and F-keys on to Blender). `mac=True`: Cmd = command key, Option = word moves; elsewhere Ctrl does both. Esc and Ctrl/Cmd+Enter return `EXIT`; Ctrl or Cmd with `+` `-` `0` return `ZOOM_IN` / `ZOOM_OUT` / `ZOOM_RESET`. `Clipboard` is a stand-in; `thumb()` / `thumb_first()` are the scrollbar math (thumb offset and size, and back); `View` keeps the scroll (`top`, `left`), `follow()` keeps the cursor visible, `hit()` maps a local point to `(row, col)`.
 - `highlight.py`
   - `highlight_line(line)` → spans `(start, end, kind)`, contiguous from 0 to `len(line)`, adjacent same-kind spans merged. Never raises. Lines are independent (`#` comments only).
   - `highlight(lines)`: one span list per line. `KEYWORDS`, `TYPES`, `CONSTANTS` are also used by `complete.py`.
@@ -144,6 +145,14 @@ Model and highlighter for the code editor drawn on the node. The Blender drawing
   - `estimate_height()` uses the `BUTTON_ROWS` table and skips hidden sockets, because real node sizes only exist after a redraw.
   - Add new node types to `BUTTON_ROWS`.
 
+## `bex/upstream.py`
+
+Blender's Python API can't read the geometry flowing into a socket, so the attributes on a wrangle's incoming geometry are a **static guess** from the node graph.
+
+- `incoming_attributes(node)` → `[(name, bex_type)]`, sorted. Walks upstream from the Geometry input (`_from_input` / `_from_output`): union over links and all geometry inputs (Join Geometry, any pass-through node, muted nodes, reroutes). Group Input at the top level gives the attributes of the objects whose modifier runs the tree (original data, `_modifier_objects_attributes`); inside a group it continues from the group node's matching input. Group nodes are followed inside to their Group Output. Object Info gives that object's attributes. Store Named Attribute adds its (unlinked) name and type, Remove Named Attribute removes exact or wildcard matches, upstream wrangles add their compiled `writes`. Names starting with `.` and `position` are skipped.
+- Called while drawing, so results are cached per node for `CACHE_SECONDS`; the Node Editor redraws on graph edits, which makes it live.
+- Can be wrong after nodes that drop or rename attributes in other ways (Realize, Separate, Capture…), and modifiers before the BEX one are ignored.
+
 ## `bex/library.py`
 
 Visible, reusable node groups for the built-in functions that take several nodes. They act as real nodes: users can add them from **Add → BEX** and use them in any tree.
@@ -159,17 +168,18 @@ Visible, reusable node groups for the built-in functions that take several nodes
 The on-node editor, Blender side. Built on `bex/editor/` (buffer, highlighter, keys).
 
 - Placement: `reserve(layout, node)` (called last in `draw_buttons`) adds an empty label scaled to `box_height()`. `box_rect(node, region)` finds it from the node's **bottom** edge: below it come only the input socket rows (`SOCKET_ROW`) and `BOTTOM_PAD`; `SIDE` is the horizontal inset. These constants were measured from Blender 5.2 screenshots (UI scale 0.6 to 2). Python can't read widget positions, so re-measure if Blender changes node drawing. Sizes are node-editor units × `preferences.system.ui_scale` × zoom.
-- The reserved block is the code box (`box_height(lines, node.code_scale)`) plus the info strip (`info_height()`) under it, so the strip needs no layout measuring of its own.
-- `_draw()`: `SpaceNodeEditor` POST_PIXEL handler. Paints each visible wrangle's code in Blender's monospace font (`FONT_ID = 1`), clipped with a scissor, using the calm fixed `PALETTE` (highlight kind → colour via `_COLOR_OF`: neutral text, dim punctuation, soft colours for keywords, attributes, numbers, strings). The outline (`PALETTE`): `focus` blue while edited, `error` red, `evaluated` green when `node.is_up_to_date()`. The edited one also shows selection, cursor and the inline completion as ghost text (the rest of the line shifts right, `_split_spans`). Up to `MAX_ROWS` lines; longer scripts scroll. `node.code_scale` scales the font and line height.
-- `_draw_info()` / `info_lines(node)`: two small lines under the code from `node.info`: `reads` (attributes the script reads from the incoming geometry) and `writes` + node count. Attributes are shown with their type prefix (`f@mask`); built-ins as `@P`.
-- `Session`: the one wrangle being edited (tree/node names, `TextBuffer`, `View`, `suggestion`, `last_double`). `push()` writes the buffer to the Text, `pull()` takes in outside changes. `is_editing(node)`.
+- The reserved block is the code box (`box_height(lines, node.code_scale)`) plus the info strip (`info_height(node)`) under it, so the strip needs no layout measuring of its own.
+- `_draw()`: `SpaceNodeEditor` POST_PIXEL handler. Paints each visible wrangle's code in Blender's monospace font (`FONT_ID = 1`), clipped with a scissor clamped to the region (`_clip()`: Metal drops the whole draw for a scissor outside the region), using the calm fixed `PALETTE` (highlight kind → colour via `_COLOR_OF`: neutral text, dim punctuation, soft colours for keywords, attributes, numbers, strings). The outline (`PALETTE`): `focus` blue while edited, `error` red, `evaluated` green when `node.is_up_to_date()`. The edited one also shows selection (rows whose line break is selected fill to the box's right edge), cursor and the inline completion as ghost text (the rest of the line shifts right, `_split_spans`). Up to `MAX_ROWS` lines; longer scripts scroll. `node.code_scale` scales the font and line height.
+- `scrollbars(node, rect, lines, view)`: the vertical (right edge) and horizontal (bottom edge) bars, each only when the code overflows that way (`BAR_W`, `BAR_MARGIN`, `BAR_BOTTOM` under the horizontal bar, `BAR_MIN`; `BAR_HIT` widens the grab area, inside the box). Drawn on every wrangle; while editing, a press on a bar drags its thumb or jumps to the clicked spot (`_bar_press` / `_bar_drag`, `Session.bar`), and Shift+wheel scrolls sideways.
+- `_draw_info()` / `error_lines(node)` / `info_lines(node)`: under the code, the node's error in red (wrapped to the box width, at most `ERROR_MAX_LINES`), then three small lines: `input` (named attributes probably on the incoming geometry, `upstream.incoming_attributes`), and from `node.info` `reads` (attributes the script reads from the incoming geometry) and `writes` + node count. Attributes are shown with their type prefix (`f@mask`); built-ins as `@P`.
+- `Session`: the one wrangle being edited (tree/node names, `TextBuffer`, `View`, `suggestion`, `clicks` / `last_press`, `bar`). `push()` writes the buffer to the Text, `pull()` takes in outside changes. `is_editing(node)`.
 - `BEX_OT_code_edit` (`bex.code_edit`): bound to LEFTMOUSE in the Node Editor keymap. `invoke` passes through unless the click is on a code box (`wrangle_at()`). The modal:
   - swallows keys (so X, Tab… don't hit node shortcuts) and passes through navigation (wheel, MMB, trackpad), unknown Ctrl/Cmd shortcuts and F-keys;
-  - click places the cursor, drag selects, Shift-click extends. Double-click uses `buf.select_at`, or selects the whole line when past the line's end. A click within `TRIPLE_CLICK` s of a double-click on the same row selects the line. A click on another wrangle's code switches to it;
+  - click places the cursor, drag selects (sideways the view follows the mouse past the box edge, even on a short row), Shift-click extends. Clicks are counted by the operator itself (`Session.clicks`: within the user's double-click time and `CLICK_SLOP` px; Blender's `DOUBLE_CLICK` is treated as a plain press). Double-click uses `buf.select_at`, or selects the whole line when past the line's end; triple-click selects the line. `DEBUG_CLICKS` (off by default) prints each click to the console and status bar. A click on another wrangle's code switches to it;
   - Ctrl/Cmd `+` `-` `0` change `node.code_scale` by `ZOOM_STEP` (0.5–3) or reset it;
   - a click outside, right-click, Esc, Ctrl+Enter, or a key pressed over another area ends it (`_end`: final sync + undo push).
 - Compile: every edit is written to the Text (`push`), but nothing is evaluated until focus is lost (`_end` → `node.sync()`).
-- Autocomplete: after a typed word character or Backspace, `suggest()` fills `Session.suggestion`; any other key or a click clears it. Tab with a suggestion (and no selection) inserts it instead of indenting.
+- Autocomplete: after a typed word character or Backspace, `suggest()` fills `Session.suggestion` (incoming attribute names from `upstream` are offered after `@`); any other key or a click clears it. Tab with a suggestion (and no selection) inserts it instead of indenting.
 
 ## `bex/node.py`
 
@@ -182,7 +192,7 @@ The on-node editor, Blender side. Built on `bex/editor/` (buffer, highlighter, k
 - `BexWrangleNode(GeometryNodeCustomGroup)`, idname `GeometryNodeBexWrangle`:
   - Properties: `script` (Text), `domain`, `show_code`, `error`, `compiled_key`, `saved_values`, `info` (JSON reads / writes / node count of the last good compile), `code_scale`.
   - `init` creates the node's own group and its own script Text from `TEMPLATE` (`_new_text()`). `copy` copies both the group and the script, so duplicates are independent. To share a script, pick the same Text in the node's script field.
-  - `draw_buttons` shows the script picker, New / Edit, domain + show-code toggle + go-inside button, errors, then `draw_channels()` (each ch* input's value, greyed out with a link icon when the socket is linked), then the reserved code box (`code_editor.reserve`) while `show_code` is on.
+  - `draw_buttons` shows the script picker, New / Edit, domain + show-code toggle + go-inside button, errors (only while the code is hidden; otherwise they're drawn under the code), then `draw_channels()` (each ch* input's value, greyed out with a link icon when the socket is linked), then the reserved code box (`code_editor.reserve`) while `show_code` is on.
   - `channels()`: the enabled non-geometry inputs.
   - `is_up_to_date()`: the compiled key matches the current script and domain (drives the green outline).
   - `sync(force, pending_line=None)`: the key is `version|domain|md5(src)` (+ `|pending` while ch* names are held back). It recompiles on change, with `keep_stale` while pending. On `BexError` it keeps the last good nodes and sets `error`. On any other exception it logs the traceback. Every rebuild calls `_redraw()`.
@@ -211,7 +221,7 @@ python3 tests/test_editor.py
 
 - `test_lang.py`: Python syntax (indentation, elif, one-line blocks, chained comparisons, `**` `//`, error hints), Python-style variables, folding, attribute types, sequencing, if→switch, scopes, for-unroll, channels, the pending line, CSE, functions, error messages and lines.
 - `test_editor.py`: buffer editing, selection, movement, undo coalescing, VS Code-style `select_at`, `suggest`; highlighter kinds, coverage, block comments, fuzzing; key mapping (platform modifiers, clipboard, exit, zoom) and `View`.
-- `test_blender.py`: real evaluated geometry. Covers bounding box / mapping functions, the library groups (shared, nested, found after a rename, rebuilt on a version bump, usable in a user tree), position and channels, attributes and sequencing, swap semantics, the face domain, keeping the last good nodes on error, sync_all and copy, the pending line (inputs held back, not removed, values remembered), typing through the editor's key path (Tab-accepting completions, compiling only on focus loss), and the layout (no overlaps, links flow left to right, per-row Group Inputs).
+- `test_blender.py`: real evaluated geometry. Covers bounding box / mapping functions, the library groups (shared, nested, found after a rename, rebuilt on a version bump, usable in a user tree), position and channels, attributes and sequencing, swap semantics, the face domain, keeping the last good nodes on error, sync_all and copy, the pending line (inputs held back, not removed, values remembered), incoming attributes (object data, Store/Remove Named Attribute, upstream wrangles, group nodes), typing through the editor's key path (Tab-accepting completions, compiling only on focus loss), and the layout (no overlaps, links flow left to right, per-row Group Inputs).
 - The draw placement can only be checked with a UI: run Blender without `-b` and with `--enable-event-simulate`, then screenshot (`bpy.ops.screen.screenshot`).
 
 ## Adding a language function (checklist)
