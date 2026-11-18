@@ -9,21 +9,22 @@ import traceback
 import bpy
 from bpy.app.handlers import persistent
 
-from . import builder, code_editor, library
+from . import builder, code_editor, library, presets
 from .lang import BexError, compile_source
 
 # Bump when the generated node layout changes, so existing nodes recompile.
-COMPILER_VERSION = 7
+COMPILER_VERSION = 8
 WATCH_INTERVAL = 1.0   # Text Editor / file check, only while a script is open or on disk
 TYPING_IDLE = 2.0      # Text Editor: a line counts as finished after this pause
 SAVED_LIMIT = 64       # remembered values of removed inputs, per node
 TREE_PREFIX = ".BEX "
+SCRIPT_NAME = TREE_PREFIX + "Script"  # a wrangle's own script: hidden from Text pickers by the dot
 
 TEMPLATE = """\
 # BEX wrangle: runs once per element, like a Houdini wrangle.
 #   @P @N @ptnum @Time      built-in attributes
 #   f@mask  v@dir  i@count  your own attributes (float / vector / int / b@ bool)
-#   chf("name", default)    adds an input socket to the node (chi, chv, chb too)
+#   chf("name", default)    adds a property to the node (chi, chv, chb too)
 
 amp = chf("amplitude", 0.2)
 freq = chf("frequency", 4.0)
@@ -65,8 +66,13 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
 
     script: bpy.props.PointerProperty(type=bpy.types.Text, name="Script", description="BEX code for this node", update=_on_change)
     domain: bpy.props.EnumProperty(items=DOMAINS, name="Run Over", default="POINT", update=_on_change)
-    show_code: bpy.props.BoolProperty(name="Show Code", default=True, description="Show and edit the script on the node")
+    group: bpy.props.StringProperty(
+        name="Group", update=_on_change,
+        description="Only change these elements. A Houdini-style pattern: groups (bool attributes) "
+                    "and element numbers, e.g. top 0-9 50-100:2, !top (all but top), * ^top (all, minus top). "
+                    "Or a BEX expression such as @P.y > 0. Empty: all")
     error: bpy.props.StringProperty()
+    warning: bpy.props.StringProperty()  # shown under the code; the build still happened
     compiled_key: bpy.props.StringProperty()
     # JSON {name: [socket type, value]} of input values, so an input that is
     # removed and comes back (undo, rename back) gets its value back.
@@ -97,28 +103,50 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             self.node_tree = node.node_tree.copy()
         if node.script:
             self.script = node.script.copy()
+            if _is_own_script(self.script):
+                self.script.use_fake_user = False
 
     def draw_label(self):
-        return f"BEX: {self.script.name}" if self.script else "BEX Wrangle"
+        if self.script is None or _is_own_script(self.script):
+            return "BEX Wrangle"
+        return f"BEX: {self.script.name}"
 
     def draw_buttons(self, context, layout):
-        row = layout.row(align=True)
-        row.prop(self, "script", text="")
-        if self.script:
-            row.operator("bex.edit_script", text="", icon="GREASEPENCIL")
-        else:
-            row.operator("bex.new_script", text="New", icon="ADD")
-        row = layout.row(align=True)
-        row.prop(self, "domain", text="")
-        row.prop(self, "show_code", text="", icon="HIDE_OFF" if self.show_code else "HIDE_ON")
-        row.operator("bex.edit_nodes", text="", icon="NODETREE")
-        if self.error and not (self.show_code and self.script):  # else it's shown under the code
+        layout.context_pointer_set("node", self)  # for the Presets menu's operators
+        split = layout.split(factor=0.4)
+        split.label(text="Group")
+        split.prop(self, "group", text="")
+        split = layout.split(factor=0.4)
+        split.label(text="Run Over")
+        split.prop(self, "domain", text="")
+        if self.error and not self.script:  # else it's shown under the code
             col = layout.column(align=True)
             col.alert = True
             col.label(text=self.error, icon="ERROR")
-        self.draw_channels(layout)
-        if self.show_code and self.script:
+        if self.draw_channels(layout):
+            layout.separator(factor=0.5, type="LINE")
+        # Code tools sit at the top right of the code box. Going inside is Tab.
+        row = layout.row(align=True)
+        row.alignment = "RIGHT"
+        menu = row.row(align=True)
+        menu.ui_units_x = 5  # right-aligned items shrink to their minimum, which cuts the label
+        menu.menu(presets.NODE_MT_bex_presets.bl_idname, text="Presets", icon="PRESET")
+        row.operator("bex.edit_script", text="", icon="GREASEPENCIL")
+        if self.script:
             code_editor.reserve(layout, self)
+
+    def update(self):
+        # Links changed: an input that was just unlinked goes back to being a property.
+        self.hide_channel_sockets()
+
+    def hide_channel_sockets(self):
+        """ch*() values are properties drawn on the node, not inputs: their sockets
+        (which carry the values into the node group) are hidden. One that is
+        linked stays visible, so links made before, or via Ctrl+H, keep working."""
+        for sock in self.channels():
+            hide = not sock.is_linked
+            if sock.hide != hide:
+                sock.hide = hide
 
     def channels(self):
         return [s for s in self.inputs if s.enabled and s.type != "GEOMETRY"]
@@ -128,7 +156,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         The sockets stay linkable; a linked one is shown greyed out."""
         chans = self.channels()
         if not chans:
-            return
+            return False
         col = layout.column(align=True)
         for sock in chans:
             row = col.row(align=True)
@@ -137,11 +165,16 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
                 row.label(text=sock.name, icon="LINKED")
             else:
                 row.prop(sock, "default_value", text=sock.name)
+        return True
+
+    def _key(self, src):
+        digest = hashlib.md5(f"{self.group}\0{src}".encode()).hexdigest()
+        return f"{COMPILER_VERSION}|{self.domain}|{digest}"
 
     def is_up_to_date(self):
         """True when the nodes were built from the script as it is now."""
         src = self.script.as_string() if self.script else ""
-        key = f"{COMPILER_VERSION}|{self.domain}|{hashlib.md5(src.encode()).hexdigest()}"
+        key = self._key(src)
         return self.compiled_key == key
 
     def sync(self, force=False, pending_line=None):
@@ -151,13 +184,13 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         don't create inputs yet, and no input is removed meanwhile.
         """
         src = self.script.as_string() if self.script else ""
-        digest = hashlib.md5(src.encode()).hexdigest()
-        key = f"{COMPILER_VERSION}|{self.domain}|{digest}"
+        key = self._key(src)
         if pending_line is None and key == self.compiled_key and not force and self.node_tree:
             return
         name = self.script.name if self.script else "(no script)"
         try:
-            program = compile_source(src, self.domain, pending_line, [s.name for s in self.channels()])
+            program = compile_source(src, self.domain, pending_line, [s.name for s in self.channels()],
+                                     group=self.group)
             if program.pending:
                 key += "|pending"
             if key == self.compiled_key and not force and self.node_tree:
@@ -171,17 +204,20 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             # Keep the last working nodes so the scene does not break while typing.
             self.compiled_key = key
             self.error = str(e)
+            self.warning = ""
             _log(f"{name}: error, {e}")
             _redraw()
             return
         except Exception:
             self.compiled_key = key
             self.error = "internal error, see the console"
+            self.warning = ""
             _log(f"{name}: internal error")
             traceback.print_exc()
             _redraw()
             return
         self.error = ""
+        self.warning = "; ".join(program.warnings)
         for input_name, default in created:
             # A new input starts at its remembered value, else the script's default.
             sock = self.inputs.get(input_name)
@@ -192,6 +228,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
                 sock.default_value = kept[1] if kept and kept[0] == sock.type else default
             except (TypeError, ValueError):
                 sock.default_value = default
+        self.hide_channel_sockets()
         self.node_tree.name = TREE_PREFIX + name
         self.info = json.dumps({
             "reads": [[n, t] for n, t in program.reads],
@@ -228,9 +265,17 @@ def _redraw():
 
 
 def _new_text():
-    text = bpy.data.texts.new("wrangle.bex")
+    """A wrangle's own script. Its name starts with a dot, so it stays out of the
+    Text Editor's list, and it has no fake user, so Blender drops it on save once
+    no node uses it (undo can still bring it back with its node)."""
+    text = bpy.data.texts.new(SCRIPT_NAME)
+    text.use_fake_user = False
     text.from_string(TEMPLATE)
     return text
+
+
+def _is_own_script(text):
+    return text.name.startswith(SCRIPT_NAME)
 
 
 def _reload_from_disk(text):
@@ -314,6 +359,7 @@ def _watch():
 def _on_load(*_args):
     _file_mtimes.clear()
     _text_changes.clear()
+    code_editor.forget_buffers()
     sync_all(force=True)
 
 
@@ -330,32 +376,19 @@ def _sync_after_register():
     return None
 
 
-class BEX_OT_new_script(bpy.types.Operator):
-    bl_idname = "bex.new_script"
-    bl_label = "New BEX Script"
-    bl_description = "Create a script for this wrangle"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return getattr(context, "node", None) is not None
-
-    def execute(self, context):
-        context.node.script = _new_text()
-        return {"FINISHED"}
-
-
 class BEX_OT_edit_script(bpy.types.Operator):
     bl_idname = "bex.edit_script"
     bl_label = "Edit BEX Script"
-    bl_description = "Show this wrangle's script in a Text Editor"
+    bl_description = "Open this wrangle's code in the Text Editor"
 
     @classmethod
     def poll(cls, context):
         node = getattr(context, "node", None)
-        return node is not None and getattr(node, "script", None) is not None
+        return node is not None and node.bl_idname == BexWrangleNode.bl_idname
 
     def execute(self, context):
+        if context.node.script is None:
+            context.node.script = _new_text()
         text = context.node.script
         area = next((a for a in context.screen.areas if a.type == "TEXT_EDITOR"), None)
         if area is None:
@@ -435,7 +468,7 @@ def _add_menu(self, context):
         self.layout.menu(library.NODE_MT_bex_library.bl_idname, icon="NODETREE")
 
 
-classes = (BexWrangleNode, BEX_OT_new_script, BEX_OT_edit_script, BEX_OT_update_node, BEX_OT_edit_nodes, BEX_OT_recompile)
+classes = (BexWrangleNode, BEX_OT_edit_script, BEX_OT_update_node, BEX_OT_edit_nodes, BEX_OT_recompile)
 _keymaps = []
 
 
@@ -451,6 +484,7 @@ def register():
         bpy.utils.register_class(cls)
     code_editor.register()
     library.register()
+    presets.register()
     bpy.types.NODE_MT_add.append(_add_menu)
     # Tab on a BEX Wrangle goes inside. On any other node our poll fails and
     # Tab falls through to Blender's own group edit.
@@ -460,6 +494,9 @@ def register():
         _keymaps.append((km, km.keymap_items.new(BEX_OT_edit_nodes.bl_idname, "TAB", "PRESS")))
         # A click on a wrangle's code starts the editor; elsewhere it passes through.
         _keymaps.append((km, km.keymap_items.new(code_editor.BEX_OT_code_edit.bl_idname, "LEFTMOUSE", "PRESS")))
+        # Wheel / trackpad over a wrangle's code scrolls it; elsewhere it passes through.
+        for event in ("WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"):
+            _keymaps.append((km, km.keymap_items.new(code_editor.BEX_OT_code_scroll.bl_idname, event, "ANY", any=True)))
     for handlers, fn in _HANDLERS:
         if fn not in handlers:
             handlers.append(fn)
@@ -477,6 +514,7 @@ def unregister():
         km.keymap_items.remove(kmi)
     _keymaps.clear()
     bpy.types.NODE_MT_add.remove(_add_menu)
+    presets.unregister()
     library.unregister()
     code_editor.unregister()
     for cls in reversed(classes):

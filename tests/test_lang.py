@@ -197,6 +197,91 @@ def test_pending_channel_line():
     assert [p[0] for p in prog.params] == ["amp", "fr"]
 
 
+def test_numeric_components():
+    # .0 .1 .2 pick components like .x .y .z and [0] [1] [2].
+    p = compile_source("v@a = (1, 2, 3)\nf@b = @a.1 + v@a.2 * 10\nf@c = (4, 5, 6).0\n@P.1 = 7\nf@d = .5")
+    w = {n: v for n, _t, v in p.writes}
+    assert w["b"].const == 32.0 and w["c"].const == 4.0 and w["d"].const == 0.5
+    assert w["P"].node.kind == "combine"
+    fails("f@x = @P.3", "component", line=1)
+    fails("f@x = @P .1", "expected the end of the line")  # with a space it's a number, as in Python
+
+
+def test_group():
+    # No group, or an always-true one: every element.
+    assert compile_source("@P.z = 1").group is None
+    assert compile_source("@P.z = 1", group="  ").group is None
+    assert compile_source("@P.z = 1", group="1 < 2").group is None
+    p = compile_source("@P.z = 1", group="@P.y > 0")
+    assert p.group.type == "bool" and not p.group.is_const and p.group.node.kind == "compare"
+    assert p.group_source == "@P.y > 0"
+    # A bare name, b@name and @group_name are the same bool attribute.
+    for spelling in ("top", "b@top", "@group_top"):
+        g = compile_source("@P.z = 1", group=spelling).group
+        assert g.node.kind == "attr" and g.node.params["name"] == "top" and g.node.params["dtype"] == "bool", spelling
+    p = compile_source("@P.z = 1", group="top and not @P.x < 0")
+    assert ("top", "bool") in p.reads and ("P", "vector") in p.reads
+    # The group reads the incoming geometry, before the script's own writes.
+    p = compile_source("@P.y = -5", group="@P.y > 0")
+    assert p.group.node.inputs[0].node.kind != "combine"
+    # A group that doesn't make sense selects nothing and warns; it never stops the build.
+    for src, fragment in (("@P.y >", "group:"), ("@P.y > 0 0", "end of the expression"),
+                          ("v@top", "as bool"), ("@P.4", "component")):
+        p = compile_source("b@top = 1", group=src)
+        assert p.group.is_const and p.group.const is False, src
+        assert len(p.warnings) == 1 and fragment in p.warnings[0] and "selects nothing" in p.warnings[0], p.warnings
+        assert [n for n, _t, _v in p.writes] == ["top"]  # the script still compiled
+    assert compile_source("b@top = 1", group="@P.y > 0").warnings == []
+
+
+def test_group_patterns():
+    def group(text):
+        return compile_source("f@mark = 1", group=text).group
+
+    assert group("*") is None                      # every element
+    assert group("* ^top").node.params["op"] == "NOT"  # all minus top folds to `not top`
+    assert group("0-9 ^top").node.params["op"] == "AND"
+    assert group("^top").const is False            # removing from nothing leaves nothing
+    assert group("!top").node.params["op"] == "NOT"
+    assert group("0-9 top").node.params["op"] == "OR"
+    # Element numbers compare the index; a number alone is one element.
+    g = group("5")
+    assert g.node.kind == "compare" and g.node.inputs[0].node.params["name"] == "index"
+    # Ad-hoc expressions without spaces mix with the rest; @name is a group (bool).
+    p = compile_source("f@mark = 1", group="@P.y>0 @sel 0-3")
+    assert ("sel", "bool") in p.reads and ("P", "vector") in p.reads
+    # Not a pattern: spaces inside an expression, keywords, negative numbers.
+    for text in ("@P.y > 0", "top and not bottom", "@ptnum < -1 or top"):
+        assert compile_source("f@mark = 1", group=text).group is not None, text
+    p = compile_source("f@mark = 1", group="0-9 @P.y>")
+    assert p.group.const is False and p.warnings  # a bad word: nothing, with a warning
+
+
+def test_group_types():
+    # A name used as a whole condition is a group (bool); inside a comparison it
+    # keeps its usual type, and nothing the Group guessed binds the script.
+    p = compile_source("f@mask = 2.0", group="@mask > 0.5")
+    assert p.group.node.inputs[0].node.params["dtype"] == "float"
+    assert [(n, t) for n, t, _ in p.writes] == [("mask", "float")]
+    assert compile_source("f@top = 1", group="top").writes[0][1] == "float"
+    for text in ("ptnum < 5", "P.y > 0", "mask > 0.5 and top"):
+        p = compile_source("f@x = 1", group=text)
+        assert not p.warnings and not p.group.is_const, (text, p.warnings)
+    assert compile_source("f@x = 1", group="mask > 0.5 and top").group.node.inputs[1].node.params["dtype"] == "bool"
+    # A ch*() in the Group is never "being typed" on script line 1.
+    p = compile_source("@P.z = 1", group="@P.y > chf('k', 1)", pending_line=1)
+    assert p.pending == [] and [n for n, *_ in p.params] == ["k"]
+    # A keyword before .5 is not a component.
+    assert compile_source("f@a = 1 if @P.x > 0 else.5").writes
+
+
+def test_group_prefix_in_scripts():
+    # Houdini spelling in the script: @group_top writes and reads the bool attribute "top".
+    p = compile_source("@group_top = @P.z > 0.5\nif @group_top:\n    @P.z = 1")
+    assert [(n, t) for n, t, _ in p.writes] == [("top", "bool"), ("P", "vector")]
+    fails("f@group_top = 1", "is a group")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

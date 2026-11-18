@@ -1,5 +1,7 @@
 """Recursive-descent parser for BEX's Python-style syntax."""
 
+import re
+
 from .lexer import BexError, tokenize
 
 TYPES = ("float", "int", "vector", "bool")
@@ -9,6 +11,8 @@ COMPARE_OPS = ("<", "<=", ">", ">=", "==", "!=")
 KEYWORDS = ("if", "elif", "else", "for", "in", "while", "pass", "and", "or", "not", "True", "False",
             "break", "continue", "def", "return", "import", "from", "class", "lambda")
 UNSUPPORTED = {"break", "continue", "def", "return", "import", "from", "class", "lambda"}
+
+GROUP_PREFIX = "group_"  # @group_top == b@top, as in Houdini
 
 # Arithmetic precedence levels, loosest first (comparisons and and/or/not sit above these).
 _ARITH = [("+", "-"), ("*", "/", "//", "%")]
@@ -249,9 +253,13 @@ class Parser:
             if self.at("."):
                 line = self.next().line
                 name = self.next()
-                if name.kind != "ident" or name.val not in COMPONENTS:
-                    raise BexError("expected a component (.x .y .z or .r .g .b)", line)
-                e = N("member", line, obj=e, comp=COMPONENTS[name.val])
+                if name.kind == "num" and name.val in (0, 1, 2):  # @P.1 == @P.y == @P[1]
+                    comp = name.val
+                elif name.kind == "ident" and name.val in COMPONENTS:
+                    comp = COMPONENTS[name.val]
+                else:
+                    raise BexError("expected a component (.x .y .z, .r .g .b or .0 .1 .2)", line)
+                e = N("member", line, obj=e, comp=comp)
             elif self.at("["):
                 line = self.next().line
                 neg = self.accept("-")
@@ -285,7 +293,13 @@ class Parser:
             return N("str", t.line, value=t.val)
         if t.kind == "attr":
             self.next()
-            return N("attr", t.line, name=t.val[0], type=t.val[1])
+            name, type = t.val
+            if name.startswith(GROUP_PREFIX) and len(name) > len(GROUP_PREFIX):
+                # Houdini spelling: @group_top is the boolean attribute "top".
+                if type not in (None, "bool"):
+                    raise BexError(f"@{name} is a group, i.e. a bool attribute", t.line)
+                name, type = name[len(GROUP_PREFIX):], "bool"
+            return N("attr", t.line, name=name, type=type)
         if t.kind == "ident":
             if t.val in ("True", "False"):
                 self.next()
@@ -319,3 +333,70 @@ class Parser:
 
 def parse(src):
     return Parser(src).program()
+
+
+# One word of a Houdini group pattern: an optional ! (not) or ^ (remove), then
+# * (all), an element number or range (5, 0-9, 0-100:2), a group (bool
+# attribute) name, or an ad-hoc expression without spaces (@P.y>0, b@top).
+_PATTERN_WORD = re.compile(r"([!^]?)(\*|\d+(?:-\d+(?::\d+)?)?|[A-Za-z_]\w*|[A-Za-z]?@\S+)")
+_RANGE = re.compile(r"(\d+)(?:-(\d+)(?::(\d+))?)?")
+
+
+def parse_group(src):
+    """The wrangle's Group field: a Houdini-style pattern, else a BEX expression.
+
+    A pattern is space-separated words, read left to right: `top bottom` is the
+    union, `!top` adds everything not in top, `^top` removes top from what came
+    before (`* ^top`), `*` is every element, `0-9` / `0-100:2` are element numbers.
+    """
+    words = src.split()
+    matches = [_PATTERN_WORD.fullmatch(w) for w in words]
+    if not words or not all(matches) or any(m.group(2) in KEYWORDS for m in matches):
+        return parse_expression(src)
+    result = None
+    for m in matches:
+        sign, body = m.groups()
+        term = _pattern_term(body)
+        if sign == "^":
+            result = N("bool", 1, value=False) if result is None else \
+                N("binop", 1, op="and", a=result, b=N("unop", 1, op="not", a=term))
+            continue
+        if sign == "!":
+            term = N("unop", 1, op="not", a=term)
+        result = term if result is None else N("binop", 1, op="or", a=result, b=term)
+    return result
+
+
+def _pattern_term(body):
+    if body == "*":
+        return N("bool", 1, value=True)
+    if "@" in body:
+        return parse_expression(body)
+    rng = _RANGE.fullmatch(body)
+    if rng is None:
+        return N("var", 1, name=body)  # a group: in the Group field a bare name is a bool attribute
+    index = N("attr", 1, name="elemnum", type=None)
+    first, last, step = rng.groups()
+    num = lambda v: N("num", 1, value=int(v))  # noqa: E731
+    if last is None:
+        return N("binop", 1, op="==", a=index, b=num(first))
+    lo, hi = sorted((int(first), int(last)))
+    term = N("binop", 1, op="and", a=N("binop", 1, op=">=", a=index, b=num(lo)),
+             b=N("binop", 1, op="<=", a=index, b=num(hi)))
+    if step and int(step) > 1:
+        offset = N("binop", 1, op="-", a=index, b=num(first))
+        every = N("binop", 1, op="==", a=N("binop", 1, op="%", a=offset, b=num(step)), b=num(0))
+        term = N("binop", 1, op="and", a=term, b=every)
+    return term
+
+
+def parse_expression(src):
+    """One expression on its own (the wrangle's Group field)."""
+    p = Parser(src)
+    e = p.expr()
+    while p.peek().kind == "newline":
+        p.next()
+    t = p.peek()
+    if t.kind != "eof":
+        raise BexError(f"expected the end of the expression but found {p._text(t)}", t.line)
+    return e

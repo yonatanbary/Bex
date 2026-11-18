@@ -33,7 +33,7 @@ FONT_SIZE = 11.0        # all sizes are node-editor units at zoom 1, before UI s
 LINE_H = 15.0
 PAD = 5.0
 MIN_ROWS = 3
-MAX_ROWS = 40           # longer scripts scroll inside the box
+MAX_ROWS = 16           # longer scripts scroll inside the box
 UNIT_Y = 20.0           # height of one layout row (Blender's UI_UNIT_Y)
 CLICK_SLOP = 5.0        # px (× UI scale): presses closer than this count as the same spot
 DEBUG_CLICKS = False    # show each click's count / position / selection in the status bar
@@ -58,6 +58,7 @@ PALETTE = {
     "focus": (0.36, 0.52, 0.78, 1.0),
     "evaluated": (0.36, 0.62, 0.42, 0.85),
     "error": (0.80, 0.36, 0.34, 0.9),
+    "warning": (0.86, 0.72, 0.38, 1.0),
     "text": (0.80, 0.80, 0.80, 1.0),
     "dim": (0.52, 0.52, 0.53, 1.0),
     "comment": (0.44, 0.47, 0.44, 1.0),
@@ -92,6 +93,81 @@ MAC = sys.platform == "darwin"
 _session = None          # the Session being edited, if any
 _draw_handle = None
 _highlight_cache = {}    # text -> highlighted spans
+_buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
+_views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
+
+
+def view_for(node):
+    """The scroll position of a wrangle's code box (kept while Blender runs)."""
+    key = (node.id_data.name, node.name)
+    view = _views.get(key)
+    if view is None:
+        view = _views[key] = View()
+    return view
+
+
+def scroll_code(node, region, event):
+    """Scroll a code box from a wheel or trackpad event. False when it doesn't
+    apply (nothing to scroll that way), so the event can go to the Node Editor."""
+    if event.ctrl or event.oskey or event.alt:
+        return False
+    lines = node.script.as_string().split("\n") if not is_editing(node) else _session.buf.lines
+    view = view_for(node)
+    rows = visible_rows(len(lines))
+    longest = max(map(len, lines)) + 1
+    cols = _session.cols if is_editing(node) else max(1, longest)
+    if event.type in ("WHEELUPMOUSE", "WHEELDOWNMOUSE"):
+        step = -3 if event.type == "WHEELUPMOUSE" else 3
+        if event.shift:  # Shift+wheel scrolls sideways
+            if not is_editing(node):
+                return False
+            view.left = max(0, min(view.left + step, max(view.left, longest - cols)))
+            return True
+        if len(lines) <= rows:
+            return False
+        view.scroll(step, len(lines), rows)
+        return True
+    if event.type == "TRACKPADPAN":
+        line_h, char_w = _metrics(box_rect(node, region)[4], node.code_scale)
+        dx, dy = event.mouse_x - event.mouse_prev_x, event.mouse_y - event.mouse_prev_y
+        if abs(dy) >= abs(dx):
+            if len(lines) <= rows:
+                return False
+            view.pan_y += dy / line_h
+            whole = int(view.pan_y)
+            view.pan_y -= whole
+            view.scroll(whole, len(lines), rows)
+        else:
+            if not is_editing(node) or longest <= cols:
+                return False
+            view.pan_x -= dx / char_w
+            whole = int(view.pan_x)
+            view.pan_x -= whole
+            view.left = max(0, min(view.left + whole, max(view.left, longest - cols)))
+        return True
+    return False
+
+
+def buffer_for(text):
+    """The editing buffer of a Text datablock, created on first use.
+
+    Undo history lives here, not in the Session, so clicking back into a wrangle
+    still undoes what was typed before (like Houdini). Changes made elsewhere
+    (Text Editor, Blender's undo, disk reload) come in through `set_text` as
+    undo steps of their own.
+    """
+    buf = _buffers.get(text.session_uid)
+    if buf is None:
+        buf = _buffers[text.session_uid] = TextBuffer(text.as_string())
+    else:
+        buf.set_text(text.as_string())
+    return buf
+
+
+def forget_buffers():
+    """Drop every script's history and every box's scroll (a new file was loaded)."""
+    _buffers.clear()
+    _views.clear()
 
 
 # -- geometry ------------------------------------------------------------------
@@ -103,23 +179,31 @@ def box_height(line_count, scale=1.0):
     return visible_rows(line_count) * LINE_H * scale + 2 * PAD
 
 
-def error_lines(node):
-    """The node's error wrapped to the code box width (in the strip's font), or []."""
-    if not node.error:
-        return []
+def _wrap(node, text):
+    """`text` wrapped to the code box width (in the strip's font)."""
     blf.size(FONT_ID, INFO_FONT)
     char_w = blf.dimensions(FONT_ID, "M" * 10)[0] / 10 or INFO_FONT * 0.6
     width = max(10, int((node.width - 2 * SIDE - 2 * PAD) / char_w))
-    lines = textwrap.wrap(node.error, width) or [node.error]
+    lines = textwrap.wrap(text, width) or [text]
     if len(lines) > ERROR_MAX_LINES:
         lines = lines[:ERROR_MAX_LINES]
         lines[-1] = lines[-1][:width - 1] + "…"
     return lines
 
 
+def note_lines(node):
+    """[(line, palette key)]: the node's error in red, then its warning in orange."""
+    notes = []
+    if node.error:
+        notes += [(line, "error") for line in _wrap(node, node.error)]
+    if node.warning:
+        notes += [(line, "warning") for line in _wrap(node, node.warning)]
+    return notes
+
+
 def info_height(node):
-    """The strip under the code: the error (if any), then reads / writes."""
-    return INFO_GAP + (len(error_lines(node)) + INFO_LINES) * INFO_LINE_H
+    """The strip under the code: the error / warning (if any), then reads / writes."""
+    return INFO_GAP + (len(note_lines(node)) + INFO_LINES) * INFO_LINE_H
 
 
 def reserve(layout, node):
@@ -197,7 +281,7 @@ def scrollbars(node, rect, lines, view):
 
 def _shows_code(node):
     return (node.bl_idname == "GeometryNodeBexWrangle" and node.script is not None
-            and node.show_code and node.show_options and not node.hide and node.dimensions.y > 0)
+            and node.show_options and not node.hide and node.dimensions.y > 0)
 
 
 def _metrics(px, scale):
@@ -212,9 +296,10 @@ class Session:
     def __init__(self, node):
         self.tree_name = node.id_data.name
         self.node_name = node.name
-        self.buf = TextBuffer(node.script.as_string())
+        self.buf = buffer_for(node.script)
         self.written = self.buf.text   # what we last wrote to the Text
-        self.view = View()
+        self.start_text = self.written # to tell whether the session changed anything
+        self.view = view_for(node)
         self.cols = 40                 # visible columns, updated on draw
         self.dragging = False
         self.clicks = 0                # presses in the current multi-click run (1, 2, 3)
@@ -315,7 +400,7 @@ def _draw_node(node, region, vx, vy):
     if editing:
         lines, view = _session.buf.lines, _session.view
     else:
-        lines, view = node.script.as_string().split("\n"), View()
+        lines, view = node.script.as_string().split("\n"), view_for(node)
     scale = node.code_scale
     _rect(x0, y0, x1, y1, PALETTE["back"])
     # Stroke: blue while focused, red on an error, green once evaluated and current.
@@ -341,7 +426,7 @@ def _draw_node(node, region, vx, vy):
     cols = max(1, int((x1 - x0 - 2 * pad) / char_w))
     if editing:
         _session.cols = cols
-        view.clamp(len(lines), rows)
+    view.clamp(len(lines), rows)
     if not _clip(region, vx, vy, x0, y0, x1, y1):
         return
 
@@ -440,8 +525,8 @@ def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
     label_w = blf.dimensions(FONT_ID, "writes  ")[0]
     line_h = INFO_LINE_H * px
     y = y1 - INFO_GAP * px - line_h + (line_h - INFO_FONT * px) * 0.5 + 0.2 * INFO_FONT * px
-    blf.color(FONT_ID, *PALETTE["error"][:3], 1.0)
-    for line in error_lines(node):
+    for line, kind in note_lines(node):
+        blf.color(FONT_ID, *PALETTE[kind][:3], 1.0)
         blf.size(FONT_ID, INFO_FONT * px)
         blf.position(FONT_ID, x0 + PAD * px, y, 0)
         blf.draw(FONT_ID, line)
@@ -510,7 +595,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
 
     def modal(self, context, event):
         node = _session.node() if _session else None
-        if node is None or not node.show_code:
+        if node is None:
             return self._end(context, None, {"CANCELLED"})
         _session.pull(node)
         result = self._event(context, node, event)
@@ -523,17 +608,9 @@ class BEX_OT_code_edit(bpy.types.Operator):
         kind, value = event.type, event.value
         x, y = event.mouse_region_x, event.mouse_region_y
         if kind in _PASS:
-            if kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE"):
+            if kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"):
                 hit, _ = wrangle_at(context, x, y)
-                lines = len(_session.buf.lines)
-                if hit == node and event.shift:  # Shift+wheel scrolls sideways
-                    view = _session.view
-                    longest = max(map(len, _session.buf.lines)) + 1
-                    step = -3 if kind == "WHEELUPMOUSE" else 3
-                    view.left = max(0, min(view.left + step, max(view.left, longest - _session.cols)))
-                    return None
-                if hit == node and lines > MAX_ROWS:
-                    _session.view.scroll(-3 if kind == "WHEELUPMOUSE" else 3, lines, MAX_ROWS)
+                if hit is not None and scroll_code(hit, context.region, event):
                     return None
             return {"PASS_THROUGH"}
         if kind == "MOUSEMOVE":
@@ -728,11 +805,13 @@ class BEX_OT_code_edit(bpy.types.Operator):
         if node is not None:
             _session.push(node)
             node.sync()  # losing focus is when the code is evaluated
+        changed = node is not None and _session.written != _session.start_text
+        _session.view.left = 0  # sideways scrolling is for editing; the resting box starts at column 0
         _session = None
         if DEBUG_CLICKS:
             context.workspace.status_text_set(None)
         _redraw(context)
-        if node is not None:
+        if changed:  # the whole session is one step in Blender's undo
             try:
                 bpy.ops.ed.undo_push(message="Edit BEX Code")
             except RuntimeError:
@@ -740,7 +819,27 @@ class BEX_OT_code_edit(bpy.types.Operator):
         return result
 
 
-classes = (BEX_OT_code_edit,)
+class BEX_OT_code_scroll(bpy.types.Operator):
+    """Wheel / trackpad over a wrangle's code scrolls it; anywhere else it passes through."""
+
+    bl_idname = "bex.code_scroll"
+    bl_label = "Scroll BEX Code"
+    bl_options = {"INTERNAL"}
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return space is not None and space.type == "NODE_EDITOR" and _session is None
+
+    def invoke(self, context, event):
+        node, _rect = wrangle_at(context, event.mouse_region_x, event.mouse_region_y)
+        if node is None or not scroll_code(node, context.region, event):
+            return {"PASS_THROUGH"}
+        _redraw(context)
+        return {"FINISHED"}
+
+
+classes = (BEX_OT_code_edit, BEX_OT_code_scroll)
 
 
 def register():

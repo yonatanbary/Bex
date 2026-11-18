@@ -1,0 +1,6 @@
+# Displace along the normal with animated noise.
+amp = chf("amplitude", 0.3)
+scale = chf("scale", 2.0)
+
+n = noise(@P * scale + @Time * 0.2)
+@P += @N * fit(n, 0, 1, -1, 1) * amp

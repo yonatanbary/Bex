@@ -1,0 +1,5 @@
+# Push points along their normal, like the default wrangle.
+amp = chf("amplitude", 0.2)
+freq = chf("frequency", 4.0)
+
+@P += @N * sin(@P.x * freq + @Time) * amp

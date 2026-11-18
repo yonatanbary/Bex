@@ -12,7 +12,7 @@ import math
 from dataclasses import dataclass, field
 
 from .lexer import BexError
-from .parser import parse
+from .parser import N, parse, parse_group
 
 MAX_LOOP_ITERATIONS = 1024
 RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3}
@@ -52,6 +52,9 @@ class Program:
     source: list = field(default_factory=list)  # script lines, used to label the generated nodes
     pending: list = field(default_factory=list)  # ch*() names held back on the line being edited
     reads: list = field(default_factory=list)  # [(attribute, type)] read from the incoming geometry
+    group: object = None  # Val (bool) choosing the elements to write, None = all
+    group_source: str = ""  # the Group expression, used to label its nodes
+    warnings: list = field(default_factory=list)  # problems that don't stop the build (a bad Group)
 
 
 # Built-in attributes that read from a field node instead of a named attribute.
@@ -199,7 +202,8 @@ class Compiler:
         self.written = []  # attribute names in first-write order
         self.params = {}  # channel name -> (type, default)
         self.line = 0  # line used for error messages
-        self.stmt_line = 0  # line of the statement being executed
+        self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
+        self.bare_attributes = False
 
     # -- IR construction ---------------------------------------------------
     def err(self, msg):
@@ -537,6 +541,8 @@ class Compiler:
             return val
         if name in CONSTANTS:
             return Val("float", CONSTANTS[name])
+        if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
+            return self.read_attr(name, self.attr_type(name, None))
         if name in self.half_set:
             raise self.err(f"'{name}' is only set in one branch of the if on line {self.half_set[name]}; "
                            f"give it a value before the if")
@@ -702,11 +708,50 @@ class Compiler:
         return prog
 
 
-def compile_source(src, domain="POINT", pending_line=None, known_params=()):
-    """`pending_line` (1-based) and `known_params`: see Compiler."""
+def _mark_groups(e):
+    """In the Group field, a name used as a whole condition (`top`, `@top`,
+    `not top`, `top and x`) is a group: a bool attribute. Inside a comparison or
+    arithmetic it keeps its usual type, so `@mask > 0.5` reads a float."""
+    if e.kind == "var" and e.name not in CONSTANTS:
+        return N("attr", e.line, name=e.name, type="bool")
+    if e.kind == "attr" and e.type is None and e.name not in BUILTINS and e.name not in KNOWN_TYPES:
+        return N("attr", e.line, name=e.name, type="bool")
+    if e.kind == "binop" and e.op in ("and", "or"):
+        return N("binop", e.line, op=e.op, a=_mark_groups(e.a), b=_mark_groups(e.b))
+    if e.kind == "unop" and e.op == "not":
+        return N("unop", e.line, op="not", a=_mark_groups(e.a))
+    return e
+
+
+def compile_source(src, domain="POINT", pending_line=None, known_params=(), group=""):
+    """`pending_line` (1-based) and `known_params`: see Compiler.
+
+    `group`: which elements the script writes (Houdini's group field): a pattern
+    like `0-9 top !bottom` or `* ^top` (parse_group), or an expression like
+    `@P.y > 0`. A bare name is a bool attribute.
+    It is read from the incoming geometry, before the script runs.
+    """
     c = Compiler(domain, pending_line, known_params)
+    selection, warnings = None, []
+    if group.strip():
+        types = dict(c.attr_types)
+        try:
+            c.bare_attributes, c.pending_line = True, None  # the Group is not a script line
+            selection = c.conv(c.eval(_mark_groups(parse_group(group))), "bool")
+        except BexError as e:
+            # Like Houdini: a group that doesn't make sense selects nothing, it doesn't
+            # break the node (the node shows a warning). Start over so nothing
+            # half-compiled from it remains.
+            c = Compiler(domain, pending_line, known_params)
+            selection = Val("bool", False)
+            warnings.append(f"group: {e.msg} (selects nothing)")
+        # Types the Group guessed (`top` is a bool) don't bind the script.
+        c.bare_attributes, c.pending_line, c.attr_types = False, pending_line, types
+        if selection.is_const and selection.const:
+            selection = None  # always true: every element
     for stmt in parse(src):
         c.exec(stmt)
     prog = c.program()
     prog.source = src.splitlines()
+    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings
     return prog

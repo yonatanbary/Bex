@@ -129,7 +129,12 @@ class TextBuffer:
         s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\t", INDENT)
         if not s and not self.has_selection:
             return
-        typing = len(s) == 1 and is_word_char(s) and not self.has_selection
+        typing = len(s) == 1 and s != "\n" and not self.has_selection
+        if typing and s.isspace():
+            row, col = self.cursor
+            prev = self.lines[row][col - 1:col]
+            if prev and (is_word_char(prev) or prev in ")]}\"'"):
+                self._group = None  # a space after a word or value starts a new undo step
         self._begin_edit("type" if typing else None)
         self._delete_selection()
         self._insert_raw(s)
@@ -190,7 +195,7 @@ class TextBuffer:
             target = (row, (col - 1) // len(INDENT) * len(INDENT))  # back to previous indent stop
         else:
             target = self._step_left(self.cursor)
-        self._delete_to(target)
+        self._delete_to(target, None if word else "back")
 
     def delete(self, word=False):
         if self.has_selection:
@@ -199,7 +204,7 @@ class TextBuffer:
             self._changed()
             return
         target = self._word_right(self.cursor) if word else self._step_right(self.cursor)
-        self._delete_to(target)
+        self._delete_to(target, None if word else "del")
 
     def indent(self):
         if not self.has_selection:
@@ -399,8 +404,13 @@ class TextBuffer:
         return True
 
     def _begin_edit(self, kind=None):
-        """Record an undo snapshot unless this edit continues the current typing group."""
-        if not (kind == "type" and self._group == "type"):
+        """Record an undo snapshot unless this edit continues the current group.
+
+        Groups: "type" (characters typed in a row; a space typed after a word,
+        `)` or a closing quote starts a new one, so `@P = 1` undoes as ` = 1`, then `@P`), "back" / "del"
+        (Backspace / Delete pressed in a row on one line). Moving the cursor ends a group.
+        """
+        if kind is None or kind != self._group:
             self._undo.append(self._snapshot())
             del self._undo[:-HISTORY_LIMIT]
         self._redo.clear()
@@ -482,11 +492,13 @@ class TextBuffer:
             self._delete_range(self.anchor, self.cursor)
         self.anchor = None
 
-    def _delete_to(self, target):
+    def _delete_to(self, target, kind=None):
         if target == self.cursor:
             self._group = None
             return
-        self._begin_edit()
+        if target[0] != self.cursor[0]:
+            kind = None  # joining lines is a step of its own
+        self._begin_edit(kind)
         self._delete_range(self.cursor, target)
         self.anchor = None
         self._changed()

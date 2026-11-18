@@ -246,15 +246,21 @@ def build(tree, program, domain, keep_stale=False):
     # -- geometry chain: capture every new value on the *input* geometry, then write.
     geo = group_input("Geometry")
     fields = [(name, type, val) for name, type, val in program.writes if not val.is_const]
-    captured = {}
-    if len(fields) > 1:
+    group = program.group
+    # Later writes see an already changed geometry, so the group is measured first too.
+    capture_group = group is not None and not group.is_const and len(program.writes) > 1
+    items = [("@" + name, type, val) for name, type, val in fields]
+    if capture_group:
+        items.append(("Group", "bool", group))
+    captured = {}  # item label -> captured output
+    if len(items) > 1 or capture_group:
         cap = new("GeometryNodeCaptureAttribute")
         cap.domain = domain
         links.new(geo, cap.inputs["Geometry"])
-        for i, (name, type, val) in enumerate(fields):
-            cap.capture_items.new(SOCKET_TYPE[type], "@" + name)
+        for i, (label, type, val) in enumerate(items):
+            cap.capture_items.new(SOCKET_TYPE[type], label)
             connect(val, cap.inputs[2 + i])
-            captured[name] = cap.outputs[2 + i]
+            captured[label] = cap.outputs[2 + i]
         geo = cap.outputs["Geometry"]
 
     for name, type, val in program.writes:
@@ -269,17 +275,22 @@ def build(tree, program, domain, keep_stale=False):
             n.label = "@" + name
             target = _enabled(n.inputs, "Value")[0]
         links.new(geo, n.inputs["Geometry"])
-        if name in captured:
-            links.new(captured[name], target)
+        if "@" + name in captured:
+            links.new(captured["@" + name], target)
         elif name == "P":
             connect_field(val, target)
         else:
             connect(val, target)
+        if group is not None:  # only the Group's elements are written
+            if "Group" in captured:
+                links.new(captured["Group"], n.inputs["Selection"])
+            else:
+                connect(group, n.inputs["Selection"])
         geo = n.outputs["Geometry"]
 
     links.new(geo, next(s for s in group_out.inputs if s.identifier == idents[("OUTPUT", "Geometry")]))
     _split_group_inputs(tree, group_in, line_of)
-    _layout(tree, group_in, line_of, program.source)
+    _layout(tree, group_in, line_of, program.source, program.group_source)
     return len(nodes), created
 
 
@@ -360,7 +371,7 @@ def estimate_height(node):
     return h + 10.0
 
 
-def _layout(tree, group_in, line_of, source):
+def _layout(tree, group_in, line_of, source, group_source=""):
     nodes = list(tree.nodes)
     feeds = {}
     for link in tree.links:
@@ -397,7 +408,10 @@ def _layout(tree, group_in, line_of, source):
         framed = line is not None
         if framed:
             frame = tree.nodes.new("NodeFrame")
-            text = source[line - 1].strip() if 0 < line <= len(source) else ""
+            if line == 0:  # nodes of the Group expression
+                text = "Group: " + group_source
+            else:
+                text = source[line - 1].strip() if 0 < line <= len(source) else ""
             frame.label = text if len(text) <= 64 else text[:61] + "..."
             frame.shrink = True
             y -= FRAME_PAD_TOP

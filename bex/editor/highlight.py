@@ -63,6 +63,12 @@ def highlight_line(line):
             pos += 1
             continue
         kind, end = m.lastgroup, m.end()
+        if kind == "number" and m.group()[0] == "." and m.group()[1:].isdigit() and pos and \
+                (line[pos - 1].isalnum() or line[pos - 1] in "_)]"):
+            add(pos, pos + 1, "punct")  # @P.1 is a component, like @P.y
+            add(pos + 1, end, "ident")
+            pos = end
+            continue
         if kind == "ident":
             kind = _ident_kind(line, m.group(), end)
         add(pos, end, kind)

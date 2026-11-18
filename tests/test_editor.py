@@ -207,12 +207,11 @@ def test_undo_redo():
     for ch in "bar":
         b.insert(ch)
     assert b.text == "foo bar"
-    assert b.undo() and b.text == "foo "
     assert b.undo() and b.text == "foo"
     assert b.undo() and b.text == ""
     assert not b.undo()
     assert b.redo() and b.text == "foo"
-    assert b.redo() and b.redo() and b.text == "foo bar" and b.cursor == (0, 7)
+    assert b.redo() and b.text == "foo bar" and b.cursor == (0, 7)
     assert not b.redo()
     b = TextBuffer()
     b.insert("a")
@@ -231,6 +230,35 @@ def test_undo_redo():
     while b.undo():
         n += 1
     assert n == 200
+
+
+def test_undo_groups():
+    b = TextBuffer()
+    for ch in "@P = 1":
+        b.insert(ch)
+    assert b.undo() and b.text == "@P"
+    assert b.undo() and b.text == ""
+    b = TextBuffer()
+    for ch in "x = sin(@P) * 2":
+        b.insert(ch)
+    b.newline()
+    b.insert("y")
+    assert b.undo() and b.text == "x = sin(@P) * 2\n"
+    assert b.undo() and b.text == "x = sin(@P) * 2"
+    assert b.undo() and b.text == "x = sin(@P)"
+    assert b.undo() and b.text == "x"
+    b = TextBuffer("ab\ncdef")
+    b.move_doc_end()
+    for _ in range(5):
+        b.backspace()
+    assert b.text == "ab"
+    assert b.undo() and b.text == "ab\n"      # the line join on its own
+    assert b.undo() and b.text == "ab\ncdef"  # the run of Backspaces in one step
+    b = TextBuffer("abc")
+    b.move_doc_end()
+    b.backspace()
+    b.insert("x")
+    assert b.undo() and b.text == "ab"
 
 
 def test_set_text():
@@ -292,6 +320,12 @@ def test_version_increments():
 
 
 # -- highlight --------------------------------------------------------------
+def test_highlight_numeric_component():
+    spans = lambda l: [(l[a:b], k) for a, b, k in highlight_line(l)]  # noqa: E731
+    assert spans("@P.1")[1:] == [(".", "punct"), ("1", "ident")]  # same as @P.y
+    assert ("0.5", "number") in spans("x = 0.5") and (".5", "number") in spans("x = .5")
+
+
 def test_highlight_kinds():
     line = 'x: float = chf("amp") * sin (@P.x) + f@mask  # hi'
     k = kinds(line)

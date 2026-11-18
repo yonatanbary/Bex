@@ -136,6 +136,8 @@ class View:
     def __init__(self):
         self.top = 0    # first visible row
         self.left = 0   # first visible column
+        self.pan_y = 0.0  # trackpad scrolling left over between whole rows
+        self.pan_x = 0.0  # ... and columns
 
     def follow(self, cursor, rows, cols):
         """Scroll just enough to keep the cursor in view."""

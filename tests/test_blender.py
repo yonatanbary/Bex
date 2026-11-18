@@ -219,6 +219,42 @@ def test_new_node_gets_its_own_script():
     assert "chf(" in a.script.as_string()
     assert a.error == "", a.error
     assert any(n.bl_idname == "GeometryNodeSetPosition" for n in a.node_tree.nodes)
+    # Its script is hidden from Text pickers (leading dot) and has no fake user,
+    # so Blender drops it on save once no node uses it.
+    from bex import node as bex_node
+    assert a.script.name.startswith(".BEX Script") and not a.script.use_fake_user
+    assert a.draw_label() == "BEX Wrangle"
+    c = tree.nodes.new("GeometryNodeBexWrangle")
+    bex_node.BexWrangleNode.copy(c, a)  # what duplicating calls
+    assert c.script != a.script and c.script.name.startswith(".BEX Script") and not c.script.use_fake_user
+
+
+def test_presets():
+    import tempfile
+    from bex import presets
+
+    builtins = presets.builtin_presets()
+    assert {"Displace", "Ripple"} <= {p.stem for p in builtins}
+    tree = bpy.data.node_groups.new("Presets", "GeometryNodeTree")
+    node = tree.nodes.new("GeometryNodeBexWrangle")
+    for path in builtins:  # every built-in preset compiles
+        presets.load_into(node, path)
+        assert node.error == "" and node.is_up_to_date(), (path.stem, node.error)
+    # User presets go to their own folder (redirected here) and show in the menu list.
+    folder = Path(tempfile.mkdtemp())
+    real_user_dir = presets.user_dir
+    presets.user_dir = lambda create=False: folder
+    try:
+        node.script.from_string("@P.z = 7")
+        path = presets.save(' my/wave? ', node.script.as_string())
+        assert path == folder / "mywave.bex" and path.read_text() == "@P.z = 7"
+        assert [p.stem for p in presets.user_presets()] == ["mywave"]
+        presets.save("mywave", "@P.z = 8")  # same name replaces it
+        assert path.read_text() == "@P.z = 8" and len(presets.user_presets()) == 1
+        presets.load_into(node, path)
+        assert node.script.as_string() == "@P.z = 8" and node.is_up_to_date()
+    finally:
+        presets.user_dir = real_user_dir
 
 
 def test_pending_line_keeps_inputs_steady():
@@ -277,6 +313,196 @@ def test_code_editor_compiles_on_focus_loss():
     assert press("ESC") == {"FINISHED"} and ce._session is None
     assert [s.name for s in node.channels()] == ["lift"] and node.is_up_to_date()
     assert close(evaluate(obj).vertices[0].co, (2, -1, 1))
+
+
+def test_code_editor_undo_survives_refocus():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1")
+    op = types.SimpleNamespace()
+    for name in ("_key", "_after_change", "_end"):
+        setattr(op, name, getattr(ce.BEX_OT_code_edit, name).__get__(op))
+    ctx = bpy.context
+
+    def press(key, ch="", **mods):
+        ev = types.SimpleNamespace(type=key, unicode=ch, ctrl=False, shift=False, alt=False, oskey=False)
+        for k, v in mods.items():
+            setattr(ev, k, v)
+        return op._key(ctx, node, ev)
+
+    undo = {"oskey": True} if ce.MAC else {"ctrl": True}
+    ce._session = ce.Session(node)
+    ce._session.buf.move_doc_end()
+    press("RET")
+    for ch in "@P = 1":
+        press(ch.upper() if ch.isalpha() else ch, ch)
+    press("ESC")
+    # Refocus: the history is still there, and undo is by word, not by character.
+    ce._session = ce.Session(node)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1\n@P", repr(text.as_string())
+    press("Z", **undo)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1"
+    press("Z", shift=True, **undo)
+    assert text.as_string() == "@P.z = 1\n"
+    press("ESC")
+    # A change from outside (Text Editor) becomes one more step.
+    text.from_string("@P.z = 2")
+    ce._session = ce.Session(node)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1\n"
+    press("ESC")
+    # Each script has its own history.
+    other = make_setup("@P.z = 5")[1]
+    ce._session = ce.Session(other)
+    assert not ce._session.buf.undo()
+    ce._session = None
+    # Loading a file forgets it.
+    ce.forget_buffers()
+    assert not ce.buffer_for(text).undo()
+
+
+def test_code_box_scrolls():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("\n".join(f"@P.z = {i}" for i in range(40)))
+    def wheel(kind, **mods):
+        return types.SimpleNamespace(**{"type": kind, "ctrl": False, "oskey": False, "alt": False, "shift": False, **mods})
+    assert ce.visible_rows(40) == ce.MAX_ROWS < 40  # the box stops growing
+    view = ce.view_for(node)
+    assert ce.scroll_code(node, None, wheel("WHEELDOWNMOUSE")) and view.top == 3
+    for _ in range(20):
+        ce.scroll_code(node, None, wheel("WHEELDOWNMOUSE"))
+    assert view.top == 40 - ce.MAX_ROWS  # clamped at the last line
+    assert not ce.scroll_code(node, None, wheel("WHEELUPMOUSE", ctrl=True))  # Ctrl+wheel stays the editor's
+    # The scroll is kept when editing starts.
+    ce._session = ce.Session(node)
+    assert ce._session.view is view
+    ce._session = None
+    # A short script has nothing to scroll: the wheel goes to the Node Editor.
+    short = make_setup("@P.z = 1")[1]
+    assert not ce.scroll_code(short, None, wheel("WHEELDOWNMOUSE"))
+
+
+def test_channels_are_properties():
+    obj, node, text = make_setup('@P.z = chf("amp", 0.5)')
+    sock = node.inputs["amp"]
+    assert sock.hide  # a property on the node, not an input socket
+    sock.default_value = 2.0
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 2))
+    # A link (made before, or after Ctrl+H) keeps the socket visible and drives the value...
+    tree = node.id_data
+    value = tree.nodes.new("ShaderNodeValue")
+    value.outputs[0].default_value = 3.0
+    link = tree.links.new(value.outputs[0], sock)
+    node.update()
+    assert not sock.hide and close(evaluate(obj).vertices[0].co, (-1, -1, 3))
+    # ...and unlinking makes it a property again.
+    tree.links.remove(link)
+    node.update()
+    assert sock.hide
+    # Recompiling keeps it hidden, and a new channel starts hidden.
+    text.from_string('@P.z = chf("amp", 0.5) + chf("lift", 1)')
+    node.sync()
+    assert node.inputs["amp"].hide and node.inputs["lift"].hide
+
+
+def test_group():
+    def attr(mesh, name):
+        return [d.value for d in mesh.attributes[name].data]
+
+    # Several writes: the group is measured once on the incoming geometry, so
+    # moving @P first does not change which points the later write picks.
+    obj, node, text = make_setup("@P.y = 5\nf@mark = 1")
+    node.group = "@P.y > 0"
+    mesh = evaluate(obj)
+    assert node.error == "", node.error
+    before = original_points(obj)
+    for (x, y, z), v, m in zip(before, mesh.vertices, attr(mesh, "mark")):
+        inside = y > 0
+        assert close(v.co, (x, 5 if inside else y, z)) and m == (1.0 if inside else 0.0), (x, y, m)
+    # Frames label the group's nodes.
+    assert any(n.bl_idname == "NodeFrame" and n.label == "Group: @P.y > 0" for n in node.node_tree.nodes)
+
+    # A bool attribute as the group, in all three spellings, written by an upstream wrangle.
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("@group_top = @P.x > 0.5")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("f@mark = 1")
+    expected = [1.0 if x > 0.5 else 0.0 for x, _y, _z in before]
+    for spelling in ("top", "b@top", "@group_top"):
+        node.group = spelling
+        assert node.error == "" and attr(evaluate(obj), "mark") == expected, spelling
+
+    # A group that doesn't make sense selects nothing, with a warning instead of an error.
+    node.group = "@P.4 > 0"
+    assert node.error == "" and node.warning.startswith("group:") and "selects nothing" in node.warning
+    assert attr(evaluate(obj), "mark") == [0.0] * len(before)
+    node.group = ""
+    assert node.error == "" and node.warning == "" and attr(evaluate(obj), "mark") == [1.0] * len(before)
+
+
+def test_group_with_float_attribute_and_constant_writes():
+    # A float attribute compared in the Group is read as a float.
+    obj, node, text = make_setup("f@mask = 0.3\n")
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("f@mask = 0.3\nb@top = 1")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("@P.z = 5")
+    node.group = "@mask > 0.5"
+    assert node.error == "" and node.warning == "", node.warning
+    assert all(abs(v.co.z) < 1e-6 for v in evaluate(obj).vertices)  # 0.3 is not > 0.5: nothing moves
+    # Only constant writes: the group is still measured before the first write.
+    text.from_string("b@top = False\nf@x = 5")
+    node.group = "top"
+    assert any(n.bl_idname == "GeometryNodeCaptureAttribute" for n in node.node_tree.nodes)
+    assert all(d.value == 5.0 for d in evaluate(obj).attributes["x"].data)
+
+
+def test_group_patterns():
+    obj, node, text = make_setup("f@mark = 1")
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")  # writes the group "top"
+    first.script.from_string("@group_top = @P.x > 0.5")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    pts = original_points(obj)
+    count = len(pts)
+    top = {i for i, (x, _y, _z) in enumerate(pts) if x > 0.5}
+    every = set(range(count))
+    cases = {
+        "*": every,
+        "3": {3},
+        "2-5": {2, 3, 4, 5},
+        "5-2": {2, 3, 4, 5},
+        "0-10:3": {0, 3, 6, 9},
+        "1 7 top": {1, 7} | top,
+        "!top": every - top,
+        "* ^top": every - top,
+        "0-9 ^top": set(range(10)) - top,
+        "^top": set(),
+        "@P.y>0 4": {i for i, (_x, y, _z) in enumerate(pts) if y > 0} | {4},
+        "@P.y > 0 and top": {i for i, (_x, y, _z) in enumerate(pts) if y > 0} & top,  # an expression
+    }
+    for pattern, chosen in cases.items():
+        node.group = pattern
+        assert node.error == "", (pattern, node.error)
+        marks = [d.value for d in evaluate(obj).attributes["mark"].data]
+        got = {i for i, m in enumerate(marks) if m == 1.0}
+        assert got == chosen, (pattern, sorted(got), sorted(chosen))
 
 
 def test_incoming_attributes():
