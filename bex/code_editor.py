@@ -276,6 +276,13 @@ def box_rect(node, region):
     return round(x0 + SIDE * px), round(y0), round(x1 - SIDE * px), round(y1), px
 
 
+def node_top(node, region):
+    """(y, zoom): the node's top edge in region pixels, and region pixels per
+    Blender pixel (node-editor view units, which already include the UI scale)."""
+    ox, oy, zoom = _view_map(region)
+    return (node.location_absolute.y * _ui_scale() - oy) * zoom, zoom
+
+
 def wrangle_at(context, x, y):
     """The wrangle whose code box is under region point (x, y), and that box."""
     tree = getattr(context.space_data, "edit_tree", None)

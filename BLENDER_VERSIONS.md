@@ -55,16 +55,22 @@ Units are node-editor units at zoom 1, before UI scale.
 | `SOCKET_ROW` | 22 | `code_editor.py` | one input socket row under the node body |
 | `BOTTOM_PAD` | 7 | `code_editor.py` | the node's padding below its last socket |
 | `SIDE` | 10.5 | `code_editor.py` | the node body's side inset |
-| `ROW_H` | 25 | `ramp_widget.py` | pitch of one row of buttons / fields in the node body |
-| `SEPARATOR_H` | 7 | `ramp_widget.py` | `separator(factor=0.5, type="LINE")` |
+| `BODY_TOP` | 16.7 Blender px | `ramp_widget.py` | gap between the output socket row and the first field (same at UI scale 1.0 and 1.1, Retina) |
 | `TOGGLES_W` | 40 | `ramp_widget.py` | the button column left of a ramp graph (two 20-unit icon buttons) |
 | `NODE_PAD` | 16 | `node.py` | the node's inner margins, left + right (an estimate; only shifts the label column by a few pixels) |
 
-- **How to re-check:** run Blender without `-b`, take a screenshot
-  (`bpy.ops.screen.screenshot_area`) and measure the row pitch in pixels. Divide by
-  `box_rect(...)[4]` (pixels per unit) to get units. Check one ramp with its point fields
-  open and a second ramp above it: an error in `ROW_H` builds up and shows as the graph
-  drawn over the "Point No." row.
+- **Ramp graphs are counted down from the node's top** in Blender pixels
+  (`ramp_widget._row_sizes`), with Blender's own rounding, not fixed units x UI scale:
+  a row is `U.widget_unit` = `round(18 x scale) + 2 x pixel size` and the gap between
+  rows is `buttonspacey` = `int(5 x scale)`, where scale is `preferences.system.ui_scale`
+  (it includes the Retina factor). At Resolution Scale 1.1 on Retina that is 44 + 10,
+  not 1.1 x (20 + 5): fixed units drifted a few pixels per row. Aligned columns (the
+  ch*() fields) have no gaps. A label scaled by `h / UNIT_Y` is `h x widget_unit / 20` tall.
+- **How to re-check:** open a saved file (no splash) in Blender without `-b`, take a
+  screenshot (`bpy.ops.screen.screenshot_area`) and compare the top pixel row of a ramp's
+  toggle buttons with its graph's, with one ramp's point fields open and a second ramp
+  under it, at Resolution Scale 1.0 and 1.1. Compute positions in the same frame as the
+  screenshot: `node.view_all` animates the zoom for a moment.
 
 ## API gaps and workarounds
 

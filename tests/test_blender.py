@@ -574,8 +574,9 @@ def test_ramp_mouse_editing():
     ramp = node.bex_ramps["r"]
     ramp.expanded = True
     # No Node Editor in background: put the code box at a known place.
-    box_rect, shows_code = ce.box_rect, ce._shows_code
+    box_rect, node_top, shows_code = ce.box_rect, ce.node_top, ce._shows_code
     ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce.node_top = lambda n, r: (600.0, 1.0)
     ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
     try:
         ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
@@ -610,7 +611,7 @@ def test_ramp_mouse_editing():
         assert op.invoke(ctx, event(*at(0.4, 0.2), ctrl=True)) == {"FINISHED"}
         assert len(ramp.keys) == 2
     finally:
-        ce.box_rect, ce._shows_code = box_rect, shows_code
+        ce.box_rect, ce.node_top, ce._shows_code = box_rect, node_top, shows_code
 
 
 def test_group():

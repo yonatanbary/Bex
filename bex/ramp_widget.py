@@ -7,6 +7,8 @@ Curve inside the wrangle's group: `write_curve` fills it with `ramp.polyline()`
 whenever a key changes, so dragging updates the result live.
 """
 
+import math
+
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -24,11 +26,10 @@ HIT_R = 8.0          # how close a press must be to grab a key or marker
 MARKER_W = 5.0       # half width of a marker
 TOGGLES_W = 40.0     # the column left of the graph: the point-fields and fold buttons
 TOGGLES_GAP = 4.0    # between that column and the graph
-# What sits between the code box and the last ramp, and each ramp's rows. The
-# layout cannot be measured from Python, so these were measured from screenshots
-# of Blender 5.2 (like code_editor's SOCKET_ROW).
-ROW_H = 25.0         # one row of buttons or fields in the node body (pitch, with spacing)
-SEPARATOR_H = 7.0    # layout.separator(factor=0.5, type="LINE")
+# Where the graph goes is counted down from the node's top edge, in Blender pixels
+# rounded the way Blender rounds them (see `_row_sizes`), so nothing below a graph
+# (its point fields, the code box) can move it. Python can't read widget positions.
+BODY_TOP = 16.7      # Blender px: the gap between the output socket row and the first field (measured, 5.2)
 RAMP_LIMIT = 16      # remembered ramps no longer in the script, per node
 
 PALETTE = {
@@ -172,11 +173,6 @@ def graph_height(ramp):
     return (GRAPH_H if ramp.expanded else STRIP_H) + MARKER_H
 
 
-def block_height(ramp):
-    """A ramp's rows: header, graph (+ markers), and the point's 4 fields."""
-    return ROW_H + graph_height(ramp) + (4 * ROW_H if ramp.show_point else 0)
-
-
 def draw_layout(layout, node, ramp, field):
     """The ramp's header row, the space the graph is drawn into, and the
     selected point's fields. `field(layout, node, label, width)` is node._field."""
@@ -206,20 +202,39 @@ def draw_layout(layout, node, ramp, field):
         field(layout, node, "Interpolation", 130).prop(key, "interpolation", text="")
 
 
+def _row_sizes():
+    """(row, gap) in Blender pixels: the height of one row of buttons (U.widget_unit)
+    and the space the layout puts between rows (style buttonspacey). Blender rounds
+    both to whole pixels (round and truncate), so at UI scale 1.1 a row is 44 + 10,
+    not 1.1 x (20 + 5)."""
+    system = bpy.context.preferences.system
+    scale = system.ui_scale or 1.0  # includes the Retina pixel size; 0 without a window (background)
+    row = math.floor(18.0 * scale + 0.5 + 1e-4) + 2 * system.pixel_size
+    return row, int(5.0 * scale + 1e-4)
+
+
 def ramp_rects(node, region):
     """{name: (graph rect, marker rect)} in region pixels, each (x0, y0, x1, y1);
-    and px. Found upwards from the code box: the Presets row and the separator,
-    then the ramps from the last one up."""
-    x0, _y0, x1, y1, px = ce.box_rect(node, region)
+    and px. Counted down from the node's top, following `draw_buttons`: header and
+    output socket, Group, Run Over, the ch*() column (aligned: no gaps), then each
+    ramp's label row, graph row and point fields."""
+    x0, _y0, x1, _y1, px = ce.box_rect(node, region)
+    top, zoom = ce.node_top(node, region)
+    row, gap = _row_sizes()
+    unit = row / ce.UNIT_Y  # Blender px per layout unit: a label scaled by h / UNIT_Y is h * unit tall
     gx0 = x0 + (TOGGLES_W + TOGGLES_GAP) * px  # right of the toggle buttons
-    y = y1 + (ROW_H + SEPARATOR_H) * px
+    y = 2 * row + BODY_TOP + 2 * (row + gap)  # down to below Run Over
+    chans = len(node.channels())
+    if chans:
+        y += chans * row + gap
     rects = {}
-    for ramp in reversed(shown_ramps(node)):
-        y += (4 * ROW_H if ramp.show_point else 0) * px
-        markers = (gx0, y, x1, y + MARKER_H * px)
-        graph = (gx0, markers[3], x1, y + graph_height(ramp) * px)
-        rects[ramp.name] = (graph, markers)
-        y += (graph_height(ramp) + ROW_H) * px
+    for ramp in shown_ramps(node):
+        y += row + gap  # the label row
+        h = graph_height(ramp) * unit
+        graph_top = top - y * zoom
+        markers = (gx0, graph_top - h * zoom, x1, graph_top - (h - MARKER_H * unit) * zoom)
+        rects[ramp.name] = ((gx0, markers[3], x1, graph_top), markers)
+        y += max(row, h) + gap + (4 * (row + gap) if ramp.show_point else 0)
     return rects, px
 
 
