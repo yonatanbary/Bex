@@ -74,17 +74,20 @@ else updates by event, with no polling.
 | Syntax | Python: indented blocks after `:`, `#` comments, one statement per line (`;` also separates). No declarations: `x = 1` creates a variable, its type follows the value; `x: int = 2.7` converts |
 | Types | `float` `int` `vector` `bool`, `True` `False` |
 | Attributes | `@name` (float by default), `f@` `i@` `v@` `b@` to set the type. `@group_name` is the bool attribute `name`, as in Houdini |
-| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@index`) `@id` `@Time` `@Frame`, `@numpt` `@numprim` `@numvtx` (element counts) |
+| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@curvenum` `@vtxnum` `@edgenum` `@index`) `@id` `@Time` `@Frame`, `@curveu` `@curvelength` `@tangent` (curves), `@area` `@island` `@edgeangle` (meshes), `@numpt` `@numprim` `@numvtx` (element counts). The ones besides `@P` `@id` are read-only |
 | Node properties | `chf("name", default)` `chi` `chv` `chb` |
 | Vectors | `(x, y, z)` or `[x, y, z]`, `vector(x, y, z)`, `.x .y .z` (`.r .g .b`, `.0 .1 .2`), `v[0]` … `v[-1]` |
 | Operators | `+ - * / // % **` (`/` always divides exactly, `//` floors), comparisons (chains like `0 < x <= 1`), `and or not`, `a if cond else b`, `+= -= *= /= //= %= **=` |
 | Control flow | `if / elif / else` (becomes a per-element Switch), `for i in range(n)` (`range(start, stop, step)`; the count can be a channel, `npoints()` or differ per element like `range(@ptnum)`), `while` (its condition can differ per element), `break`, `continue`, `pass`. Short loops (up to 8 iterations) are unrolled, loops that only compute constants become nothing, others become a Repeat Zone; a loop that can end early runs in growing chunks that stop once every element is done (a `while` stops after 100 000 iterations). `v[i]` picks a component by a computed index |
 | Functions | `def name(a, b=1):` with `return`. Call with keywords too: `name(b=2, a=1)`. A function reads the script's variables, its own stay inside it; it may write `@attributes`. An early `return` can differ per element, also from inside a loop. Recursion works when it ends while compiling (`fib(10)` is just 55); for anything else use a `while` loop. A function called more than once with values that differ per element is built once (a Closure); otherwise it is written out where it's called |
-| Math | `sin cos tan asin acos atan atan2 sinh cosh tanh sqrt pow exp log log10 abs floor ceil round trunc frac sign mod min max clamp snap pingpong radians degrees` |
-| Mapping | `lerp/mix fit efit fit01 fit11 smoothstep/smooth smootherstep wrap(x, lo, hi)`. `fit` and `wrap` also take vectors (per component) |
+| Math | `sin cos tan asin acos atan atan2 sinh cosh tanh sqrt pow exp log log10 abs floor ceil round/rint trunc frac sign mod min max clamp snap pingpong radians degrees`, `avg(a, b, …)` (`avg(v)`: of a vector's components) |
+| Mapping | `lerp/mix fit efit fit01 fit11 smoothstep/smooth smootherstep wrap(x, lo, hi)`, `invlerp(x, a, b)`. `fit` and `wrap` also take vectors (per component) |
 | Bounding box | `getbbox_min() getbbox_max() getbbox_size() getbbox_center() relbbox(p)` (0–1 inside the box). Of the geometry entering the node; `getbbox_max(1)` measures input 1 |
-| Other inputs | `point(1, "P", i)` `prim(1, "f@area", i)` `vertex(…)`: an attribute of element `i` on an input (type from the prefix in the name, else float; `P`/`N` are vectors). `@opinput1_name`: the same element number on input 1. `npoints(1)` `nprims(1)` `nvertices(1)`, `nearpoint(1, pos)` |
-| Vector | `length distance dot cross normalize` |
+| Other inputs | `point(1, "P", i)` `prim(1, "f@area", i)` `vertex(…)`: an attribute of element `i` on an input (type from the prefix in the name, else float; `P`/`N` are vectors). `@opinput1_name`: the same element number on input 1. `npoints(1)` `nprims(1)`/`nprimitives` `nvertices(1)` `nedges(1)` `ncurves(1)`, `nearpoint(1, pos)` |
+| Surface | `xyzdist(1, pos)` (distance to the faces of input 1), `minpos(1, pos)` (closest position on them), `intersect(1, origin, dir)` (the face a ray hits, or -1; the ray is as long as `dir`). As in VEX, a variable as the last argument gets more: `xyzdist(1, @P, prim)` sets `prim` to the closest face, `intersect(1, @P, dir, pos)` sets `pos` to the hit position. Input 0 is the geometry as it entered |
+| Topology | `primpoint(0, prim, n)` `primvertexcount(0, prim)` `vertexpoint(0, vtx)` `vertexprim(0, vtx)` `vertexprimindex(0, vtx)` `neighbour(0, pt, n)` `neighbourcount(0, pt)`, on meshes. On inputs 1–3 the last argument `n` has to be a constant |
+| Vector | `length distance dot cross normalize`, `length2 distance2` (squared), `reflect(dir, n)` `refract(dir, n, ior)` `faceforward(n, dir)` |
+| Colour | `hsvtorgb rgbtohsv hsltorgb rgbtohsl` (hue 0–1, wraps around), `luminance(c)`, `blackbody(kelvin, brightness=1)` |
 | Random | `noise(p)` `vnoise(p)` `rand(seed)` `vrand(seed)` |
 | Constants | `PI` / `pi`, `TAU` / `tau` |
 

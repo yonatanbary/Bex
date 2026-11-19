@@ -659,6 +659,54 @@ def test_domain_indices():
     fails("@curvenum = 1", "read-only")
 
 
+def test_data_functions():
+    import colorsys
+    # Constants fold.
+    w = writes("v@a = hsvtorgb((0.25, 0.5, 1))\nv@b = rgbtohsl(hsltorgb((0.75, 0.5, 0.25)))\n"
+               "f@c = luminance((1, 1, 1))\nf@d = length2((1, 2, 2)) + distance2((1, 0, 0), (0, 0, 0))\n"
+               "f@e = avg(1, 2, 6)\nf@f = avg((3, 6, 9))\nf@g = invlerp(5, 0, 4)\nf@h = rint(2.5)\n"
+               "v@i = hsvtorgb((1.25, 0.5, 1))")
+    assert w["a"].const == colorsys.hsv_to_rgb(0.25, 0.5, 1)
+    assert all(abs(x - y) < 1e-9 for x, y in zip(w["b"].const, (0.75, 0.5, 0.25)))
+    assert abs(w["c"].const - 1) < 1e-9 and w["d"].const == 10
+    assert w["e"].const == 3 and w["f"].const == 6 and w["g"].const == 1.25 and w["h"].const == 3
+    assert w["i"].const == w["a"].const  # the hue wraps
+    # Out arguments set a variable or attribute, like VEX.
+    w = writes("d = xyzdist(1, @P, prim)\ni@p = prim\ni@h = intersect(2, @P, (0, 0, -5), v@hit)\nf@d = d")
+    assert w["p"].node.params["idname"] == "GeometryNodeSampleNearestSurface" and w["p"].type == "int"
+    assert w["hit"].node.params["idname"] == "GeometryNodeRaycast" and w["hit"].out == 1
+    assert w["h"].node.kind == "switch" and w["d"].node.params["idname"] == "GeometryNodeProximity"
+    assert compile_source("f@d = xyzdist(1, @P, prim)\nf@m = minpos(3, @P).x").inputs == [1, 3]
+    # Topology: a field on this geometry, a sample on another input.
+    w = writes("i@a = primpoint(0, @primnum, 1)\ni@b = primpoint(1, @primnum, 1)\ni@c = neighbour(0, @elemnum, 0)",
+               "FACE")
+    assert w["a"].node.kind == "node" and w["a"].node.params["field"]
+    assert w["b"].node.kind == "sample" and w["b"].node.inputs[1].node.kind == "sample"
+    # A per-element count: the loop runs the largest one.
+    p = compile_source("n = 0\nfor i in range(neighbourcount(0, @ptnum)):\n    n += 1\ni@n = n")
+    assert any(n.kind == "stat" for n in _ir_nodes(p))
+    w = writes("v@t = @tangent\nf@a = @area\ni@i = @island\nf@e = @edgeangle\ni@n = nedges(0) + ncurves(1)")
+    assert w["t"].node.params["name"] == "tangent" and w["e"].node.params["name"] == "edge_angle"
+    fails("i@a = primpoint(1, 0, @ptnum)", "has to be a constant")
+    fails("f@d = xyzdist(1, @P, 3)", "variable name")
+    fails("f@d = intersect(1, @P)", "3 or 4 arguments")
+    fails("@area = 1", "read-only")
+    fails("f@a = avg()", "at least one")
+
+
+def _ir_nodes(p):
+    """Every IR node the program's writes reach."""
+    seen, stack = {}, [v.node for _, _, v in p.writes if v.node is not None]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen[id(n)] = n
+        stack.extend(v.node for v in n.inputs if v.node is not None)
+        stack.extend(x for x in n.params.values() if hasattr(x, "kind"))
+    return list(seen.values())
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

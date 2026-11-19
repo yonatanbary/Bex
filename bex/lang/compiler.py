@@ -8,6 +8,7 @@ Variables work like Python's: assigning creates them, and they are visible until
 the end of the script.
 """
 
+import colorsys
 import itertools
 import math
 import re
@@ -100,6 +101,10 @@ BUILTINS = {
     "Frame": ("float", "time", 1),
     "curveu": ("float", "spline_parameter", 0),  # 0-1 along each curve (Spline Parameter's Factor)
     "curvelength": ("float", "spline_parameter", 1),  # distance along the curve from its start
+    "tangent": ("vector", "tangent", 0),  # direction along the curve
+    "area": ("float", "face_area", 0),
+    "island": ("int", "mesh_island", 0),  # which connected piece of the mesh
+    "edgeangle": ("float", "edge_angle", 0),  # angle between an edge's two faces, 0 when flat
 }
 # Index built-ins that depend on the Run Over domain, like Formula to Nodes / Houdini:
 # name -> {domain: (input kind, output)}. @elemnum / @index are always the element's index.
@@ -121,7 +126,8 @@ INDEX_HINTS = {
 
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
+READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
+             "curveu", "curvelength", "tangent", "area", "island", "edgeangle"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
 
 
@@ -173,6 +179,7 @@ MATH1 = {
     "trunc": ("TRUNC", math.trunc),
     "frac": ("FRACT", lambda x: x - math.floor(x)),
     "sign": ("SIGN", _sign),
+    "rint": ("ROUND", lambda x: math.floor(x + 0.5)),
     "radians": ("RADIANS", math.radians),
     "degrees": ("DEGREES", math.degrees),
 }
@@ -233,7 +240,26 @@ BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox
 # node's "Input N" sockets (always there).
 MAX_INPUT = 3
 SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
-COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
+COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nprimitives": "FACE", "nvertices": "CORNER",
+               "nedges": "EDGE", "ncurves": "CURVE"}  # npoints(1)
+# Mesh topology on an input: name -> (node, output, index socket, domain of the index)
+TOPOLOGY = {
+    "primvertexcount": ("GeometryNodeCornersOfFace", "Total", "Face Index", "FACE"),
+    "vertexpoint": ("GeometryNodeVertexOfCorner", "Vertex Index", "Corner Index", "CORNER"),
+    "vertexprim": ("GeometryNodeFaceOfCorner", "Face Index", "Corner Index", "CORNER"),
+    "vertexprimindex": ("GeometryNodeFaceOfCorner", "Index in Face", "Corner Index", "CORNER"),
+    "neighbourcount": ("GeometryNodeEdgesOfVertex", "Total", "Vertex Index", "POINT"),
+}
+# Every output of the topology nodes, in socket order (an IR node's `out` indexes these).
+NODE_OUTS = {
+    "GeometryNodeCornersOfFace": ("Corner Index", "Total"),
+    "GeometryNodeEdgesOfVertex": ("Edge Index", "Total"),
+    "GeometryNodeVertexOfCorner": ("Vertex Index",),
+    "GeometryNodeFaceOfCorner": ("Face Index", "Index in Face"),
+    "GeometryNodeInputMeshEdgeVertices": ("Vertex Index 1", "Vertex Index 2"),
+}
+COLOR_MODES = {"hsvtorgb": "HSV", "rgbtohsv": "HSV", "hsltorgb": "HSL", "rgbtohsl": "HSL"}
+LUMINANCE = (0.2126, 0.7152, 0.0722)  # Rec. 709, for linear colours
 # Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
 INPUT_SOCKETS = tuple(f"Input {n + 1}" for n in range(1, MAX_INPUT + 1))
 OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
@@ -242,8 +268,10 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "log", "log10", "clamp", "lerp", "mix", "fit", "efit", "fit01", "fit11", "smoothstep",
     "length", "normalize", "dot", "cross", "distance", "set", "vector", "float", "bool", "int",
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
-    "nearpoint",
-}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS)
+    "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
+    "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
+    "luminance", "blackbody",
+}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
 # BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
@@ -272,6 +300,7 @@ SIGNATURES = {
     "floor": (("value",), "Rounds down."),
     "ceil": (("value",), "Rounds up."),
     "round": (("value",), "Rounds to the nearest whole number."),
+    "rint": (("value",), "Same as round()."),
     "trunc": (("value",), "Cuts off the decimals."),
     "frac": (("value",), "Just the decimals: frac(2.75) is 0.75."),
     "min": (("a", "b"), "The smaller of the two."),
@@ -294,6 +323,8 @@ SIGNATURES = {
     "smootherstep": (("min", "max", "value"), "Like smoothstep(), with softer ends."),
     "lerp": (("a", "b", "t"), "Blends from a (t = 0) to b (t = 1)."),
     "mix": (("a", "b", "t"), "Same as lerp()."),
+    "invlerp": (("value", "a", "b"), "Where value sits between a (0) and b (1). Not clamped."),
+    "avg": (("values...",), "Average of the values. With one vector, the average of its components."),
     # Vectors
     "set": (("x", "y", "z"), "Makes a vector."),
     "length": (("vector",), "How long the vector is."),
@@ -301,6 +332,18 @@ SIGNATURES = {
     "dot": (("a", "b"), "Dot product of two vectors."),
     "cross": (("a", "b"), "A vector at right angles to both."),
     "distance": (("a", "b"), "Distance between two points."),
+    "length2": (("vector",), "Squared length: faster than length() for comparing."),
+    "distance2": (("a", "b"), "Squared distance between two points."),
+    "reflect": (("direction", "normal"), "The direction bounced off a surface with this normal."),
+    "refract": (("direction", "normal", "ior"), "The direction bent through a surface; ior is the ratio of the two indices."),
+    "faceforward": (("normal", "direction"), "The normal, flipped if needed to face against direction."),
+    # Colour
+    "hsvtorgb": (("hsv",), "Hue, saturation, value (each 0 to 1) to an RGB colour."),
+    "rgbtohsv": (("rgb",), "An RGB colour to hue, saturation, value."),
+    "hsltorgb": (("hsl",), "Hue, saturation, lightness (each 0 to 1) to an RGB colour."),
+    "rgbtohsl": (("rgb",), "An RGB colour to hue, saturation, lightness."),
+    "luminance": (("rgb",), "Brightness of a linear colour."),
+    "blackbody": (("temperature", "[brightness]"), "Colour of a glowing body at this temperature in kelvin."),
     # Types
     "vector": (("x", "y", "z"), "Makes a vector. With one value, all three are set to it."),
     "float": (("value",), "Turns value into a float."),
@@ -330,7 +373,23 @@ SIGNATURES = {
     "npoints": (("input",), "Number of points on an input."),
     "nprims": (("input",), "Number of faces on an input."),
     "nvertices": (("input",), "Number of corners on an input."),
+    "nprimitives": (("input",), "Same as nprims()."),
+    "nedges": (("input",), "Number of edges on an input."),
+    "ncurves": (("input",), "Number of curves on an input."),
     "nearpoint": (("input", "position"), "Index of the point on the input closest to position."),
+    "xyzdist": (("input", "position", "[prim]"),
+                "Distance to the input's surface. A variable as prim gets the closest face."),
+    "minpos": (("input", "position"), "The closest position on the input's surface."),
+    "intersect": (("input", "origin", "direction", "[pos]"),
+                  "Face a ray hits, or -1. The ray is as long as direction. A variable as pos gets the hit."),
+    # Topology
+    "primpoint": (("input", "prim", "n"), "Point number of a face's nth corner."),
+    "primvertexcount": (("input", "prim"), "Number of corners of a face."),
+    "vertexpoint": (("input", "vertex"), "Point number of a corner."),
+    "vertexprim": (("input", "vertex"), "Face a corner belongs to."),
+    "vertexprimindex": (("input", "vertex"), "Which corner of its face a corner is: 0, 1, 2..."),
+    "neighbour": (("input", "point", "n"), "Point number of a point's nth neighbour along an edge."),
+    "neighbourcount": (("input", "point"), "Number of points connected to a point by an edge."),
     # Loops
     "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
 }
@@ -594,6 +653,101 @@ class Compiler:
     def count(self, n, domain):
         return self.node("count", "int", (), input=n, domain=domain)
 
+    def gnode(self, type, idname, outs, out=0, inputs=(), ins=(), **params):
+        """One Blender node `idname` (IR `node`): `inputs` go to the sockets named `ins`,
+        and the Val is output `out` of the sockets named `outs`. Other params: `props`
+        ((property, value) pairs), `menus` ((socket, item) pairs), `geo` ((socket, input
+        number): the geometry it reads), `implicit` (sockets that fall back to a field when
+        unlinked), `field` (a field of the geometry it is evaluated on, even with constant
+        inputs), `src` (the input it is evaluated on, inside a node that reads that input)."""
+        return self.node("node", type, tuple(inputs), out=out, idname=idname, outs=tuple(outs),
+                         ins=tuple(ins), **params)
+
+    def topology(self, fn, n, idname, output, index_sock, index, domain, extra=()):
+        """A mesh topology node read on input `n` at `index` (an element of `domain`).
+        On this geometry it is a field taking the index directly; on another input it is
+        evaluated there, at every element, and sampled at `index`. `extra`: other int
+        inputs (socket, Val), which have to be constants on another input."""
+        outs = NODE_OUTS[idname]
+        index = self.conv(index, "int")
+        socks = tuple(s for s, _ in extra)
+        vals = tuple(self.conv(v, "int") for _, v in extra)
+        if n == 0:
+            return self.gnode("int", idname, outs, outs.index(output), (index,) + vals, (index_sock,) + socks,
+                              implicit=(index_sock,), field=True)
+        if not all(v.is_const for v in vals):
+            raise self.err(f"on another input, {fn}()'s last argument has to be a constant")
+        value = self.gnode("int", idname, outs, outs.index(output), vals, socks, src=n)
+        return self.node("sample", "int", (value, index), input=n, domain=domain, dtype="int")
+
+    def proximity(self, n, pos, out):
+        """Geometry Proximity to input `n`'s faces: out 0 the closest position, 1 the distance."""
+        return self.gnode("float" if out else "vector", "GeometryNodeProximity", ("Position", "Distance"), out,
+                          (pos,), ("Sample Position",), geo=("Geometry", n), props=(("target_element", "FACES"),),
+                          implicit=("Sample Position",))
+
+    def out_arg(self, fn, arg, val):
+        """VEX's output arguments: `xyzdist(1, @P, prim)` sets the variable `prim`."""
+        if arg.kind not in ("var", "attr", "member", "index"):
+            self.line = arg.line
+            raise self.err(f"{fn}()'s last argument receives a value: give it a variable name")
+        self.assign(arg, val)
+
+    def query(self, fn, args):
+        """xyzdist() and intersect(), which can fill in a last output argument."""
+        need = 2 if fn == "xyzdist" else 3
+        if len(args) not in (need, need + 1):
+            usage = "xyzdist(1, @P) or xyzdist(1, @P, prim)" if fn == "xyzdist" else \
+                "intersect(1, origin, direction) or intersect(1, origin, direction, pos)"
+            raise self.err(f"{fn}() takes {need} or {need + 1} arguments: {usage}")
+        a = [self.eval(x) for x in args[:need]]
+        n = self.input_number(a[0], fn)
+        # The face is read through Face of Corner: both nodes look values up on the corners.
+        face = self.gnode("int", "GeometryNodeFaceOfCorner", NODE_OUTS["GeometryNodeFaceOfCorner"], 0, src=n)
+        if fn == "xyzdist":
+            pos = self.conv(a[1], "vector")
+            if len(args) > need:
+                prim = self.gnode("int", "GeometryNodeSampleNearestSurface", ("Value",), 0, (face, pos),
+                                  ("Value", "Sample Position"), props=(("data_type", "INT"),), geo=("Mesh", n),
+                                  implicit=("Sample Position",))
+                self.out_arg(fn, args[need], prim)
+            return self.proximity(n, pos, 1)
+        origin, direction = self.conv(a[1], "vector"), self.conv(a[2], "vector")
+        length = (Val("float", math.hypot(*direction.const)) if direction.is_const
+                  else self.node("vmath", "float", (direction,), op="LENGTH"))
+
+        def ray(type, out):
+            return self.gnode(type, "GeometryNodeRaycast", ("Is Hit", "Hit Position", "Hit Normal", "Hit Distance",
+                                                            "Attribute"), out,
+                              (face, origin, direction, length),
+                              ("Attribute", "Source Position", "Ray Direction", "Ray Length"),
+                              props=(("data_type", "INT"),), menus=(("Interpolation", "Nearest"),),
+                              geo=("Target Geometry", n), implicit=("Source Position",))
+        if len(args) > need:
+            self.out_arg(fn, args[need], ray("vector", 1))
+        return self.select(ray("bool", 0), ray("int", 4), Val("int", -1))
+
+    def color(self, name, v):
+        """hsvtorgb() and friends. Blender's HSL order is hue, saturation, lightness."""
+        mode, to_rgb = COLOR_MODES[name], name.endswith("torgb")
+        if v.is_const:
+            h, s, x = v.const
+            if mode == "HSV":
+                r = colorsys.hsv_to_rgb(h, s, x) if to_rgb else colorsys.rgb_to_hsv(h, s, x)
+            elif to_rgb:
+                r = colorsys.hls_to_rgb(h, x, s)
+            else:
+                h, l, s = colorsys.rgb_to_hls(h, s, x)
+                r = (h, s, l)
+            return Val("vector", tuple(float(c) for c in r))
+        if to_rgb:  # hue wraps around like an angle (Combine Color would clamp it)
+            comps = [self.member(v, i) for i in range(3)]
+            comps[0] = self.fn1("FRACT", lambda x: x - math.floor(x), comps[0])
+            return self.gnode("vector", "FunctionNodeCombineColor", ("Color",), 0, comps, ("Red", "Green", "Blue"),
+                              props=(("mode", mode),))
+        return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
+                                        ("Color",), props=(("mode", mode),)) for i in range(3)])
+
     def read_opinput(self, n, name, prefix_type):
         if n > MAX_INPUT:
             raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
@@ -657,6 +811,8 @@ class Compiler:
             return self.ramp(name, arg_nodes)
         if name in SAMPLE_FUNCS:
             return self.sample_call(name, arg_nodes)
+        if name in ("xyzdist", "intersect"):
+            return self.query(name, arg_nodes)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
 
@@ -721,6 +877,72 @@ class Compiler:
             want(2)
             n = self.input_number(a[0], name)
             return self.node("nearest", "int", (self.conv(a[1], "vector"),), input=n, domain="POINT")
+        if name == "minpos":
+            want(2)
+            return self.proximity(self.input_number(a[0], name), self.conv(a[1], "vector"), 0)
+        if name in TOPOLOGY:
+            want(2)
+            idname, output, sock, domain = TOPOLOGY[name]
+            return self.topology(name, self.input_number(a[0], name), idname, output, sock, a[1], domain)
+        if name == "primpoint":
+            want(3)
+            n = self.input_number(a[0], name)
+            corner = self.topology(name, n, "GeometryNodeCornersOfFace", "Corner Index", "Face Index", a[1], "FACE",
+                                   [("Sort Index", a[2])])
+            return self.topology(name, n, "GeometryNodeVertexOfCorner", "Vertex Index", "Corner Index", corner,
+                                 "CORNER")
+        if name == "neighbour":
+            want(3)
+            n = self.input_number(a[0], name)
+            edge = self.topology(name, n, "GeometryNodeEdgesOfVertex", "Edge Index", "Vertex Index", a[1], "POINT",
+                                 [("Sort Index", a[2])])
+            outs = NODE_OUTS["GeometryNodeInputMeshEdgeVertices"]
+            ends = [self.node("sample", "int", (self.gnode("int", "GeometryNodeInputMeshEdgeVertices", outs, i, src=n),
+                                                edge), input=n, domain="EDGE", dtype="int") for i in (0, 1)]
+            return self.select(self.compare("==", ends[0], self.conv(a[1], "int")), ends[1], ends[0])
+        if name in ("reflect", "faceforward"):
+            want(2)
+            v, w = self.conv(a[0], "vector"), self.conv(a[1], "vector")
+            if name == "reflect":
+                return self.node("vmath", "vector", (v, w), op="REFLECT")
+            return self.node("vmath", "vector", (v, w, v), op="FACEFORWARD")  # flips v when dot(v, w) > 0
+        if name == "refract":
+            want(3)
+            v, w, ior = self.conv(a[0], "vector"), self.conv(a[1], "vector"), self.conv(a[2], "float")
+            return self.node("vmath", "vector", (v, w, ior), op="REFRACT")
+        if name in ("length2", "distance2"):
+            want(1 if name == "length2" else 2)
+            v = self.conv(a[0], "vector")
+            if name == "distance2":
+                v = self.arith("-", v, self.conv(a[1], "vector"))
+            if v.is_const:
+                return Val("float", sum(c * c for c in v.const))
+            return self.node("vmath", "float", (v, v), op="DOT_PRODUCT")
+        if name == "avg":
+            if not a:
+                raise BexError("avg() needs at least one value", line)
+            if len(a) == 1 and a[0].type == "vector":
+                a = [self.member(a[0], i) for i in range(3)]
+            total = a[0]
+            for x in a[1:]:
+                total = self.arith("+", total, x)
+            return self.arith("/", total, Val("float", float(len(a))))
+        if name == "invlerp":
+            want(3)
+            return self.map_range([a[0], a[1], a[2], Val("float", 0.0), Val("float", 1.0)], "LINEAR", clamp=False)
+        if name in COLOR_MODES:
+            want(1)
+            return self.color(name, self.conv(a[0], "vector"))
+        if name == "luminance":
+            want(1)
+            v = self.conv(a[0], "vector")
+            if v.is_const:
+                return Val("float", sum(c * w for c, w in zip(v.const, LUMINANCE)))
+            return self.node("vmath", "float", (v, Val("vector", LUMINANCE)), op="DOT_PRODUCT")
+        if name == "blackbody":
+            want(1, 2)
+            c = self.gnode("vector", "ShaderNodeBlackbody", ("Color",), 0, (self.conv(a[0], "float"),), ("Temperature",))
+            return self.arith("*", c, a[1]) if len(a) == 2 else c
         if name in BBOX:
             return self.bbox(name, a, want)
         if name in ("length", "normalize"):
@@ -1620,6 +1842,10 @@ def _is_field(val):
     """Whether `val` can differ per element (a Repeat Zone count has to be one value)."""
     def visit(n, out):
         k = n.kind
+        if "src" in n.params and k == "node":  # evaluated on another input, inside a node reading it
+            return False
+        if k == "node" and n.params.get("field"):
+            return True
         if k == "attr" and "src" not in n.params or k == "input" and n.params["name"] != "time":
             return True
         if k == "repeat_in":
@@ -1664,7 +1890,8 @@ def _changes(name):
 
 # What each built-in input node reads from the geometry.
 _INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"},
-                "spline_parameter": {"P", "position"}}
+                "spline_parameter": {"P", "position"}, "tangent": {"P", "position"},
+                "face_area": {"P", "position"}, "edge_angle": {"P", "position"}}
 
 
 def _reads(val):

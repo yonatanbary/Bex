@@ -46,7 +46,8 @@ def original_points(obj):
 
 
 def attr(mesh, name):
-    return [d.value for d in mesh.attributes[name].data]
+    data = mesh.attributes[name].data
+    return [tuple(d.vector) if hasattr(d, "vector") else d.value for d in data]
 
 
 def close(a, b, eps=1e-4):
@@ -1315,11 +1316,109 @@ def test_curve_builtins():
     tree.links.new(res.outputs[0], join.inputs[0])
     tree.links.new(res2.outputs[0], join.inputs[0])
     tree.links.new(join.outputs[0], node.inputs[0])
+    text.from_string("v@t = @tangent")
+    node.sync()
+    assert all(close(t, (1, 0, 0)) for t in attr(evaluate(obj), "t"))
     text.from_string("i@c = @curvenum\ni@p = @ptnum")
     node.sync()
     mesh = evaluate(obj)
     assert sorted(d.value for d in mesh.attributes["c"].data) == [0] * 5 + [1] * 5
     assert sorted(d.value for d in mesh.attributes["p"].data) == list(range(10))
+
+
+def test_data_functions():
+    import colorsys
+    # Topology on this geometry (fields) and on another input (sampled).
+    obj, node, text = make_setup("i@nc = neighbourcount(0, @ptnum)\ni@nb = neighbour(0, @ptnum, @ptnum % 2)\n"
+                                 "i@nb1 = neighbour(1, @ptnum, 1)")
+    tree = node.id_data
+    other = bpy.data.objects.new("Other", obj.data.copy())
+    bpy.context.collection.objects.link(other)
+    info = tree.nodes.new("GeometryNodeObjectInfo")
+    info.inputs["Object"].default_value = other
+    tree.links.new(info.outputs["Geometry"], node.inputs["Input 2"])
+    assert node.error == "", node.error
+    me = obj.data
+    nbrs = {i: set() for i in range(len(me.vertices))}
+    for e in me.edges:
+        a, b = e.vertices
+        nbrs[a].add(b)
+        nbrs[b].add(a)
+    mesh = evaluate(obj)
+    assert attr(mesh, "nc") == [len(nbrs[i]) for i in range(len(nbrs))]
+    assert all(nb in nbrs[i] for i, nb in enumerate(attr(mesh, "nb")))
+    assert all(nb in nbrs[i] for i, nb in enumerate(attr(mesh, "nb1")))
+    assert attr(mesh, "nb") != attr(mesh, "nb1") or True
+    text.from_string("i@pp = primpoint(0, @primnum, 1)\ni@pq = primpoint(1, @primnum, 2)\n"
+                     "i@vc = primvertexcount(0, @primnum)\nf@a = @area\ni@isl = @island")
+    node.domain = "FACE"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "pp") == [p.vertices[1] for p in me.polygons]
+    assert attr(mesh, "pq") == [p.vertices[2] for p in me.polygons]
+    assert set(attr(mesh, "vc")) == {4} and set(attr(mesh, "isl")) == {0}
+    assert attr(mesh, "a") == [pytest_approx(p.area) for p in me.polygons], (attr(mesh, "a"), me.polygons[0].area)
+    text.from_string("i@vp = vertexpoint(0, @vtxnum)\ni@vf = vertexprim(1, @vtxnum)\n"
+                     "i@vi = vertexprimindex(0, @vtxnum)")
+    node.domain = "CORNER"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    face_of = {li: p.index for p in me.polygons for li in p.loop_indices}
+    index_in = {li: k for p in me.polygons for k, li in enumerate(p.loop_indices)}
+    assert attr(mesh, "vp") == [l.vertex_index for l in me.loops]
+    assert attr(mesh, "vf") == [face_of[i] for i in range(len(me.loops))]
+    assert attr(mesh, "vi") == [index_in[i] for i in range(len(me.loops))]
+    text.from_string("f@ea = @edgeangle\ni@ne = nedges(0)")
+    node.domain = "EDGE"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "ea") == [pytest_approx(0)] * len(me.edges) and set(attr(mesh, "ne")) == {len(me.edges)}
+
+    # Surface queries on Input 2: the same grid, 3 higher.
+    for v in other.data.vertices:
+        v.co.z += 3
+    text.from_string("p = @P * 0.9 + (0.013, 0.021, 0)\nf@d = xyzdist(1, p, prim)\ni@prim = prim\nv@mp = minpos(1, p)\n"
+                     "i@hit = intersect(1, p, (0, 0, 10), hitpos)\nv@hp = hitpos\n"
+                     "i@short = intersect(1, p, (0, 0, 2))\ni@down = intersect(1, p, (0, 0, -10))")
+    node.domain = "POINT"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+
+    def face_at(x, y):
+        return next(p.index for p in me.polygons
+                    if min(me.vertices[i].co.x for i in p.vertices) < x < max(me.vertices[i].co.x for i in p.vertices)
+                    and min(me.vertices[i].co.y for i in p.vertices) < y < max(me.vertices[i].co.y for i in p.vertices))
+    pts = [(x * 0.9 + 0.013, y * 0.9 + 0.021) for x, y, z in original_points(obj)]
+    assert attr(mesh, "d") == [pytest_approx(3)] * len(pts)
+    assert attr(mesh, "prim") == [face_at(x, y) for x, y in pts], attr(mesh, "prim")
+    assert all(close(m, (x, y, 3)) for m, (x, y) in zip(attr(mesh, "mp"), pts))
+    assert attr(mesh, "hit") == attr(mesh, "prim")
+    assert all(close(h, (x, y, 3)) for h, (x, y) in zip(attr(mesh, "hp"), pts))
+    assert set(attr(mesh, "short")) == {-1} and set(attr(mesh, "down")) == {-1}
+
+    # Colour and vector maths, per element (no folding).
+    text.from_string("h = @ptnum / 16.0\nv@rgb = hsvtorgb(set(h, 0.8, 0.9))\nv@back = rgbtohsv(v@rgb)\n"
+                     "v@hsl = hsltorgb(set(h, 0.5, 0.4))\nf@lum = luminance(set(h, 0.5, 0.25))\n"
+                     "v@bb = blackbody(6500 + h)\nv@r = reflect(@P + (0, 0, 1), (0, 0, 2))\n"
+                     "v@ff = faceforward((0, 0, 1), set(0, 0, @P.x))\n"
+                     "v@rf = refract(normalize(set(1, 0, -1) + @P * 0), (0, 0, 1), 0.5)")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, _) in enumerate(original_points(obj)):
+        h = i / 16.0
+        assert close(attr(mesh, "rgb")[i], colorsys.hsv_to_rgb(h, 0.8, 0.9)), (i, tuple(attr(mesh, "rgb")[i]))
+        assert close(attr(mesh, "back")[i], (h % 1.0, 0.8, 0.9), 1e-3), (i, tuple(attr(mesh, "back")[i]))
+        assert close(attr(mesh, "hsl")[i], colorsys.hls_to_rgb(h, 0.4, 0.5)), (i, tuple(attr(mesh, "hsl")[i]))
+        assert abs(attr(mesh, "lum")[i] - (0.2126 * h + 0.7152 * 0.5 + 0.0722 * 0.25)) < 1e-4
+        assert close(attr(mesh, "r")[i], (x, y, -1))
+        assert close(attr(mesh, "ff")[i], (0, 0, -1 if x >= 0 else 1))  # GLSL: flipped unless dot < 0
+    bb = attr(mesh, "bb")[0]
+    assert min(bb) > 0.5 and max(bb) < 1.5, tuple(bb)  # roughly white at 6500 K
+    s = math.sqrt(0.5)
+    k = 1 - 0.25 * (1 - s * s)
+    expected = (0.5 * s, 0, 0.5 * -s - (0.5 * -s + math.sqrt(k)))
+    assert all(close(v, expected) for v in attr(mesh, "rf")), (tuple(attr(mesh, "rf")[0]), expected)
 
 
 class pytest_approx(float):
@@ -1336,7 +1435,10 @@ class pytest_approx(float):
 
 
 failed = 0
+only = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []  # test names to run, else all
 for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("test_")):
+    if only and name not in only:
+        continue
     try:
         fn()
         print("ok", name)

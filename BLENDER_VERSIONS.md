@@ -131,6 +131,9 @@ Units are node-editor units at zoom 1, before UI scale.
 | The active tool's keymap ("Node Tool: Tweak / Select Box / Select Lasso / Select Circle", each also "(fallback)") is checked before "Node Editor", and its Shift-click `node.select` (toggle) doesn't pass through | the ramp's click item is added to those tool keymaps too (add-on items run before Blender's in the same keymap) | `node.register` |
 | A layout separator's height can't be read | taken from Blender's source: `int(int(0.3 * widget unit) * factor)`, plus the row gap (checked on screen, 5.2) | `ramp_widget._separator_height` |
 | Remove Named Attribute's pattern mode is a menu socket ("Pattern Mode": "Exact" / "Wildcard"), not a node property | set through `inputs["Pattern Mode"].default_value` | `builder.build` (chunked loops' hidden attributes) |
+| Raycast's Interpolation is a menu socket ("Interpolated" / "Nearest"), not a property | set through `menus` on the IR `node` | `compiler.query` |
+| Raycast and Sample Nearest Surface can't output the face they found | their Attribute / Value reads Face of Corner, which they evaluate on the target's corners (checked in 5.2 by `test_data_functions`) | `compiler.query` |
+| Combine Color (HSV / HSL) clamps the hue to 0–1 | a Fraction node wraps it first, like `colorsys` (which constant folding uses) | `compiler.color` |
 | The Mac key labelled "delete" sends `BACK_SPACE`, not `DEL` | ramp point delete is bound to both | `node.register` |
 | The Float Curve widget updates only on mouse release | moot: our ramp widget writes the curve on every move | `ramp_widget.write_curve` |
 

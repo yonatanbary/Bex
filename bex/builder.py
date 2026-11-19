@@ -17,6 +17,10 @@ INPUT_NODES = {
     "curve_of_point": "GeometryNodeCurveOfPoint",
     "face_of_corner": "GeometryNodeFaceOfCorner",
     "vertex_of_corner": "GeometryNodeVertexOfCorner",
+    "tangent": "GeometryNodeInputTangent",
+    "face_area": "GeometryNodeInputMeshFaceArea",
+    "mesh_island": "GeometryNodeInputMeshIsland",
+    "edge_angle": "GeometryNodeInputMeshEdgeAngle",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
 RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node evaluating that ramp
@@ -168,8 +172,18 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         """Like connect(), for sockets that ignore their own value when unlinked
         (they fall back to an implicit field such as the position)."""
         if val.is_const:
-            n = new("FunctionNodeInputVector")
-            n.vector = val.const
+            if val.type == "vector":
+                n = new("FunctionNodeInputVector")
+                n.vector = val.const
+            elif val.type == "int":
+                n = new("FunctionNodeInputInt")
+                n.integer = val.const
+            elif val.type == "bool":
+                n = new("FunctionNodeInputBool")
+                n.boolean = val.const
+            else:
+                n = new("ShaderNodeValue")
+                n.outputs[0].default_value = val.const
             links.new(n.outputs[0], sock)
         else:
             connect(val, sock)
@@ -202,9 +216,10 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         if kind == "vmath":
             n = new("ShaderNodeVectorMath")
             n.operation = p["op"]
-            if p["op"] == "SCALE":
-                connect(ins[0], n.inputs[0])
-                connect(ins[1], n.inputs["Scale"])
+            if p["op"] in ("SCALE", "REFRACT"):  # the last value goes into Scale (REFRACT: the IOR)
+                for i, v in enumerate(ins[:-1]):
+                    connect(v, n.inputs[i])
+                connect(ins[-1], n.inputs["Scale"])
             else:
                 for i, v in enumerate(ins):
                     connect(v, n.inputs[i])
@@ -260,6 +275,18 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             for v, sock in zip(ins, [s for s in n.inputs if s.enabled]):
                 connect(v, sock)
             return _enabled(n.outputs, "Vector" if vec else "Result")
+        if kind == "node":  # one Blender node, described by its params (see Compiler.gnode)
+            n = new(p["idname"])
+            for prop, value in p.get("props", ()):
+                setattr(n, prop, value)
+            for name, value in p.get("menus", ()):
+                n.inputs[name].default_value = value
+            if "geo" in p:
+                links.new(geometry(p["geo"][1]), n.inputs[p["geo"][0]])
+            implicit = p.get("implicit", ())
+            for name, v in zip(p["ins"], ins):
+                (connect_field if name in implicit else connect)(v, _enabled(n.inputs, name)[0])
+            return [_enabled(n.outputs, name)[0] for name in p["outs"]]
         if kind == "group":  # a library node group (library.py); geometry comes from the input
             d = library.GROUPS[p["name"]]
             n = new("GeometryNodeGroup")
@@ -600,6 +627,14 @@ BUTTON_ROWS = {
     "NodeClosureOutput": 0,
     "NodeEvaluateClosure": 0,
     "GeometryNodeRepeatOutput": 0,
+    "FunctionNodeInputInt": 1,
+    "FunctionNodeInputBool": 1,
+    "ShaderNodeValue": 1,
+    "GeometryNodeProximity": 1,
+    "GeometryNodeRaycast": 2,  # data type, and the Interpolation menu
+    "GeometryNodeSampleNearestSurface": 1,
+    "FunctionNodeCombineColor": 1,
+    "FunctionNodeSeparateColor": 1,
 }
 
 
