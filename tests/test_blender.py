@@ -957,6 +957,246 @@ def test_layout_has_no_overlaps():
         assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
 
 
+def test_for_repeat_zone():
+    obj, node, _ = make_setup("""
+    n = chi("steps", 4)
+    x = @P.x
+    c = 0
+    for i in range(n):
+        x = x * 2 + i
+        @P.z += 0.25
+        if @P.x > 0:
+            c += 1
+    @a = x
+    i@c = c
+    """)
+    assert node.error == "", node.error
+    tree = node.node_tree
+    assert [n.bl_idname for n in tree.nodes].count("GeometryNodeRepeatInput") == 1
+    assert sum(n.bl_idname == "ShaderNodeMath" and n.operation == "MULTIPLY_ADD" for n in tree.nodes) <= 1
+    for steps, a_of, z in ((4, lambda x: 16 * x + 11, 1.0), (2, lambda x: 4 * x + 1, 0.5), (0, lambda x: x, 0.0)):
+        node.inputs["steps"].default_value = steps
+        mesh = evaluate(obj)
+        pts = original_points(obj)
+        assert close(attr(mesh, "a"), [a_of(x) for x, _, _ in pts]), (steps, attr(mesh, "a"))
+        assert close([v.co.z for v in mesh.vertices], [z] * len(pts)), steps
+        assert attr(mesh, "c") == [steps if x > 0 else 0 for x, _, _ in pts], (steps, attr(mesh, "c"))
+    # The zone's input sits left of its output, and links flow left to right.
+    zone_in = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeRepeatInput")
+    assert zone_in.location_absolute.x < zone_in.paired_output.location_absolute.x
+    for link in tree.links:
+        assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
+    # Nested loops are nested zones.
+    obj, node, _ = make_setup("""
+    n = chi("n", 3)
+    s = 0
+    for i in range(n):
+        for j in range(n):
+            s += i * j + @ptnum
+    i@s = s
+    """)
+    assert node.error == "", node.error
+    assert [n.bl_idname for n in node.node_tree.nodes].count("GeometryNodeRepeatInput") == 2
+    mesh = evaluate(obj)
+    assert attr(mesh, "s") == [9 + 9 * p for p in range(len(mesh.vertices))], attr(mesh, "s")
+
+
+def test_loops_per_element():
+    # range(@ptnum): each point loops its own number of times (Houdini gives a tilted plane).
+    obj, node, _ = make_setup("""
+    for i in range(@ptnum):
+        @P.z += 0.1
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert close([v.co.z for v in mesh.vertices], [0.1 * k for k in range(len(mesh.vertices))])
+    # Only points in the Group count towards the longest loop, and only they move.
+    node.group = "@ptnum < 3"
+    mesh = evaluate(obj)
+    assert close([v.co.z for v in mesh.vertices], [0.1 * k if k < 3 else 0.0 for k in range(len(mesh.vertices))])
+    stat = next(n for n in node.node_tree.nodes if n.bl_idname == "GeometryNodeAttributeStatistic")
+    assert stat.inputs["Selection"].is_linked
+
+    # break: count up until x * i passes 1, per point.
+    obj, node, _ = make_setup("""
+    n = 0
+    for i in range(chi("cap", 50)):
+        if (@P.x + 1) * i > 3:
+            break
+        if i % 2:
+            continue
+        n += 1
+    i@n = n
+    i@last = i
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, _, _), n, last in zip(original_points(obj), attr(mesh, "n"), attr(mesh, "last")):
+        want = 0
+        for i in range(50):  # the same loop in Python
+            if (x + 1) * i > 3:
+                break
+            if i % 2:
+                continue
+            want += 1
+        assert (n, last) == (want, i), (x, n, last, want, i)
+
+    # while with a per-point condition: halve until below 1.
+    obj, node, _ = make_setup("""
+    x = (@P.x + 1.5) * 10
+    steps = 0
+    while x > 1:
+        x *= 0.5
+        steps += 1
+    i@steps = steps
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (px, _, _), steps in zip(original_points(obj), attr(mesh, "steps")):
+        x, want = (px + 1.5) * 10, 0
+        while x > 1:
+            x, want = x * 0.5, want + 1
+        assert steps == want, (px, steps, want)
+
+    # Chunked: values that read each other (Fibonacci) across many chunk boundaries,
+    # different lengths per point, and no hidden attributes left behind.
+    obj, node, _ = make_setup("""
+    a = 0
+    b = 1
+    n = 0
+    limit = (@ptnum + 1) * 40
+    while n < limit:
+        t = (a + b) % 1000
+        a = b
+        b = t
+        n += 1
+    i@a = a
+    i@n = n
+    """)
+    assert node.error == "", node.error
+    kinds = [n.bl_idname for n in node.node_tree.nodes]
+    assert kinds.count("GeometryNodeRepeatInput") == 2  # chunks, and the loop inside a chunk
+    mesh = evaluate(obj)
+    for k, (a, n) in enumerate(zip(attr(mesh, "a"), attr(mesh, "n"))):
+        x, y = 0, 1
+        for _ in range((k + 1) * 40):
+            x, y = y, (x + y) % 1000
+        assert (a, n) == (x, (k + 1) * 40), (k, a, n, x)
+    assert not [name for name in mesh.attributes.keys() if name.startswith(".bex")], mesh.attributes.keys()
+
+    # v[i] with i from a zone.
+    obj, node, _ = make_setup("""
+    v = @P
+    for i in range(chi("n", 3)):
+        v[i] = v[i] + i + 1
+    @P = v
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, y, z), v in zip(original_points(obj), mesh.vertices):
+        assert close(v.co, (x + 1, y + 2, z + 3)), tuple(v.co)
+
+
+def test_own_functions():
+    obj, node, _ = make_setup("""
+    def sgn(x):
+        if x < 0:
+            return -1.0
+        return 1.0
+
+    def halvings(x, limit=1.0):
+        n = 0
+        while True:
+            if x <= limit:
+                return n
+            x *= 0.5
+            n += 1
+
+    def fib(n):
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+    def bump(h):
+        @w += h
+
+    @s = sgn(@P.x)
+    i@h = halvings((@P.y + 1.5) * 20)
+    i@f = fib(12)
+    for i in range(chi("n", 3)):
+        bump(0.5)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, y, _), s, h, f, w in zip(original_points(obj), attr(mesh, "s"), attr(mesh, "h"), attr(mesh, "f"),
+                                    attr(mesh, "w")):
+        v, want = (y + 1.5) * 20, 0
+        while v > 1.0:
+            v, want = v * 0.5, want + 1
+        assert (s, h, f, w) == ((-1.0 if x < 0 else 1.0), want, 144, 1.5), (x, y, s, h, f, w)
+
+
+def test_shared_functions_are_closures():
+    obj, node, _ = make_setup("""
+    def wave(x, f):
+        return sin(x * f) * 0.5 + @P.x
+    @a = wave(@P.x, 3)
+    @b = wave(@P.y, 5)
+    """)
+    assert node.error == "", node.error
+    kinds = [n.bl_idname for n in node.node_tree.nodes]
+    assert kinds.count("NodeClosureOutput") == 1 and kinds.count("NodeEvaluateClosure") == 2
+    mesh = evaluate(obj)
+    for (x, y, _), a, b in zip(original_points(obj), attr(mesh, "a"), attr(mesh, "b")):
+        assert close((a, b), (math.sin(x * 3) * 0.5 + x, math.sin(y * 5) * 0.5 + x)), (x, y, a, b)
+    tree = node.node_tree
+    zone_in = next(n for n in tree.nodes if n.bl_idname == "NodeClosureInput")
+    assert zone_in.location_absolute.x < zone_in.paired_output.location_absolute.x
+
+
+def test_review_regressions():
+    obj, node, _ = make_setup("""
+    k = @P.x
+    def f(a):
+        return a * k
+    f@x = f(@P.y)
+    k = 5.0
+    f@y = f(@P.y + 1)
+
+    def g(lim):
+        x = 0.0
+        for i in range(12):
+            for j in range(12):
+                x += 1
+                if x > lim:
+                    return x
+        return -x
+    f@r = g(@ptnum * 3.0)
+
+    n = 0
+    while n < @ptnum % 5 + 9:
+        n += 1
+    c = 0.0
+    for i in range(n):
+        c += 1
+    f@c = c
+    """)
+    assert node.error == "", node.error
+    assert all(link.is_valid for link in node.node_tree.links)
+    mesh = evaluate(obj)
+    for k, ((px, py, _), x, y, r, c) in enumerate(zip(original_points(obj), attr(mesh, "x"), attr(mesh, "y"),
+                                                       attr(mesh, "r"), attr(mesh, "c"))):
+        lim, want_r = k * 3.0, None
+        v = 0.0
+        for _ in range(144):
+            v += 1
+            if v > lim:
+                want_r = v
+                break
+        want_r = -v if want_r is None else want_r
+        assert close((x, y, r, c), (py * px, (py + 1) * 5.0, want_r, k % 5 + 9)), (k, x, y, r, c)
+
+
 def test_write_plan():
     def kinds(node):
         return [n.bl_idname for n in node.node_tree.nodes]

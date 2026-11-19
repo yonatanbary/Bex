@@ -2,12 +2,13 @@
 
 The script is executed *symbolically*: every variable and attribute holds a
 `Val`, which is either a compile-time constant or an output of an `IRNode`.
-Constants are folded, `if` becomes a per-element Switch, and `for` / `while`
-loops are unrolled (their range or condition has to be known at compile time).
+Constants are folded and `if` becomes a per-element Switch. Loops are unrolled
+when short or constant, else they become a Repeat Zone (see the loops section).
 Variables work like Python's: assigning creates them, and they are visible until
 the end of the script.
 """
 
+import itertools
 import math
 import re
 from dataclasses import dataclass, field
@@ -15,7 +16,14 @@ from dataclasses import dataclass, field
 from .lexer import _PREFIX_TYPES, BexError
 from .parser import N, parse, parse_group
 
-MAX_LOOP_ITERATIONS = 1024
+MAX_LOOP_ITERATIONS = 1024  # longest loop run at compile time
+UNROLL_MAX = 8  # loops this short are unrolled even when they make nodes
+MAX_ZONE_ITERATIONS = 100_000  # a Repeat Zone never runs more often than this
+WHILE_CAP = 1000  # iterations of a while loop whose end differs per element (inside another loop)
+TEMP_PREFIX = ".bex"  # hidden attributes a chunked loop keeps its values in; removed at the end
+CHUNK_FIRST, CHUNK_GROWTH = 32, 1.5
+MAX_CALL_DEPTH = 50  # nested calls of your own functions (recursion has to end while compiling)
+MAX_CALLS = 10_000  # calls of your own functions in one script  # chunk k of a loop that can end early runs floor(32 * 1.5^k) times
 RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3}
 
 
@@ -61,6 +69,7 @@ class Program:
     inputs: list = field(default_factory=list)  # extra geometry inputs the script reads (1-3), sorted
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
+    preludes: list = field(default_factory=list)  # chunk_end IRNodes: chunked loops, run on the geometry first
 
 
 @dataclass
@@ -340,6 +349,21 @@ class Compiler:
         self.cse = {}  # (kind, params, inputs) -> IRNode
         self.vars = {}  # variable name -> Val (Python-style: one flat namespace)
         self.half_set = {}  # name -> line of an `if` that set it in only one branch
+        self.loop_only = {}  # name -> line of a Repeat Zone loop that first set it inside
+        self.loops = []  # (break flag, continue flag) of each enclosing loop
+        self.loop_count = 0
+        self.group_sel = None  # the Group's bool Val: a per-element loop count only counts those
+        self.zone_depth = 0  # Repeat Zones the statement being run sits in
+        self.preludes = []  # chunk_end IRNodes, in script order
+        self.funcs = {}  # name -> `def` statement of the script's own functions
+        self.call_counts = {}  # (name, argument types) -> calls with a non-constant argument
+        self.closure_keys = frozenset()  # those built once as a Closure (the second compile)
+        self.closures = {}  # (name, argument types) -> closure_out IRNode, or None (inlined after all)
+        self.frames = []  # one dict per running call of an own function (see call_user)
+        self.calls = 0
+        self.path = []  # conditions of the `if` branches being run (a loop starts stopped outside them)
+        self.reading = []  # per closure being built: what its body read from outside (see _closure)
+        self.warnings = []
         self.attrs = {}  # attribute name -> current Val (only attributes that were written)
         self.attr_types = {}  # attribute name -> type, fixed on first use
         self.written = []  # attribute names in first-write order
@@ -441,6 +465,8 @@ class Compiler:
     def logic(self, op, a, b):
         a, b = self.conv(a, "bool"), self.conv(b, "bool")
         is_and = op == "and"
+        if _negates(a, b) or _negates(b, a):  # x or not x, x and not x
+            return Val("bool", not is_and)
         for x, y in ((a, b), (b, a)):
             if x.is_const:  # true && y -> y, false && y -> false, ...
                 return y if x.const == is_and else Val("bool", not is_and)
@@ -453,6 +479,10 @@ class Compiler:
             return self.fold("float", lambda x: -x, a) or self.node("math", "float", (a, Val("float", -1.0)), op="MULTIPLY")
         a = self.conv(a, "int")
         return self.fold("int", lambda x: -x, a) or self.node("imath", "int", (a,), op="NEGATE")
+
+    def not_(self, a):
+        a = self.conv(a, "bool")
+        return Val("bool", not a.const) if a.is_const else self.node("bmath", "bool", (a,), op="NOT")
 
     def select(self, cond, a, b):
         """cond ? a : b"""
@@ -615,6 +645,12 @@ class Compiler:
         return self.node("ramp", RAMPS[name], (pos,), name=label)
 
     def call(self, name, arg_nodes):
+        if name in self.funcs:
+            return self.call_user(name, arg_nodes)
+        kw = next((a for a in arg_nodes if a.kind == "kwarg"), None)
+        if kw is not None:
+            self.line = kw.line
+            raise self.err(f"{name}() takes no keyword arguments (only your own functions do)")
         if name in CHANNELS:
             return self.channel(name, arg_nodes)
         if name in RAMPS:
@@ -754,6 +790,8 @@ class Compiler:
 
     def read_attr(self, name, type):
         val = self.attrs.get(name)
+        for deps in self.reading:  # a closure being built depends on this attribute's value
+            deps.append(("attr", name, val))
         if val is not None:
             return val
         if (name, type) not in self.reads:
@@ -764,24 +802,54 @@ class Compiler:
         val = self.vars.get(name)
         if val is not None:
             return val
+        if self.frames and name in self.frames[0]["globals"]:  # inside a function: the script's variables
+            val = self.frames[0]["globals"][name]
+            for deps in self.reading:
+                deps.append(("var", name, val))
+            return val
         if name in CONSTANTS:
             return Val("float", CONSTANTS[name])
         if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
             return self.read_attr(name, self.attr_type(name, None))
+        if name in self.loop_only:
+            raise self.err(f"'{name}' is only set inside the loop on line {self.loop_only[name]}; "
+                           f"give it a value before the loop")
         if name in self.half_set:
             raise self.err(f"'{name}' is only set in one branch of the if on line {self.half_set[name]}; "
                            f"give it a value before the if")
         raise self.err(f"unknown variable '{name}' (give it a value first, e.g. {name} = 0)")
 
+    def component_index(self, e):
+        """`v[i]`: the component number (0-2) as an int Val; negative counts from the end."""
+        i = self.conv(self.eval(e.index), "int")
+        self.line = e.line
+        if i.is_const:
+            if not -3 <= i.const <= 2:
+                raise self.err("component index must be 0, 1 or 2 (or -1, -2, -3)")
+            return Val("int", i.const % 3)
+        return self.arith("%", i, Val("int", 3))
+
     def assign(self, target, val):
+        if target.kind == "index":
+            cur, i = self.eval(target.obj), self.component_index(target)
+            if i.is_const:
+                return self.assign(N("member", target.line, obj=target.obj, comp=i.const), val)
+            val = self.conv(val, "float")
+            comps = [self.select(self.compare("==", i, Val("int", c)), val, self.member(cur, c)) for c in range(3)]
+            return self.assign(target.obj, self.combine(comps))
         if target.kind == "member":
             cur = self.eval(target.obj)
             comps = [self.member(cur, i) for i in range(3)]
             comps[target.comp] = self.conv(val, "float")
             return self.assign(target.obj, self.combine(comps))
+        live = self._live()
         if target.kind == "var":
+            old = self.vars.get(target.name)
+            if old is not None and not (live.is_const and live.const):
+                val = self.select(live, val, old)  # after a break / continue: keep the old value
             self.vars[target.name] = val
             self.half_set.pop(target.name, None)
+            self.loop_only.pop(target.name, None)
             return
         name = target.name
         if OPINPUT_RE.match(name):
@@ -791,9 +859,130 @@ class Compiler:
             raise self.err(f"@{name} is read-only")
         if name == "P" and self.domain != "POINT":
             raise self.err("@P can only be written when the wrangle runs over Points")
-        self.attrs[name] = self.conv(val, type)
+        val = self.conv(val, type)
+        if self.frames:  # inside a call: only where the call itself runs
+            live = self.logic("and", live, self.frames[-1]["live"])
+        if not (live.is_const and live.const):
+            val = self.select(live, val, self.attrs.get(name) or self.read_original(name, type))
+        self.attrs[name] = val
         if name not in self.written:
             self.written.append(name)
+
+    # -- the script's own functions ---------------------------------------------
+    # A call runs the function's body right there (inlined), in its own variables,
+    # reading the script's variables as they are at the call. `return` sets the
+    # hidden `$ret` / `$returned` variables like `break` sets its flag, so an early
+    # return under a per-element `if` works. Recursion works when it ends while
+    # compiling (its condition is known then).
+
+    def call_user(self, name, arg_nodes, want_value=True):
+        d = self.funcs[name]
+        line = self.line
+        values = self._bind_args(d, name, arg_nodes)
+        self.line = line
+        self.calls += 1
+        if self.calls > MAX_CALLS:
+            raise self.err(f"more than {MAX_CALLS} function calls (a recursion that grows too fast?)")
+        if len(self.frames) >= MAX_CALL_DEPTH:
+            raise self.err(f"{name}() calls itself too deeply: recursion has to end while compiling, so its "
+                           f"condition can't depend on attributes or inputs (use a while loop instead)")
+        args = [values[p] for p, _ in d.params]
+        # one closure per argument types, and per which arguments differ per element
+        key = (name, tuple(v.type for v in args), tuple(_is_field(v) for v in args))
+        recursive = any(f["name"] == name for f in self.frames)
+        if want_value and not recursive and not all(v.is_const for v in args):
+            self.call_counts[key] = self.call_counts.get(key, 0) + 1
+            if key in self.closure_keys:
+                out = self._find_closure(d, key)
+                if out is not None:
+                    self.line = line
+                    return self.node("closure_call", out.params["ret"], tuple(args), closure=out)
+        live = self._live() if not self.frames else self.logic("and", self._live(), self.frames[-1]["live"])
+        result, returned, has_value = self._run_body(d, values, live)
+        self.line = line
+        if not want_value:
+            return None
+        return self._result(d, name, result, returned, has_value)
+
+    def _bind_args(self, d, name, arg_nodes):
+        names = [p for p, _ in d.params]
+        pos = [a for a in arg_nodes if a.kind != "kwarg"]
+        if len(pos) > len(names):
+            raise self.err(f"{name}() takes {len(names)} argument{'s' * (len(names) != 1)}, got {len(pos)}")
+        values = {p: self.eval(a) for p, a in zip(names, pos)}
+        for a in arg_nodes:
+            if a.kind == "kwarg":
+                self.line = a.line
+                if a.name not in names:
+                    raise self.err(f"{name}() has no parameter '{a.name}'")
+                if a.name in values:
+                    raise self.err(f"{name}() got two values for '{a.name}'")
+                values[a.name] = self.eval(a.value)
+        for p, default in d.params:
+            if p not in values:
+                if default is None:
+                    raise self.err(f"{name}() is missing the argument '{p}'")
+                caller = self.vars
+                if self.frames:  # a default sees the script's variables, not the caller's
+                    self.vars = self.frames[0]["globals"]
+                values[p] = self.eval(default)
+                self.vars = caller
+        return values
+
+    def _run_body(self, d, values, live):
+        """Run a function body in its own variables: (return value, $returned, returns a value)."""
+        caller = (self.vars, self.loops, self.half_set, self.loop_only)
+        self.frames.append({"name": d.name, "live": live, "value": False,
+                            "globals": self.frames[0]["globals"] if self.frames else self.vars})
+        self.vars = dict(values, **{"$returned": Val("bool", False), "$ret": Val("bool", False)})
+        self.loops, self.half_set, self.loop_only = [], {}, {}
+        self.exec(d.body)
+        result, returned = self.vars["$ret"], self.vars["$returned"]
+        frame = self.frames.pop()
+        self.vars, self.loops, self.half_set, self.loop_only = caller
+        return result, returned, frame["value"]
+
+    def _result(self, d, name, result, returned, has_value):
+        if not has_value:
+            raise self.err(f"{name}() doesn't return a value")
+        if not (returned.is_const and returned.const) and not _always_returns(d.body):
+            raise self.err(f"{name}() doesn't return a value on every path (add a return at the end)")
+        return result
+
+    def _find_closure(self, d, key):
+        """A closure for this call: one built before whose body read the same
+        script variables and attribute values as they are now, else a new one.
+        None: the function has to be inlined."""
+        for deps, out in self.closures.get(key, []):
+            if all((self.frames[0]["globals"] if self.frames else self.vars).get(n) is v if kind == "var"
+                   else self.attrs.get(n) is v for kind, n, v in deps):
+                return out
+        deps, out = self._closure(d, key)
+        if deps is None:  # can't be a closure: inline every call of it
+            return None
+        self.closures.setdefault(key, []).append((deps, out))
+        return out
+
+    def _closure(self, d, key):
+        """Build the function body once, in a Closure zone, for these argument
+        types: (what it read from outside, closure_out IRNode), or (None, None)
+        when it has to be inlined (it writes attributes or runs a chunked loop,
+        which need the geometry)."""
+        name, types, fields = key
+        line = self.line
+        saved = self._snapshot()
+        zone_in = IRNode("closure_in", {"items": types, "fields": fields}, (), d.line)
+        values = {p: Val(t, node=zone_in, out=k) for k, ((p, _), t) in enumerate(zip(d.params, types))}
+        self.reading.append([])
+        result, returned, has_value = self._run_body(d, values, Val("bool", True))
+        deps = self.reading.pop()
+        self.line = line
+        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]):
+            self._restore(saved)
+            return None, None
+        result = self._result(d, name, result, returned, has_value)
+        return deps, IRNode("closure_out", {"input": zone_in, "items": types, "ret": result.type, "name": name},
+                            (result,), d.line)
 
     # -- evaluation --------------------------------------------------------
     def eval(self, e):
@@ -818,6 +1007,13 @@ class Compiler:
             v = self.eval(e.obj)
             self.line = e.line
             return self.member(v, e.comp)
+        if k == "index":
+            v, i = self.eval(e.obj), self.component_index(e)
+            if i.is_const:
+                return self.member(v, i.const)
+            comps = [self.member(v, c) for c in range(3)]
+            return self.select(self.compare("==", i, Val("int", 2)), comps[2],
+                               self.select(self.compare("==", i, Val("int", 1)), comps[1], comps[0]))
         if k == "call":
             return self.call(e.name, e.args)
         if k == "unop":
@@ -825,8 +1021,7 @@ class Compiler:
             self.line = e.line
             if e.op == "-":
                 return self.negate(a)  # else: not
-            a = self.conv(a, "bool")
-            return Val("bool", not a.const) if a.is_const else self.node("bmath", "bool", (a,), op="NOT")
+            return self.not_(a)
         if k == "ternary":
             cond = self.conv(self.eval(e.cond), "bool")
             a, b = self.eval(e.a), self.eval(e.b)
@@ -845,6 +1040,10 @@ class Compiler:
     def exec(self, s):
         self.line = s.line
         k = s.kind
+        if k != "def":
+            live = self._live()
+            if live.is_const and not live.const:  # after a constant break / continue / return
+                return
         if k in ("assign", "expr"):
             self.stmt_line = s.line
         if k == "block":
@@ -859,13 +1058,36 @@ class Compiler:
                 val = self.conv(val, s.annot)
             self.assign(s.target, val)
         elif k == "expr":
-            self.eval(s.expr)
+            if s.expr.kind == "call" and s.expr.name in self.funcs:
+                self.call_user(s.expr.name, s.expr.args, want_value=False)
+            else:
+                self.eval(s.expr)
         elif k == "if":
             self.exec_if(s)
         elif k == "for":
             self.exec_for(s)
         elif k == "while":
             self.exec_while(s)
+        elif k in ("break", "continue"):
+            self.stmt_line = s.line
+            if not self.loops:
+                raise self.err(f"'{k}' can only be used inside a loop")
+            brk, cont = self.loops[-1]
+            self._raise_flags(brk if k == "break" else cont)
+        elif k == "return":
+            self.stmt_line = s.line
+            if not self.frames:
+                raise self.err("'return' can only be used inside a function (def)")
+            if s.value is not None:
+                val = self.eval(s.value)
+                self.line = s.line
+                self.assign(N("var", s.line, name="$ret"), val)
+                self.frames[-1]["value"] = True
+            self._raise_flags("$returned", *(brk for brk, _ in self.loops))  # and leaves every loop
+        elif k == "def":
+            if s.name in FUNCTION_NAMES or s.name in ("range", "set"):
+                raise self.err(f"'{s.name}' is a built-in function, pick another name")
+            self.funcs[s.name] = s
 
     def exec_if(self, s):
         self.stmt_line = s.line
@@ -877,11 +1099,14 @@ class Compiler:
             return
         # Run both branches from the same starting state, then merge with switches.
         base_vars, base_attrs = dict(self.vars), dict(self.attrs)
+        self.path.append(cond)
         self.exec(s.then)
+        self.path[-1] = self.not_(cond)
         then_vars, then_attrs = self.vars, self.attrs
         self.vars, self.attrs = dict(base_vars), base_attrs
         if s.orelse is not None:
             self.exec(s.orelse)
+        self.path.pop()
         self.line = self.stmt_line = s.line
         for name in set(then_vars) | set(self.vars):
             a, b = then_vars.get(name), self.vars.get(name)
@@ -896,44 +1121,294 @@ class Compiler:
             b = self.attrs.get(name) or self.read_original(name, type)
             self.attrs[name] = self.select(cond, a, b)
 
-    def loop_guard(self, count, s):
-        if count > MAX_LOOP_ITERATIONS:
-            raise BexError(f"the loop runs more than {MAX_LOOP_ITERATIONS} times", s.line)
+    # -- loops --------------------------------------------------------------
+    # A loop runs now (unrolled) when it is short or everything it changes stays
+    # constant. Otherwise it is one Repeat Zone whose items are the values the body
+    # changes, carried as fields, so attributes are still written once, after it.
+    # `break` / `continue` set hidden bool variables (one pair per loop); while
+    # one is set, assign() keeps the old values (_live), so `if` merging and zone
+    # items handle them like any other variable. A loop whose length differs per
+    # element runs the longest length, and each element stops changing once done.
 
-    def exec_for(self, s):
-        bounds = []
+    def _new_flags(self):
+        self.loop_count += 1
+        return f"$break{self.loop_count}", f"$continue{self.loop_count}"
+
+    def _live(self):
+        """Whether statements here run: no break / continue of an enclosing loop
+        (in this function) is set, and the function hasn't returned."""
+        live = Val("bool", True)
+        for name in [n for flags in self.loops for n in flags] + ["$returned"]:
+            f = self.vars.get(name)
+            if f is not None:
+                live = self.logic("and", live, self.not_(f))
+        return live
+
+    def _raise_flags(self, *names):
+        """break / continue / return: the flags are set wherever statements run now."""
+        live = self._live()
+        for name in names:
+            self.vars[name] = self.logic("or", self.vars.get(name, Val("bool", False)), live)
+
+    def _range(self, s):
+        args = []
         for arg in s.args:
             v = self.eval(arg)
-            if not v.is_const or v.type not in ("int", "bool"):
-                raise BexError("range() needs whole numbers known at compile time "
-                               "(not attributes or inputs)", s.line)
-            bounds.append(int(v.const))
-        if len(bounds) > 2 and bounds[2] == 0:
+            if v.type not in ("int", "bool"):
+                raise BexError("range() needs whole numbers", s.line)
+            args.append(self.conv(v, "int"))
+        self.line = self.stmt_line = s.line
+        if len(args) == 1:
+            args = [Val("int", 0)] + args
+        start, stop, step = (args + [Val("int", 1)])[:3]
+        if not step.is_const:
+            raise BexError("the range() step must be a fixed number", s.line)
+        if step.const == 0:
             raise BexError("range() step cannot be 0", s.line)
-        r = range(*bounds)
-        self.loop_guard(len(r), s)
-        for i in r:
-            self.vars[s.var] = Val("int", i)
-            self.half_set.pop(s.var, None)
-            self.exec(s.body)
+        return start, stop, step
+
+    def exec_for(self, s):
+        start, stop, step = self._range(s)
+        brk, cont = self._new_flags()
+        self.vars[brk] = Val("bool", False)
+        if start.is_const and stop.is_const:
+            r = range(start.const, stop.const, step.const)
+            if len(r) <= MAX_LOOP_ITERATIONS and self._unroll(s, list(r), brk, cont) is True:
+                self._end_loop(brk, cont)
+                return
+        # Iterations: ceil((stop - start) / step), at least 0
+        span = self.arith("-", stop, start) if step.const > 0 else self.arith("-", start, stop)
+        size = abs(step.const)
+        count = self.arith("//", self.arith("+", span, Val("int", size - 1)), Val("int", size))
+        count = self.fn2("MAXIMUM", max, count, Val("int", 0))
+        per_element = _is_field(count)
+        total = count
+        if per_element:  # run the longest; each element stops at its own count
+            if _uses_items(count):
+                raise BexError("a loop count that differs per element can't depend on values an outer "
+                               "loop changes (loop to a fixed maximum and skip with if)", s.line)
+            sel = self.group_sel if self.group_sel is not None else Val("bool", True)
+            total = self.conv(self.node("stat", "float", (self.conv(count, "float"), sel), domain=self.domain), "int")
+        names, _ = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        can_break = brk in names
+        if can_break:  # elements outside the if around it, or already returned, start stopped
+            self.vars[brk] = self._stopped_here()
+        carry = per_element or can_break  # the loop variable keeps its value when an element stops
+        chunked = can_break and self.zone_depth == 0 and not (total.is_const and total.const <= CHUNK_FIRST)
+        if carry and s.var not in self.vars:
+            self.vars[s.var] = start
+
+        def begin(it):
+            self.vars[cont] = Val("bool", False)
+            if per_element or chunked:  # chunks can run past the count
+                done = self.not_(self.compare("<", it, count))
+                self.vars[brk] = self.logic("or", self.vars[brk], done)
+            value = self.arith("+", self.arith("*", it, step), start)
+            if carry:
+                self.assign(N("var", s.line, name=s.var), value)
+            else:
+                self.vars[s.var] = value
+                self.half_set.pop(s.var, None)
+
+        self._zone(s, total, brk, cont, begin, ((s.var,) if carry else ()) + ((brk,) if chunked else ()), chunked)
+        if not carry:  # Python keeps the loop variable at its last value (unchanged after no iterations)
+            last = self.arith("-", count, Val("int", 1))
+            value = self.arith("+", self.arith("*", last, step), start)
+            before = self.vars.get(s.var)
+            if before is not None:
+                value = self.select(self.compare(">", count, Val("int", 0)), value, before)
+            self.vars[s.var] = value
+        self._end_loop(brk, cont)
 
     def exec_while(self, s):
-        count = 0
-        while True:
-            cond = self.conv(self.eval(s.cond), "bool")
-            if not cond.is_const:
-                raise BexError("a while-loop condition must be known at compile time "
-                               "(it cannot depend on attributes or inputs)", s.line)
-            if not cond.const:
+        brk, cont = self._new_flags()
+        self.vars[brk] = Val("bool", False)
+        n = self._unroll(s, None, brk, cont)
+        if n is not True:
+            self.vars[brk] = self._stopped_here()
+            def begin(it):
+                self.vars[cont] = Val("bool", False)
+                cond = self.conv(self.eval(s.cond), "bool")
+                self.line = self.stmt_line = s.line
+                self.vars[brk] = self.logic("or", self.vars[brk], self.not_(cond))
+
+            # n: the exact count, when the condition was known each time but the body was not
+            chunked = not n and self.zone_depth == 0
+            count = n or (MAX_ZONE_ITERATIONS if chunked else WHILE_CAP)
+            if not n and not chunked:
+                self.warnings.append(f"line {s.line}: a while loop inside another loop stops after "
+                                     f"{WHILE_CAP} iterations")
+            self._zone(s, Val("int", count), brk, cont, begin, (brk,), chunked)
+        self._end_loop(brk, cont)
+
+    def _stopped_here(self):
+        """Where a loop starting now doesn't run at all: outside the `if` branches
+        around it, or after a break / continue / return (so a chunked loop can
+        skip those elements instead of running them to the cap)."""
+        here = self._live()
+        if self.frames:
+            here = self.logic("and", here, self.frames[-1]["live"])
+        for c in self.path:
+            here = self.logic("and", here, c)
+        return self.not_(here)
+
+    def _end_loop(self, brk, cont):
+        self.vars.pop(brk, None)
+        self.vars.pop(cont, None)
+
+    def _begin_unrolled(self, s, cont, value):
+        self.vars[cont] = Val("bool", False)
+        if s.kind == "for":
+            self.assign(N("var", s.line, name=s.var), Val("int", value))
+
+    def _unroll(self, s, values, brk, cont):
+        """Run the loop now: `values` are a for-loop's values; None for a while
+        loop, whose condition is checked before each iteration. The result is kept
+        (returns True) when everything the loop changes stays constant, or it ran
+        at most UNROLL_MAX times. Otherwise everything is undone, and it returns the
+        iteration count when that was known (a while loop with a constant
+        condition but a non-constant body), else False."""
+        saved = self._snapshot()
+        names, attrs = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        short = values is not None and len(values) <= UNROLL_MAX
+        n, all_const = 0, True
+        for value in (values if values is not None else itertools.count()):
+            run = self.not_(self.vars[brk])
+            if s.kind == "while":
+                run = self.logic("and", run, self.conv(self.eval(s.cond), "bool"))
+                self.line = self.stmt_line = s.line
+                if not run.is_const:  # its end differs per element
+                    self._restore(saved)
+                    return False
+            if run.is_const and not run.const:
                 break
-            count += 1
-            self.loop_guard(count, s)
+            if n == MAX_LOOP_ITERATIONS:
+                if all_const:
+                    raise BexError(f"the loop runs more than {MAX_LOOP_ITERATIONS} times", s.line)
+                self._restore(saved)
+                return False
+            n += 1
+            self.loops.append((brk, cont))
+            self._begin_unrolled(s, cont, value)
             self.exec(s.body)
+            self.loops.pop()
+            if all_const:  # attributes: also those a called function wrote
+                changed = [self.vars.get(x) for x in names] + \
+                    [v for a, v in self.attrs.items() if saved["attrs"].get(a) is not v]
+                all_const = all(v is None or v.is_const for v in changed)
+            if not all_const and values is not None and not short:
+                self._restore(saved)
+                return False
+        if all_const or n <= UNROLL_MAX:
+            return True
+        self._restore(saved)
+        return n
+
+    def _zone(self, s, count, brk, cont, begin, carry=(), chunked=False):
+        """One Repeat Zone running the loop body `count` times (one value, not a
+        field). `begin(it)` starts each iteration (it: the Iteration output).
+        Items: the variables (set before the loop) and attributes the body assigns,
+        plus `carry`. Their types widen, and they become fields, as the body needs.
+
+        `chunked` (a loop that can end early, `brk` carried): an outer zone runs
+        chunks of growing size, each an inner zone; between chunks the items are
+        stored on the geometry (hidden attributes), and once no element is still
+        running (`brk` unset) the remaining chunks are skipped. Blender's Repeat
+        Zone has no stop condition, so this is how a loop ends early."""
+        line = s.line
+        if count.is_const and count.const > MAX_ZONE_ITERATIONS:
+            raise BexError(f"the loop runs more than {MAX_ZONE_ITERATIONS} times", line)
+        count = self.fn2("MINIMUM", min, count, Val("int", MAX_ZONE_ITERATIONS))
+        names, attrs = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        names = (names | set(carry)) - {cont} - ({s.var} if s.kind == "for" and s.var not in carry else set())
+        local = [n for n in names if n not in self.vars]  # created inside the loop
+        items = [("var", n, self.vars[n]) for n in sorted(names) if n in self.vars]
+        for name, prefix in attrs.items():
+            if name in READ_ONLY or OPINPUT_RE.match(name):
+                continue  # assign() reports it while running the body
+            items.append(("attr", name, self.read_attr(name, self.attr_type(name, prefix))))
+        types = [v.type for _, _, v in items]
+        fields = [_is_field(v) for _, _, v in items]
+        temp = [f"{TEMP_PREFIX}{self.loop_count}_{k}" for k in range(len(items))]  # chunked: hidden attribute names
+        saved = self._snapshot()
+        while True:
+            starts = tuple(self.conv(v, t) for (_, _, v), t in zip(items, types))
+            if chunked:
+                fields = [True] * len(items)  # read back from the geometry
+                chunks = 1
+                longest = count.const if count.is_const else MAX_ZONE_ITERATIONS
+                while CHUNK_FIRST * (CHUNK_GROWTH ** chunks - 1) / (CHUNK_GROWTH - 1) < longest:
+                    chunks += 1
+                chunk = IRNode("chunk", {"names": tuple(temp), "items": tuple(types), "count": chunks,
+                                         "domain": self.domain}, starts, line)
+                size, offset = Val("int", node=chunk, out=0), Val("int", node=chunk, out=1)
+                starts = tuple(self.node("attr", t, name=n, dtype=t) for n, t in zip(temp, types))
+                zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (size,) + starts, line)
+                it = self.arith("+", offset, Val("int", node=zone, out=0))
+            else:
+                zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (count,) + starts, line)
+                it = Val("int", node=zone, out=0)
+            for k, ((kind, name, _), t) in enumerate(zip(items, types)):
+                (self.vars if kind == "var" else self.attrs)[name] = Val(t, node=zone, out=k + 1)
+            self.loops.append((brk, cont))
+            self.zone_depth += 1
+            begin(it)
+            self.exec(s.body)
+            self.zone_depth -= 1
+            self.loops.pop()
+            finals = [(self.vars if kind == "var" else self.attrs).get(name) for kind, name, _ in items]
+            # e.g. x = 0 before the loop and x += 0.5 inside: carry a float
+            wider = [f.type if f is not None and RANK[f.type] > RANK[t] else t for f, t in zip(finals, types)]
+            varying = [d or (f is not None and _is_field(f)) for f, d in zip(finals, fields)]
+            carried = {name for kind, name, _ in items if kind == "attr"}
+            missed = [a for a, v in self.attrs.items() if a not in carried and saved["attrs"].get(a) is not v]
+            if wider == types and varying == fields and not missed:
+                break
+            types, fields = wider, varying
+            missed = [(a, self.attr_types[a]) for a in missed]
+            self._restore(saved)
+            for name, type in missed:  # written by a function the body calls
+                v = self.read_attr(name, self.attr_type(name, type))
+                items.append(("attr", name, v))
+                types.append(v.type)
+                fields.append(True)
+                temp.append(f"{TEMP_PREFIX}{self.loop_count}_{len(temp)}")
+            saved = self._snapshot()
+        self.line = self.stmt_line = line
+        finals = [self.conv(f, t) for f, t in zip(finals, types)]
+        out = IRNode("repeat_out", {"zone": zone}, tuple(finals), line)
+        for k, ((kind, name, _), t) in enumerate(zip(items, types)):
+            if chunked:  # the values the chunks left on the geometry
+                val = self.node("attr", t, name=temp[k], dtype=t)
+            else:
+                val = Val(t, node=out, out=k)
+            (self.vars if kind == "var" else self.attrs)[name] = val
+        if chunked:
+            running = next(k for k, (kind, name, _) in enumerate(items) if name == brk)
+            sel = self.group_sel if self.group_sel is not None else Val("bool", True)
+            self.preludes.append(IRNode("chunk_end", {"chunk": chunk, "flag": running},
+                                        tuple(Val(t, node=out, out=k) for k, t in enumerate(types)) + (sel,), line))
+        for name in local:  # its value would come from inside the zone
+            self.vars.pop(name, None)
+            self.loop_only[name] = line
+        return out
+
+    _STATE = ("vars", "half_set", "loop_only", "attrs", "attr_types", "written", "params", "ramps",
+              "reads", "pending", "inputs", "cse", "preludes", "closures", "call_counts", "calls",
+              "loop_count", "warnings")
+
+    def _snapshot(self):
+        """Copies of everything running statements can change (see _restore)."""
+        return {k: _copy(getattr(self, k)) for k in self._STATE}
+
+    def _restore(self, saved):
+        for k, v in saved.items():
+            setattr(self, k, _copy(v))
 
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
                        ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
-                       reads=list(self.reads), inputs=sorted(self.inputs))
+                       reads=list(self.reads), inputs=sorted(self.inputs), preludes=list(self.preludes))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
@@ -991,37 +1466,40 @@ class Compiler:
 
     def _position_offset(self, val):
         """The offset when `val` is the position plus something (`@P += x`,
-        `@P.z -= 1`), so Set Position's Offset input does the adding."""
+        `@P.z -= 1`, also repeated: `(@P.z + a) + b`), so Set Position's Offset
+        input does the adding."""
         if val.is_const:
             return None
-        n, pos = val.node, self.read_original("P", "vector")
-        self.stmt_line = n.line
-        if n.kind == "vmath" and n.params.get("op") in ("ADD", "SUBTRACT"):
-            a, b = n.inputs
-            if _same(a, pos):
-                return b if n.params["op"] == "ADD" else self.negate(b)
-            if _same(b, pos) and n.params["op"] == "ADD":
-                return a
-            return None
-        if n.kind != "combine":
+        pos = self.read_original("P", "vector")
+        self.stmt_line = val.node.line
+        if val.node.kind == "vmath":
+            return self._strip_base(val, lambda v: _same(v, pos), "vmath", Val("vector", (0.0, 0.0, 0.0)))
+        if val.node.kind != "combine":
             return None
         parts = []
-        for i, c in enumerate(n.inputs):
-            if _is_component(c, pos, i):
-                parts.append(Val("float", 0.0))
-            elif not c.is_const and c.node.kind == "math" and c.node.params.get("op") in ("ADD", "SUBTRACT"):
-                a, b = c.node.inputs
-                self.stmt_line = c.node.line
-                if _is_component(a, pos, i):
-                    parts.append(b if c.node.params["op"] == "ADD" else self.negate(b))
-                elif _is_component(b, pos, i) and c.node.params["op"] == "ADD":
-                    parts.append(a)
-                else:
-                    return None
-            else:
+        for i, c in enumerate(val.node.inputs):
+            off = self._strip_base(c, lambda v, i=i: _is_component(v, pos, i), "math", Val("float", 0.0))
+            if off is None:
                 return None
-        self.stmt_line = n.line
+            parts.append(off)
+        self.stmt_line = val.node.line
         return self.combine(parts)
+
+    def _strip_base(self, v, is_base, kind, zero):
+        """`v` as base + offset through a chain of ADD / SUBTRACT nodes of `kind`:
+        the offset, or None when `v` isn't the base plus something."""
+        if is_base(v):
+            return zero
+        if v.is_const or v.node.kind != kind or v.node.params.get("op") not in ("ADD", "SUBTRACT"):
+            return None
+        a, b = v.node.inputs
+        add = v.node.params["op"] == "ADD"
+        self.stmt_line = v.node.line
+        off = self._strip_base(a, is_base, kind, zero)
+        if off is not None:
+            return self.arith("+" if add else "-", off, b)
+        off = self._strip_base(b, is_base, kind, zero) if add else None
+        return None if off is None else self.arith("+", off, a)
 
     def _and_all(self, conds):
         sel = None
@@ -1030,6 +1508,138 @@ class Compiler:
                 self.stmt_line = c.node.line or self.stmt_line
             sel = c if sel is None else self.logic("and", sel, c)
         return sel
+
+
+def _copy(x):
+    if isinstance(x, dict):  # ramps hold sets, closures hold lists
+        return {k: set(v) if isinstance(v, set) else list(v) if isinstance(v, list) else v for k, v in x.items()}
+    if isinstance(x, list):
+        return list(x)
+    return x  # counters
+
+
+def _assigned(body, brk=None, cont=None, outer=()):
+    """Names a loop body assigns: ({variable}, {attribute: prefix type}). A
+    `break` / `continue` of this loop assigns its flag `brk` / `cont`; a `return`
+    also the break flags `outer` of the loops around it (in the same function)."""
+    names, attrs = set(), {}
+
+    def target(t):
+        while t.kind in ("member", "index"):
+            t = t.obj
+        if t.kind == "var":
+            names.add(t.name)
+        elif t.kind == "attr":
+            attrs.setdefault(t.name, t.type)
+
+    def walk(s, inner):
+        if s is None:
+            return
+        k = s.kind
+        if k == "assign":
+            target(s.target)
+        elif k == "return":
+            names.update(("$ret", "$returned", *outer))
+            if brk:
+                names.add(brk)
+        elif k == "break" and not inner:
+            names.add(brk)
+        elif k == "continue" and not inner:
+            names.add(cont)
+        elif k == "for":
+            names.add(s.var)
+            walk(s.body, True)
+        elif k == "while":
+            walk(s.body, True)
+        elif k == "if":
+            walk(s.then, inner)
+            walk(s.orelse, inner)
+        elif k == "block":
+            for c in s.body:
+                walk(c, inner)
+
+    walk(body, False)
+    names.discard(None)
+    return names, attrs
+
+
+def _always_returns(s):
+    """Every path through statement `s` ends in a return (judged from the code)."""
+    if s is None:
+        return False
+    if s.kind == "return":
+        return True
+    if s.kind == "block":
+        return bool(s.body) and _always_returns(s.body[-1])
+    if s.kind == "if":
+        return _always_returns(s.then) and _always_returns(s.orelse)
+    if s.kind == "while":  # `while True:` left only by return
+        return s.cond.kind == "bool" and s.cond.value and not _breaks(s.body)
+    return False
+
+
+def _breaks(s):
+    """Statement `s` has a `break` of the loop it sits in (not of a loop inside it)."""
+    if s is None or s.kind in ("for", "while"):
+        return False
+    if s.kind == "break":
+        return True
+    if s.kind == "if":
+        return _breaks(s.then) or _breaks(s.orelse)
+    return s.kind == "block" and any(_breaks(c) for c in s.body)
+
+
+def _negates(a, b):
+    """`a` is NOT `b`."""
+    return not a.is_const and a.node.kind == "bmath" and a.node.params.get("op") == "NOT" \
+        and _same(a.node.inputs[0], b)
+
+
+def _walk_outputs(val, visit):
+    """Walk the (node, output) pairs `val` depends on. `visit(node, out)` returns
+    True to stop with True, False to skip the node's inputs, or None to go on."""
+    seen, stack = set(), [(val.node, val.out)]
+    while stack:
+        n, out = stack.pop()
+        if n is None or (id(n), out) in seen:
+            continue
+        seen.add((id(n), out))
+        r = visit(n, out)
+        if r is True:
+            return True
+        if r is False:
+            continue
+        if n.kind == "closure_call":  # and the function body
+            stack.append((n.params["closure"], 0))
+        # Sample Index: the sampled value is read on the other geometry, only the index matters here
+        stack.extend((v.node, v.out) for v in (n.inputs[1:] if n.kind == "sample" else n.inputs))
+    return False
+
+
+def _is_field(val):
+    """Whether `val` can differ per element (a Repeat Zone count has to be one value)."""
+    def visit(n, out):
+        k = n.kind
+        if k == "attr" and "src" not in n.params or k == "input" and n.params["name"] != "time":
+            return True
+        if k == "repeat_in":
+            if out == 0:  # Iteration: depends only on the count
+                return _is_field(n.inputs[0]) or False
+            return n.params["fields"][out - 1] or False
+        if k == "repeat_out":
+            return n.params["zone"].params["fields"][out] or False
+        if k in ("stat", "count"):  # one value measured over the geometry
+            return False
+        if k == "closure_in":  # an argument: as the calls pass it (closures are per field-ness)
+            return n.params["fields"][out] or False
+        return None
+    return _walk_outputs(val, visit)
+
+
+def _uses_items(val):
+    """Whether `val` reads an item of a Repeat Zone it sits in."""
+    return _walk_outputs(val, lambda n, out: (out > 0 or None) if n.kind == "repeat_in" else
+                         (False if n.kind == "repeat_out" else None))
 
 
 def _typed_name(text):
@@ -1066,12 +1676,16 @@ def _reads(val):
         if n is None or id(n) in seen:
             continue
         seen.add(id(n))
-        if "src" in n.params:  # evaluated on another input, not on this geometry
+        if "src" in n.params or n.kind == "stat":  # evaluated on another input / the incoming geometry
             continue
         if n.kind == "attr":
             found.add(n.params["name"])
         elif n.kind == "input":
             found |= _INPUT_READS.get(n.params["name"], set())
+        elif n.kind == "repeat_out":  # zero iterations pass the starting values through
+            stack.append(n.params["zone"])
+        elif n.kind == "closure_call":  # what the function body reads
+            stack.append(n.params["closure"])
         stack.extend(v.node for v in n.inputs)
     return found
 
@@ -1099,7 +1713,16 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
     `@P.y > 0`. A bare name is a bool attribute.
     It is read from the incoming geometry, before the script runs.
     """
+    c, prog = _compile(src, domain, pending_line, known_params, group, frozenset())
+    shared = frozenset(k for k, n in c.call_counts.items() if n > 1)
+    if shared:  # functions called more than once: built once each, as Closures
+        c, prog = _compile(src, domain, pending_line, known_params, group, shared)
+    return prog
+
+
+def _compile(src, domain, pending_line, known_params, group, closure_keys):
     c = Compiler(domain, pending_line, known_params)
+    c.closure_keys = closure_keys
     selection, warnings = None, []
     if group.strip():
         types = dict(c.attr_types)
@@ -1111,16 +1734,18 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
             # break the node (the node shows a warning). Start over so nothing
             # half-compiled from it remains.
             c = Compiler(domain, pending_line, known_params)
+            c.closure_keys = closure_keys
             selection = Val("bool", False)
             warnings.append(f"group: {e.msg} (selects nothing)")
         # Types the Group guessed (`top` is a bool) don't bind the script.
         c.bare_attributes, c.pending_line, c.attr_types = False, pending_line, types
         if selection.is_const and selection.const:
             selection = None  # always true: every element
+    c.group_sel = selection
     for stmt in parse(src):
         c.exec(stmt)
     prog = c.program()
     prog.source = src.splitlines()
-    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings
+    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings + c.warnings
     c.plan_stores(prog, selection)
-    return prog
+    return c, prog

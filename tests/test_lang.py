@@ -96,13 +96,266 @@ def test_variables_like_python():
     fails("x += 1", "unknown variable 'x'")
 
 
-def test_for_unrolls():
-    w = writes("s = 0\nfor i in range(4):\n    s += i\n@a = s")
+def zone_of(val):
+    """The repeat_out node behind a written value (looking through one conversion level)."""
+    n = val.node
+    assert n is not None and n.kind == "repeat_out", n
+    return n, n.params["zone"]
+
+
+def test_for_folds_constants():
+    w = writes("s = 0\nfor i in range(4):\n    s += i\n@a = s\n@b = i")
+    assert w["a"].const == 6.0 and w["b"].const == 3.0  # the loop variable keeps its last value
+    w = writes("for i in range(3):\n    @a = i * 2")
+    assert w["a"].const == 4.0
+    w = writes("s = 0\nfor i in range(100000):\n    pass\n@a = s")  # too long to fold, nothing changes
+    assert w["a"].const == 0.0
+
+
+def kinds(val):
+    """Every IR node kind `val` depends on (following zones), with counts."""
+    seen, stack, found = set(), [val.node], {}
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        found[n.kind] = found.get(n.kind, 0) + 1
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    return found
+
+
+def test_short_loops_unroll():
+    # Up to UNROLL_MAX iterations: no zone, so components and the Set Position Offset work.
+    c = compile_source("v = @N\nfor i in range(3):\n    v[i] = v[i] * 2\n@a = v.x\nfor i in range(8):\n    @P.z += @a")
+    assert all("repeat_out" not in kinds(v) for _, _, v in c.writes)
+    assert [st.offset for st in c.stores if st.name == "P"] == [True]
+    c = compile_source("x = @P.x\nfor i in range(9):\n    x += i\n@a = x")
+    assert "repeat_out" in kinds(c.writes[0][2])
+
+
+def test_nested_loop_counts():
+    # The inner count comes from the outer loop's Iteration: one value, so it's fine.
+    c = compile_source("for i in range(chi('n', 4)):\n    for j in range(i):\n        @a += @P.x")
+    assert kinds(c.writes[0][2])["repeat_in"] == 2
+    w = writes("s = 0\nfor i in range(4):\n    for j in range(i):\n        s += 1\n@a = s")
     assert w["a"].const == 6.0
-    fails("for i in range(@ptnum):\n    pass", "compile time")
-    fails("for i in range(100000):\n    pass", "more than")
+
+
+def test_per_element_count():
+    # range(@ptnum): the zone runs the longest count (an Attribute Statistic Max), each
+    # element stops changing at its own count.
+    c = compile_source("for i in range(@ptnum):\n    @P.z += 0.1", group="@P.x > 0")
+    found = kinds(c.stores[0].value)
+    assert found["stat"] == 1 and found["repeat_in"] == 1
+    stat = next(n for n in _nodes(c.stores[0].value) if n.kind == "stat")
+    assert stat.inputs[1] == c.group  # only elements in the Group count
+    assert not c.captures
+
+
+def _nodes(val):
+    seen, stack = {}, [val.node]
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen[id(n)] = n
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    return list(seen.values())
+
+
+def test_break_continue():
+    # Constant: worked out now, like Python.
+    w = writes("s = 0\nfor i in range(100):\n    if i == 5:\n        break\n    if i % 2:\n        continue\n    s += i\n"
+               "@a = s\n@b = i")
+    assert w["a"].const == 0 + 2 + 4 and w["b"].const == 5
+    w = writes("i = 0\nwhile True:\n    i += 1\n    if i >= 7:\n        break\n@a = i")
+    assert w["a"].const == 7
+    # Per element: the flags become zone items, values freeze once broken.
+    # A loop that can end early runs in growing chunks, skipped once every element is done.
+    c = compile_source("x = 0.0\nfor i in range(chi('n', 50)):\n    if @P.x * i > 1:\n        break\n    x += 1\n@a = x")
+    (end,) = c.preludes
+    chunk = end.params["chunk"]
+    assert end.kind == "chunk_end" and chunk.params["items"][end.params["flag"]] == "bool"
+    assert chunk.params["count"] == 19  # 32 * (1.5^19 - 1) / 0.5 >= MAX_ZONE_ITERATIONS
+    assert c.writes[0][2].node.kind == "attr" and c.writes[0][2].node.params["name"].startswith(".bex")
+    # Inside another zone: a plain masked zone.
+    c = compile_source("for j in range(chi('m', 3)):\n    for i in range(chi('n', 50)):\n        if @P.x * i > 1:\n"
+                       "            break\n        @a += 1")
+    assert not c.preludes  # the break is the inner loop's, and that one sits in a zone
+    # Values that depend on each other survive the chunk stores (swap through shadows).
+    c = compile_source("a = 0.0\nb = 1.0\nwhile b < @P.x * 1000 + 2:\n    t = a + b\n    a = b\n    b = t\n@f = a")
+    assert len(c.preludes) == 1
+    c = compile_source("x = 0.0\nfor i in range(20):\n    if @P.x > i:\n        continue\n    x += i\n@a = x")
+    assert "repeat_in" in kinds(c.writes[0][2])
+
+
+def test_while_loops():
+    # A constant condition with a non-constant body: a zone with the exact count.
+    c = compile_source("i = 0\nx = @P.x\nwhile i < 20:\n    x = x * 0.5 + 1\n    i += 1\n@a = x")
+    zone = c.writes[0][2].node.params["zone"]
+    assert zone.inputs[0].const == 20
+    # A per-element condition: a zone with the safety cap, stopping each element.
+    c = compile_source("x = @P.x\nn = 0\nwhile x > 1:\n    x *= 0.5\n    n += 1\ni@n = n")
+    assert len(c.preludes) == 1  # chunked
+    c = compile_source("for j in range(chi('m', 2)):\n    x = @P.x\n    while x > 1:\n        x *= 0.5\n    @a += x")
+    zones = [n for n in _nodes(c.writes[0][2]) if n.kind == "repeat_in"]
+    assert sorted(z.inputs[0].const or 0 for z in zones) == [0, 1000]  # inside another loop: the cap
+    # Short ones unroll.
+    w = writes("i = 0\nx = @P.x\nwhile i < 3:\n    x += 1\n    i += 1\n@a = x")
+    assert "repeat_in" not in kinds(w["a"])
+
+
+def test_own_functions():
+    # Inlined: constants fold through, defaults and keywords bind, globals are read.
+    w = writes("""
+scale = 2
+def f(x, k=3):
+    y = x * k
+    return y + scale
+@a = f(1)
+@b = f(1, k=10)
+@c = f(k=1, x=5)
+""")
+    assert (w["a"].const, w["b"].const, w["c"].const) == (5.0, 12.0, 7.0)
+    # Locals stay local; attributes can be written; a value-less call is a statement.
+    w = writes("""
+def lift(h):
+    @P.z += h
+    t = 5
+t = 1
+lift(0.5)
+@a = t
+""")
+    assert w["a"].const == 1.0 and "P" in w
+    # Early return under a per-element condition.
+    c = compile_source("def sgn(x):\n    if x < 0:\n        return -1.0\n    return 1.0\n@a = sgn(@P.x)")
+    assert c.writes[0][2].node.kind == "switch"
+    # return inside a loop leaves it.
+    w = writes("def first_over(limit):\n    for i in range(100):\n        if i * i > limit:\n            return i\n"
+               "    return -1\n@a = first_over(50)")
+    assert w["a"].const == 8.0
+    c = compile_source("def steps(x):\n    n = 0\n    for i in range(chi('cap', 99)):\n        if x < 1:\n"
+                       "            return n\n        x *= 0.5\n        n += 1\n    return n\n@a = steps(@P.x * 100)")
+    assert c.preludes  # can end early: chunked
+    # Recursion that ends while compiling.
+    w = writes("def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n@a = fib(10)")
+    assert w["a"].const == 55.0
+    # A function writing an attribute inside a loop: the attribute is a zone item.
+    c = compile_source("def bump():\n    @w += @P.x\nfor i in range(chi('n', 20)):\n    bump()")
+    assert c.writes[0][0] == "w" and c.writes[0][2].node.kind == "repeat_out"
+
+
+def test_shared_functions_are_closures():
+    src = "def wave(x, f):\n    y = sin(x * f) * 0.5\n    return y * y + x\n@a = wave(@P.x, 3)\n@b = wave(@P.y, 5)\n"
+    c = compile_source(src)
+    calls = [v.node for _, _, v in c.writes]
+    assert [n.kind for n in calls] == ["closure_call", "closure_call"]
+    assert calls[0].params["closure"] is calls[1].params["closure"]  # one body
+    assert sum(1 for n in _nodes(c.writes[0][2]) if n.kind == "math" and n.params["op"] == "SINE") == 1
+    # Called once, all-constant arguments, or writing attributes: inlined.
+    assert writes("def wave(x, f):\n    return sin(x * f)\n@a = wave(@P.x, 3)")["a"].node.kind == "math"
+    w = writes("def sq(x):\n    return x * x\n@a = sq(3) + sq(4)")
+    assert w["a"].const == 25.0
+    c = compile_source("def lift(x):\n    @w += x\n    return x\n@a = lift(@P.x) + lift(@P.y)")
+    assert all("closure_call" not in kinds(v) for _, _, v in c.writes)
+    # Different argument types: one closure each.
+    c = compile_source("def dbl(x):\n    return x * 2\nv@a = dbl(@P) + dbl(@N)\n@b = dbl(@P.x) + dbl(@P.y)")
+    closures = {id(n.params["closure"]) for _, _, v in c.writes for n in _nodes(v) if n.kind == "closure_call"}
+    assert len(closures) == 2
+
+
+def test_review_regressions():
+    # A shared function reads the script's variables / attributes as they are at each call.
+    c = compile_source("k = @P.x\ndef f(a):\n    return a * k\nf@x = f(@P.y)\nk = 5.0\nf@y = f(@P.y + 1)")
+    x, y = (v.node for _, _, v in c.writes)
+    assert x.params["closure"] is not y.params["closure"] if y.kind == "closure_call" else True
+    # A per-element argument used as a loop count inside a shared function: its own closure, a real count.
+    c = compile_source("def f(n, x):\n    for i in range(n):\n        x += 0.5\n    return x\n"
+                       "f@x = f(@ptnum + 9, 1.0)\nf@y = f(@ptnum % 3 + 10, @P.x)")
+    assert any(n.kind == "stat" for _, _, v in c.writes for n in _nodes(v))
+    # return inside two nested zone loops: the outer break flag is an item of the inner zone.
+    c = compile_source("def f(lim):\n    x = 0.0\n    for i in range(12):\n        for j in range(12):\n"
+                       "            x += 1\n            if x > lim:\n                return x\n    return -x\nf@x = f(@ptnum * 3.0)")
+    zones = [n for n in _nodes(c.writes[0][2]) if n.kind == "repeat_in"]
+    assert len(zones) == 2 and all(z.params["items"].count("bool") >= 2 for z in zones)
+    # Rollback keeps channels of a shared function first called inside a long loop.
+    c = compile_source("def f(a):\n    return a * chf('amp', 2.0)\ns = 0.0\nfor i in range(20):\n    s += f(@P.x * i)\n"
+                       "@a = s\n@b = f(@P.y)")
+    assert [p[0] for p in c.params] == ["amp"]
+    # Called once inside a zone loop: inlined (reruns don't count as calls).
+    c = compile_source("def f(a):\n    return a * 2\ns = 0.0\nfor i in range(20):\n    s += f(@P.x * i)\n@a = s")
+    assert "closure_call" not in kinds(c.writes[0][2])
+    # A while inside another loop warns about its cap.
+    assert "stops after 1000" in compile_source("for j in range(chi('m', 3)):\n    y = @P.x\n    while y < 100:\n"
+                                                "        y += 1\n    @a += y").warnings[0]
+    # After no iterations the loop variable keeps its value; defaults see the script's variables.
+    c = compile_source("i = 7\nfor i in range(chi('n', 0)):\n    @a += @P.x\n@b = i")
+    assert c.writes[1][2].node.kind == "switch"
+    w = writes("k = 1\ndef g(x, d=k):\n    return x + d\ndef f(k):\n    return g(k)\n@a = f(10)")
+    assert w["a"].const == 11.0
+
+
+def test_function_errors():
+    fails("def f(x):\n    if x > 0:\n        return 1\n@a = f(@P.x)", "every path")
+    fails("def f(x):\n    y = x\n@a = f(1)", "doesn't return a value")
+    fails("def f(n):\n    return f(n - 1)\n@a = f(@ptnum)", "too deeply")
+    fails("def f(x):\n    return x\n@a = f(1, 2)", "takes 1 argument")
+    fails("def f(x):\n    return x\n@a = f(y=2)", "no parameter 'y'")
+    fails("def f(x):\n    return x\n@a = f()", "missing the argument 'x'")
+    fails("@a = sin(x=1)", "no keyword arguments")
+    fails("def sin(x):\n    return x", "built-in")
+    fails("return 1", "inside a function")
+    fails("def f(a=1, b):\n    return a", "needs a default")
+    fails("@a = g(1)\ndef g(x):\n    return x", "unknown function")
+
+
+def test_for_repeat_zone():
+    # A loop whose values depend on the geometry is one Repeat Zone, not unrolled copies.
+    c = compile_source("x = @P.x\nfor i in range(64):\n    x = x + sin(x * 3 + i * 0.1) * 0.01\n@a = x")
+    out, zone = zone_of(c.writes[0][2])
+    assert zone.inputs[0].const == 64 and zone.params["items"] == ("float",)
+    assert zone.inputs[1].node.kind == "separate"  # starts at @P.x
+    # The body is built once: one sine in the whole program.
+    seen, stack, sines = set(), [out], 0
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        sines += n.kind == "math" and n.params.get("op") == "SINE"
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    assert sines == 1
+    # A count from a channel: ceil((stop - start) / step) iterations, never negative.
+    c = compile_source("n = chi('n', 5)\ns = 0.0\nfor i in range(2, n, 2):\n    s += @P.x * i\n@a = s")
+    out, zone = zone_of(c.writes[0][2])
+    clamp = zone.inputs[0].node  # min(max(count, 0), MAX_ZONE_ITERATIONS)
+    assert clamp.params["op"] == "MINIMUM" and clamp.inputs[0].node.params["op"] == "MAXIMUM"
+    # Attributes written in the loop are items too, and the write happens once, after it.
+    c = compile_source("for i in range(chi('n', 3)):\n    @P.y += 0.1\n    @w = @w + @P.y")
+    assert {name for name, _, _ in c.writes} == {"P", "w"}
+    assert len(c.stores) == 2 and all(st.value.node.kind == "repeat_out" for st in c.stores)
+    assert len({id(st.value.node) for st in c.stores}) == 1
+
+
+def test_for_item_types_widen():
+    c = compile_source("x = 0\nfor i in range(chi('n', 3)):\n    x += 0.5\n@a = x")
+    out, zone = zone_of(c.writes[0][2])
+    assert zone.params["items"] == ("float",)
+    c = compile_source("v = 0\nfor i in range(chi('n', 3)):\n    v = v + @N\n@a = v.x")
+    assert c.writes[0][2].node.inputs[0].node.params["zone"].params["items"] == ("vector",)
+
+
+def test_for_errors():
+    fails("n = @ptnum\nfor i in range(chi('m', 4)):\n    n += 1\n    for j in range(n):\n        @a += 1",
+          "can't depend on values an outer loop changes")
+    fails("break", "only be used inside a loop")
+    fails("for i in range(0, 9, chi('s', 1)):\n    pass", "step must be a fixed number")
+    fails("for i in range(1.5):\n    pass", "whole numbers")
+    fails("for i in range(chi('n', 3)):\n    y = @P.x\n@a = y", "only set inside the loop on line 1")
+    w = writes("for i in range(chi('n', 3)):\n    y = @P.x\n    @a = y")  # fine inside the loop
+    assert w["a"].node.kind == "repeat_out"
     fails("while True:\n    pass", "more than")
-    fails("while @P.x > 0:\n    pass", "compile time")
 
 
 def test_channels():
@@ -189,7 +442,7 @@ def test_errors():
     fails("v@a = (1, 2)", "three components")
     fails("@a = range(3)", "for-loop")
     fails("for i in (1, 2, 3):\n    pass", "range(")
-    fails("def f():\n    pass", "not supported")
+    fails("import math", "not supported")
     fails("@a = (1 +\n2", "never closed", 1)
 
 

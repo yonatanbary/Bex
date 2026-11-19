@@ -1,7 +1,7 @@
 """Turns a compiled BEX `Program` into real nodes inside a geometry node group."""
 
 from . import library
-from .lang.compiler import INPUT_SOCKETS
+from .lang.compiler import CHUNK_FIRST, CHUNK_GROWTH, INPUT_SOCKETS, TEMP_PREFIX, Val
 
 SOCKET_IDNAME = {"float": "NodeSocketFloat", "int": "NodeSocketInt", "vector": "NodeSocketVector", "bool": "NodeSocketBool"}
 ATTR_TYPE = {"float": "FLOAT", "int": "INT", "vector": "FLOAT_VECTOR", "bool": "BOOLEAN"}
@@ -143,12 +143,18 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
     def group_input(name):
         return next(s for s in group_in.outputs if s.identifier == idents[("INPUT", name)])
 
+    base = []  # the node's Geometry after the chunked loops built so far (they add hidden attributes)
+
     def geometry(n):
-        """Geometry input n: 0 is the node's Geometry, 1-3 are "Input 2"-"Input 4"."""
-        return group_input("Geometry" if n == 0 else INPUT_SOCKETS[n - 1])
+        """Geometry input n: 0 is the node's Geometry, 1-3 are "Input 2"-"Input 4".
+        Input 0 comes after the chunked loops, so a measurement can read their results."""
+        if n == 0:
+            return base[-1] if base else group_input("Geometry")
+        return group_input(INPUT_SOCKETS[n - 1])
 
     captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
     closures = {}  # shared ramp name -> its Closure Output
+    zones = {}  # repeat_in IRNode -> its Repeat Output node
 
     def connect(val, sock):
         if val.is_const:
@@ -333,11 +339,154 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             else:
                 connect(ins[0], n.inputs["W"])
             return [n.outputs[0], n.outputs[1]]
+        if kind == "stat":  # the largest value of a field over the incoming geometry (a per-element loop count)
+            n = new("GeometryNodeAttributeStatistic")
+            n.data_type = "FLOAT"
+            n.domain = p["domain"]
+            links.new(geometry(0), n.inputs["Geometry"])
+            connect(ins[0], n.inputs["Attribute"])
+            connect(ins[1], n.inputs["Selection"])
+            return [n.outputs["Max"]]
+        if kind == "repeat_in":  # a for-loop: both zone nodes; values changed in it are its items
+            zone_in, zone_out = new("GeometryNodeRepeatInput"), new("GeometryNodeRepeatOutput")
+            zone_in.pair_with_output(zone_out)
+            zone_out.repeat_items.clear()
+            for k, t in enumerate(p["items"]):
+                zone_out.repeat_items.new(SOCKET_TYPE[t], f"Item {k + 1}")
+            for v, sock in zip(ins, zone_in.inputs):  # Iterations, then the starting values
+                connect(v, sock)
+            zones[ir] = zone_out
+            return list(zone_in.outputs)  # Iteration, then the items
+        if kind == "closure_out":  # an own function called from several places, built once
+            zone_in, zone_out = new("NodeClosureInput"), new("NodeClosureOutput")
+            zone_in.pair_with_output(zone_out)
+            for k, t in enumerate(p["items"]):
+                zone_out.input_items.new(SOCKET_TYPE[t], f"Arg {k + 1}")
+            zone_out.output_items.new(SOCKET_TYPE[p["ret"]], "Result")
+            zone_out.label = zone_in.label = p["name"] + "()"
+            built[p["input"]] = list(zone_in.outputs)
+            connect(ins[0], zone_out.inputs[0])
+            return [zone_out.outputs[0]]
+        if kind == "closure_in":
+            raise RuntimeError("BEX builder: a closure's input is built by its closure_out")
+        if kind == "closure_call":
+            closure = p["closure"]
+            ev = new("NodeEvaluateClosure")
+            for k, t in enumerate(closure.params["items"]):
+                ev.input_items.new(SOCKET_TYPE[t], f"Arg {k + 1}")
+            ev.output_items.new(SOCKET_TYPE[closure.params["ret"]], "Result")
+            ev.label = closure.params["name"] + "()"
+            links.new(realize(closure)[0], ev.inputs[0])
+            for k, v in enumerate(ins):
+                connect(v, ev.inputs[k + 1])
+            return [ev.outputs[0]]
+        if kind == "chunk":
+            raise RuntimeError("BEX builder: a chunked loop is built by its chunk_end (Program.preludes)")
+        if kind == "repeat_out":
+            realize(p["zone"])
+            zone_out = zones[p["zone"]]
+            for v, sock in zip(ins, zone_out.inputs):
+                connect(v, sock)
+            return list(zone_out.outputs)
         raise RuntimeError(f"BEX builder: unknown IR node '{kind}'")
 
-    # -- geometry chain: capture the values that need it (Program.captures) on the
-    # *input* geometry, then one write node per Program.stores entry.
+    def store(geo, name, type, val, dom, selection=None):
+        n = new("GeometryNodeStoreNamedAttribute")
+        n.data_type = ATTR_TYPE[type]
+        n.domain = dom
+        n.inputs["Name"].default_value = name
+        links.new(geo, n.inputs["Geometry"])
+        if selection is not None:
+            links.new(selection, n.inputs["Selection"])
+        value = _enabled(n.inputs, "Value")[0]
+        if isinstance(val, Val):
+            connect(val, value)
+        else:  # a socket
+            links.new(val, value)
+        return n.outputs["Geometry"]
+
+    def read(name, type):
+        n = new("GeometryNodeInputNamedAttribute")
+        n.data_type = ATTR_TYPE[type]
+        n.inputs["Name"].default_value = name
+        return _enabled(n.outputs, "Attribute")[0]
+
+    def chunked_loop(end, geo):
+        """A loop that can end early (compiler._zone, `chunked`): an outer zone of
+        growing chunks. Each chunk runs the inner zone, then stores the items on the
+        geometry (all under shadow names first, so values that read each other stay
+        right, then copied back); once no element is running it is skipped."""
+        ch = end.params["chunk"]
+        p = ch.params
+        line_stack.append(ch.line)
+        for name, type, val in zip(p["names"], p["items"], ch.inputs):  # starting values
+            geo = store(geo, name, type, val, p["domain"])
+        zone_in, zone_out = new("GeometryNodeRepeatInput"), new("GeometryNodeRepeatOutput")
+        zone_in.pair_with_output(zone_out)
+        zone_out.repeat_items.clear()
+        zone_out.repeat_items.new("GEOMETRY", "Geometry")
+        zone_out.repeat_items.new("INT", "Offset")
+        zone_in.inputs["Iterations"].default_value = p["count"]
+        links.new(geo, zone_in.inputs["Geometry"])
+        # this chunk's size: floor(CHUNK_FIRST * CHUNK_GROWTH ^ chunk)
+        grow = new("ShaderNodeMath")
+        grow.operation = "POWER"
+        grow.inputs[0].default_value = CHUNK_GROWTH
+        links.new(zone_in.outputs["Iteration"], grow.inputs[1])
+        size = new("ShaderNodeMath")
+        size.operation = "MULTIPLY"
+        links.new(grow.outputs[0], size.inputs[0])
+        size.inputs[1].default_value = CHUNK_FIRST
+        floor = new("ShaderNodeMath")
+        floor.operation = "FLOOR"
+        links.new(size.outputs[0], floor.inputs[0])
+        built[ch] = [floor.outputs[0], zone_in.outputs["Offset"]]
+        inside = zone_in.outputs["Geometry"]
+        # Only elements still running (the loop's break flag unset) are worked on and stored.
+        flag = p["names"][end.params["flag"]]
+        running = new("FunctionNodeBooleanMath")
+        running.operation = "NOT"
+        links.new(read(flag, "bool"), running.inputs[0])
+        stepped = inside
+        for name, type, val in zip(p["names"], p["items"], end.inputs):
+            stepped = store(stepped, name + "~", type, val, p["domain"], running.outputs[0])
+        order = sorted(range(len(p["names"])), key=lambda k: p["names"][k] == flag)  # the flag last
+        for k in order:
+            name, type = p["names"][k], p["items"][k]
+            stepped = store(stepped, name, type, read(name + "~", type), p["domain"], running.outputs[0])
+        # still running anywhere (in the Group)?
+        stat = new("GeometryNodeAttributeStatistic")
+        stat.data_type = "FLOAT"
+        stat.domain = p["domain"]
+        links.new(inside, stat.inputs["Geometry"])
+        links.new(running.outputs[0], stat.inputs["Attribute"])
+        connect(end.inputs[-1], stat.inputs["Selection"])
+        any_running = new("FunctionNodeCompare")
+        any_running.data_type = "FLOAT"
+        any_running.operation = "GREATER_THAN"
+        links.new(stat.outputs["Max"], _enabled(any_running.inputs, "A")[0])
+        _enabled(any_running.inputs, "B")[0].default_value = 0.5
+        skip = new("GeometryNodeSwitch")
+        skip.input_type = "GEOMETRY"
+        links.new(any_running.outputs[0], _enabled(skip.inputs, "Switch")[0])
+        links.new(inside, _enabled(skip.inputs, "False")[0])
+        links.new(stepped, _enabled(skip.inputs, "True")[0])
+        links.new(_enabled(skip.outputs, "Output")[0], zone_out.inputs["Geometry"])
+        offset = new("FunctionNodeIntegerMath")
+        offset.operation = "ADD"
+        links.new(zone_in.outputs["Offset"], offset.inputs[0])
+        links.new(floor.outputs[0], offset.inputs[1])
+        links.new(offset.outputs[0], zone_out.inputs["Offset"])
+        line_stack.pop()
+        return zone_out.outputs["Geometry"]
+
+    # -- geometry chain: chunked loops first (they leave their results on the
+    # geometry as hidden attributes), then capture the values that need it
+    # (Program.captures), then one write node per Program.stores entry.
     geo = group_input("Geometry")
+    for end in program.preludes:
+        geo = chunked_loop(end, geo)
+        base.append(geo)
     if program.captures:
         cap = new("GeometryNodeCaptureAttribute")
         cap.domain = domain
@@ -369,6 +518,12 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             connect(st.selection, n.inputs["Selection"])
         geo = n.outputs["Geometry"]
 
+    if program.preludes:  # the chunked loops' hidden attributes
+        n = new("GeometryNodeRemoveAttribute")
+        n.inputs["Pattern Mode"].default_value = "Wildcard"  # a menu socket in 5.2, not a property
+        n.inputs["Name"].default_value = TEMP_PREFIX + "*"
+        links.new(geo, n.inputs["Geometry"])
+        geo = n.outputs["Geometry"]
     links.new(geo, next(s for s in group_out.inputs if s.identifier == idents[("OUTPUT", "Geometry")]))
     _split_group_inputs(tree, group_in, line_of)
     _layout(tree, group_in, line_of, program.source, program.group_source)
@@ -439,6 +594,12 @@ BUTTON_ROWS = {
     "GeometryNodeSampleIndex": 3,
     "GeometryNodeSampleNearest": 1,
     "GeometryNodeAttributeStatistic": 2,
+    "GeometryNodeRepeatInput": 0,
+    "GeometryNodeRemoveAttribute": 1,
+    "NodeClosureInput": 0,
+    "NodeClosureOutput": 0,
+    "NodeEvaluateClosure": 0,
+    "GeometryNodeRepeatOutput": 0,
 }
 
 
@@ -461,6 +622,9 @@ def _layout(tree, group_in, line_of, source, group_source=""):
     feeds = {}
     for link in tree.links:
         feeds.setdefault(link.from_node.name, set()).add(link.to_node.name)
+    for n in nodes:  # a zone's input sits left of its output even when no item passes straight through
+        if n.bl_idname in ("GeometryNodeRepeatInput", "NodeClosureInput") and n.paired_output:
+            feeds.setdefault(n.name, set()).add(n.paired_output.name)
     depth = {}
 
     def get_depth(name):

@@ -12,7 +12,7 @@ KINDS = ("comment", "string", "number", "attr", "type", "keyword", "function",
          "channel", "constant", "operator", "punct", "ident", "text")
 
 TYPES = frozenset({"float", "int", "vector", "bool"})
-KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "pass", "and", "or", "not", "True", "False"})
+KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "pass", "break", "continue", "def", "return", "and", "or", "not", "True", "False"})
 CONSTANTS = frozenset(_CONSTANT_VALUES)
 
 _TOKEN_RE = re.compile(
