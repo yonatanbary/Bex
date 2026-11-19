@@ -170,18 +170,28 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
     def draw_channels(self, layout):
         """The ch*() inputs as fields above the code, like a wrangle's parameters.
         The sockets stay linkable; a linked one is shown greyed out."""
-        chans = self.channels()
-        if not chans:
-            return False
-        col = layout.column(align=True)
-        for sock in chans:
-            row = col.row(align=True)
-            if sock.is_linked:
-                row.active = False
-                row.label(text=sock.name, icon="LINKED")
-            else:
-                row.prop(sock, "default_value", text=sock.name)
-        return True
+        chans, ramps = self.channels(), self.ramps()
+        if chans:
+            col = layout.column(align=True)
+            for sock in chans:
+                row = col.row(align=True)
+                if sock.is_linked:
+                    row.active = False
+                    row.label(text=sock.name, icon="LINKED")
+                else:
+                    row.prop(sock, "default_value", text=sock.name)
+        for name in ramps:  # Blender's own curve editor, on the node inside
+            layout.label(text=name)
+            layout.template_curve_mapping(builder.ramp_node(self.node_tree, name), "mapping")
+        return bool(chans or ramps)
+
+    def ramps(self):
+        """The chramp() names of the last good compile that have a ramp node."""
+        try:
+            names = json.loads(self.info).get("ramps", []) if self.info else []
+        except ValueError:
+            names = []
+        return [n for n in names if builder.ramp_node(self.node_tree, n) is not None]
 
     def _key(self, src):
         digest = hashlib.md5(f"{self.group}\0{src}".encode()).hexdigest()
@@ -205,8 +215,8 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             return
         name = self.script.name if self.script else "(no script)"
         try:
-            program = compile_source(src, self.domain, pending_line, [s.name for s in self.channels()],
-                                     group=self.group)
+            known = [s.name for s in self.channels()] + self.ramps()
+            program = compile_source(src, self.domain, pending_line, known, group=self.group)
             if program.pending:
                 key += "|pending"
             if key == self.compiled_key and not force and self.node_tree:
@@ -250,6 +260,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             "reads": [[n, t] for n, t in program.reads],
             "writes": [[n, t] for n, t, _ in program.writes],
             "nodes": count,
+            "ramps": program.ramps,
         })
         _log(f"{name}: compiled to {count} nodes ({len(program.writes)} attributes written, {len(program.params)} inputs)")
         _redraw()

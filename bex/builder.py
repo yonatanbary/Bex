@@ -19,6 +19,13 @@ INPUT_NODES = {
     "vertex_of_corner": "GeometryNodeVertexOfCorner",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
+RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node holding that ramp's shape
+
+
+def ramp_node(tree, name):
+    """The Float Curve node that holds chramp(`name`)'s shape, or None."""
+    n = tree.nodes.get(RAMP_PREFIX + name) if tree else None
+    return n if n is not None and n.bl_idname == "ShaderNodeFloatCurve" else None
 
 
 def _enabled(sockets, name):
@@ -101,14 +108,21 @@ def build(tree, program, domain, keep_stale=False):
     """
     created = sync_interface(tree, program, keep_stale)
     nodes, links = tree.nodes, tree.links
-    nodes.clear()
+    # Everything goes except the ramps still in use: their nodes hold the curves
+    # drawn on the wrangle, so they survive the rebuild (unused ones too while a
+    # line is pending, like the inputs).
+    keep = {RAMP_PREFIX + r for r in program.ramps}
+    for n in list(nodes):
+        ramp = n.bl_idname == "ShaderNodeFloatCurve" and n.name.startswith(RAMP_PREFIX)
+        if not (ramp and (keep_stale or n.name in keep)):
+            nodes.remove(n)
     group_in = nodes.new("NodeGroupInput")
     group_out = nodes.new("NodeGroupOutput")
     group_out.is_active_output = True
     idents = {(i.in_out, i.name): i.identifier for i in tree.interface.items_tree if i.item_type == "SOCKET"}
     built = {}  # IRNode -> [output sockets]
     # Node name -> source line it belongs to. None is the geometry chain along the top.
-    line_of = {group_in.name: None, group_out.name: None}
+    line_of = {n.name: None for n in nodes}  # the kept ramps, until they are used
     line_stack = [None]  # source line of the expression being built
 
     def new(idname):
@@ -124,6 +138,7 @@ def build(tree, program, domain, keep_stale=False):
         return group_input("Geometry" if n == 0 else INPUT_SOCKETS[n - 1])
 
     captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
+    closures = {}  # shared ramp name -> its Closure Output
 
     def connect(val, sock):
         if val.is_const:
@@ -264,6 +279,34 @@ def build(tree, program, domain, keep_stale=False):
             links.new(geometry(p["input"]), n.inputs["Geometry"])
             n.inputs["Attribute"].default_value = 1.0
             return [n.outputs["Sum"]]
+        if kind == "ramp":
+            name = p["name"]
+            curve = ramp_node(tree, name)
+            if curve is None:  # a new ramp starts as Blender's default: a straight 0-1 line
+                curve = nodes.new("ShaderNodeFloatCurve")
+                curve.name = curve.label = RAMP_PREFIX + name
+            if name not in program.shared_ramps:
+                line_of[curve.name] = line_stack[-1]
+                connect(ins[0], curve.inputs["Value"])
+                return [curve.outputs[0]]
+            # Read at several positions: the one curve sits in a closure zone, and
+            # each position is an Evaluate Closure of it, so the shape stays in one node.
+            closure = closures.get(name)
+            if closure is None:
+                line_of[curve.name] = line_stack[-1]
+                zone_in, closure = new("NodeClosureInput"), new("NodeClosureOutput")
+                zone_in.pair_with_output(closure)
+                closure.input_items.new("FLOAT", "Value")
+                closure.output_items.new("FLOAT", "Result")
+                links.new(zone_in.outputs[0], curve.inputs["Value"])
+                links.new(curve.outputs[0], closure.inputs[0])
+                closures[name] = closure
+            ev = new("NodeEvaluateClosure")
+            ev.input_items.new("FLOAT", "Value")
+            ev.output_items.new("FLOAT", "Result")
+            links.new(closure.outputs[0], ev.inputs[0])
+            connect(ins[0], ev.inputs[1])
+            return [ev.outputs[0]]
         if kind == "noise":
             n = new("ShaderNodeTexNoise")
             n.noise_dimensions = "3D"
@@ -365,6 +408,7 @@ BUTTON_ROW = 25.0
 
 # Rows of buttons each node draws above its sockets.
 BUTTON_ROWS = {
+    "ShaderNodeFloatCurve": 9,  # the curve widget
     "ShaderNodeMath": 2,
     "ShaderNodeVectorMath": 1,
     "FunctionNodeIntegerMath": 1,

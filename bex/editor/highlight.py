@@ -6,7 +6,7 @@ BEX is line-based like Python (``#`` comments, no block comments), so lines are 
 
 import re
 
-from ..lang.compiler import CHANNELS, CONSTANTS as _CONSTANT_VALUES, FUNCTION_NAMES
+from ..lang.compiler import CHANNELS, RAMPS, CONSTANTS as _CONSTANT_VALUES, FUNCTION_NAMES
 
 KINDS = ("comment", "string", "number", "attr", "type", "keyword", "function",
          "channel", "constant", "operator", "punct", "ident", "text")
@@ -36,7 +36,7 @@ def _ident_kind(line, word, end):
         return "type"
     if word in KEYWORDS:
         return "keyword"
-    if word in CHANNELS:
+    if word in CHANNELS or word in RAMPS:
         return "channel"
     if word in CONSTANTS:
         return "constant"

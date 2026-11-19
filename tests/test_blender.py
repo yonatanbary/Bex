@@ -45,6 +45,10 @@ def original_points(obj):
     return [tuple(v.co) for v in obj.data.vertices]
 
 
+def attr(mesh, name):
+    return [d.value for d in mesh.attributes[name].data]
+
+
 def close(a, b, eps=1e-4):
     return all(abs(x - y) < eps for x, y in zip(a, b))
 
@@ -499,6 +503,54 @@ def test_channels_are_properties():
     text.from_string('@P.z = chf("amp", 0.5) + chf("lift", 1)')
     node.sync()
     assert node.inputs["amp"].hide and node.inputs["lift"].hide
+
+
+def test_chramp_keeps_its_shape():
+    from bex import builder
+    obj, node, text = make_setup('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    assert node.error == "" and node.ramps() == ["lift"]
+    ramp = builder.ramp_node(node.node_tree, "lift")
+    # A new ramp is a straight 0-1 line: x = -1..1 gives z = 0..1.
+    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [0, 0.25, 0.5, 0.75, 1])
+    # Shape it: flat at 0.3.
+    curve = ramp.mapping.curves[0]
+    curve.points[0].location = (0, 0.3)
+    curve.points[1].location = (1, 0.3)
+    ramp.mapping.update()
+    node.node_tree.update_tag()
+    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [0.3] * 5)
+    # A recompile keeps the ramp node, and with it the shape.
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5) + chf("up", 1)')
+    node.sync()
+    assert builder.ramp_node(node.node_tree, "lift") == ramp
+    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [1.3] * 5)
+    # A duplicated wrangle copies its node group (BexWrangleNode.copy), so it
+    # gets its own ramp with the same shape.
+    dup = node.node_tree.copy()
+    assert builder.ramp_node(dup, "lift") != ramp
+    assert builder.ramp_node(dup, "lift").mapping.curves[0].points[0].location[1] == pytest_approx(0.3)
+    bpy.data.node_groups.remove(dup)
+    # Read at two positions (like Houdini): still one ramp node, so one shape.
+    text.from_string('f@a = chramp("lift", @P.x * 0.5 + 0.5)\nf@b = chramp("lift", @P.y * 0.5 + 0.5)')
+    node.sync()
+    assert node.error == "" and builder.ramp_node(node.node_tree, "lift") == ramp
+    curve.points.new(0.5, 1.0)  # a peak in the middle: 0.3 at the ends, 1 at 0.5
+    ramp.mapping.update()
+    node.node_tree.update_tag()
+    mesh = evaluate(obj)
+    for v, a, b in zip(mesh.vertices, attr(mesh, "a"), attr(mesh, "b")):
+        assert abs(a - ramp.mapping.evaluate(curve, v.co.x * 0.5 + 0.5)) < 1e-3
+        assert abs(b - ramp.mapping.evaluate(curve, v.co.y * 0.5 + 0.5)) < 1e-3
+    # Dragging a point re-evaluates live: the draw handler sees the new shape.
+    from bex import code_editor as ce
+    ce.check_ramps(node)  # the first look only remembers the shape
+    assert not ce.check_ramps(node)
+    curve.points[0].location = (0, 0.6)
+    assert ce.check_ramps(node) and not ce.check_ramps(node)
+    # Removed from the script: the ramp node goes.
+    text.from_string("@P.z = 2")
+    node.sync()
+    assert builder.ramp_node(node.node_tree, "lift") is None and node.ramps() == []
 
 
 def test_group():

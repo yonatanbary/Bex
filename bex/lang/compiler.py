@@ -52,6 +52,8 @@ class Program:
     writes: list = field(default_factory=list)  # [(attribute, type, Val)] in script order
     source: list = field(default_factory=list)  # script lines, used to label the generated nodes
     pending: list = field(default_factory=list)  # ch*() names held back on the line being edited
+    ramps: list = field(default_factory=list)  # chramp() names, first-use order
+    shared_ramps: set = field(default_factory=set)  # ramps read at more than one position
     reads: list = field(default_factory=list)  # [(attribute, type)] read from the incoming geometry
     group: object = None  # Val (bool) choosing the elements to write, None = all
     group_source: str = ""  # the Group expression, used to label its nodes
@@ -213,6 +215,7 @@ COMPARE = {
     "!=": ("NOT_EQUAL", lambda a, b: a != b),
 }
 CHANNELS = {"chf": "float", "chi": "int", "chv": "vector", "chb": "bool"}
+RAMPS = {"chramp": "float"}  # a ramp on the node (a Float Curve), looked up at a 0-1 position
 # Bounding box of the geometry that entered the node. The optional first argument
 # is the input number, as in VEX (only input 0 exists).
 BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox")
@@ -226,7 +229,7 @@ COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # n
 INPUT_SOCKETS = tuple(f"Input {n + 1}" for n in range(1, MAX_INPUT + 1))
 OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
 
-FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset({
+FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset(RAMPS) | frozenset({
     "log", "log10", "clamp", "lerp", "mix", "fit", "efit", "fit01", "fit11", "smoothstep",
     "length", "normalize", "dot", "cross", "distance", "set", "vector", "float", "bool", "int",
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
@@ -304,6 +307,7 @@ SIGNATURES = {
     "chi": (("name", "[default]"), "A whole number value on the node."),
     "chv": (("name", "[default]"), "A vector value on the node."),
     "chb": (("name", "[default]"), "A checkbox on the node."),
+    "chramp": (("name", "position"), "A ramp drawn on the node, read at position 0 to 1."),
     # Bounding box
     "getbbox_min": (("[input]",), "Lowest corner of the geometry's bounding box."),
     "getbbox_max": (("[input]",), "Highest corner of the geometry's bounding box."),
@@ -340,6 +344,7 @@ class Compiler:
         self.attr_types = {}  # attribute name -> type, fixed on first use
         self.written = []  # attribute names in first-write order
         self.params = {}  # channel name -> (type, default)
+        self.ramps = {}  # chramp() name -> {position Val} it is read at
         self.line = 0  # line used for error messages
         self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
         self.bare_attributes = False
@@ -592,9 +597,28 @@ class Compiler:
             self.params[label] = (type, default.const)
         return self.node("param", type, (), name=label)
 
+    def ramp(self, name, args):
+        if not args or args[0].kind != "str":
+            raise self.err(f'{name}() needs a name in quotes, e.g. {name}("falloff", u)')
+        if len(args) != 2:
+            raise self.err(f"{name}() takes a name and a position, e.g. {name}(\"falloff\", u)")
+        label = args[0].value.strip()
+        if not label:
+            raise self.err(f"'{label}' cannot be used as a {name}() name")
+        pos = self.conv(self.eval(args[1]), "float")
+        if args[0].line == self.pending_line and label not in self.known_params and label not in self.ramps:
+            # Still being typed: act as the default (straight) ramp, and make no node yet.
+            if label not in self.pending:
+                self.pending.append(label)
+            return pos
+        self.ramps.setdefault(label, set()).add(pos)
+        return self.node("ramp", RAMPS[name], (pos,), name=label)
+
     def call(self, name, arg_nodes):
         if name in CHANNELS:
             return self.channel(name, arg_nodes)
+        if name in RAMPS:
+            return self.ramp(name, arg_nodes)
         if name in SAMPLE_FUNCS:
             return self.sample_call(name, arg_nodes)
         a = [self.eval(x) for x in arg_nodes]
@@ -908,6 +932,7 @@ class Compiler:
 
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
+                       ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
                        reads=list(self.reads), inputs=sorted(self.inputs))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]

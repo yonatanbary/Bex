@@ -112,6 +112,23 @@ def test_channels():
     fails("@a = chf(1)", "name in quotes")
 
 
+def test_chramp():
+    p = compile_source('@a = chramp("falloff", @P.x)\n@b = chramp("falloff", @P.x) * 2')
+    assert p.ramps == ["falloff"] and p.params == []
+    a = {n: v for n, _, v in p.writes}["a"]
+    assert a.type == "float" and a.node.kind == "ramp" and a.node.params == {"name": "falloff"}
+    assert p.shared_ramps == set()
+    # Read at two positions: one ramp, shared (a closure in the builder).
+    p = compile_source('@a = chramp("r", @P.x)\n@b = chramp("r", @P.z)')
+    assert p.ramps == ["r"] and p.shared_ramps == {"r"}
+    fails('@a = chramp(1, @P.x)', "name in quotes")
+    fails('@a = chramp("r")', "a name and a position")
+    # A new ramp on the line being typed acts as a straight ramp and makes no node yet.
+    p = compile_source('@a = chramp("fal", @P.x)', pending_line=1)
+    assert p.ramps == [] and p.pending == ["fal"]
+    assert compile_source('@a = chramp("fal", @P.x)', pending_line=1, known_params={"fal"}).ramps == ["fal"]
+
+
 def test_cse():
     w = writes("@a = sin(@P.x) + sin(@P.x)")
     a, b = w["a"].node.inputs
