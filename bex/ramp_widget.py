@@ -24,6 +24,7 @@ STRIP_H = 34.0       # folded: a strip, still editable by dragging
 MARKER_H = 16.0      # the row of position markers under the graph
 MARKER_GAP = 4.0     # between the graph's bottom edge and a marker's tip
 KEY_R = 4.0          # key dot radius
+ARROW_W = 3.0        # half width of the triangle drawn for a point whose value is past 0-1
 HIT_R = 8.0          # how close a press must be to grab a key or marker
 MARKER_W = 5.0       # half width of a marker
 TOGGLES_W = 40.0     # the 2x2 button grid left of the graph (add / delete, point fields / fold)
@@ -308,9 +309,11 @@ def draw_layout(layout, node, ramp, field):
     if ramp.show_point and ramp.keys:
         key = ramp.keys[min(ramp.selected, len(ramp.keys) - 1)]
         field(layout, node, "Point No.", 80).prop(ramp, "point", text="")
-        field(layout, node, "Position").prop(key, "position", text="", slider=True)
-        field(layout, node, "Value").prop(key, "value", text="", slider=True)
-        field(layout, node, "Interpolation", 130).prop(key, "interpolation", text="")
+        fields = layout.column()
+        fields.enabled = len(selected_indices(ramp)) < 2  # with several points selected the fields are read-only
+        field(fields, node, "Position").prop(key, "position", text="", slider=True)
+        field(fields, node, "Value").prop(key, "value", text="", slider=True)
+        field(fields, node, "Interpolation", 130).prop(key, "interpolation", text="")
 
 
 def _row_sizes():
@@ -387,6 +390,17 @@ def _dot(x, y, r, color, segments=12):
     _tris([p for a, b in zip(ring, ring[1:]) for p in ((x, y), a, b)], color)
 
 
+def _arrow(x, y, direction, px, color):
+    """A point whose value is off the graph: a triangle with its tip on the edge at
+    (x, y), pointing up (direction 1, above 1) or down (-1, below 0), outlined like a dot."""
+    def tri(w, inset):
+        tip = y - direction * inset
+        base = tip - direction * 2 * w
+        return [(x, tip), (x - w, base), (x + w, base)]
+    _tris(tri((ARROW_W + 1.0) * px, 0.0), PALETTE["key_edge"])
+    _tris(tri(ARROW_W * px, 1.0 * px), color)
+
+
 def _draw_label(region, text, at, px):
     """The ramp's name at baseline `at`, in the UI font, drawn twice for a bold look."""
     x, y = at
@@ -433,9 +447,13 @@ def draw_node(node, region, vx, vy):
         if not ce._clip(region, vx, vy, graph[0] - r, graph[1] - r, graph[2] + r, graph[3] + r):
             continue
         for i, (x, y, _interp) in enumerate(keys):
-            cx, cy = _to_px(graph, x, y)
-            _dot(cx, cy, (KEY_R + 1) * px, PALETTE["key_edge"])
-            _dot(cx, cy, KEY_R * px, PALETTE["selected" if picked[i] else "key"])
+            cx, cy = _to_px(graph, x, _clamp01(y))
+            color = PALETTE["selected" if picked[i] else "key"]
+            if 0.0 <= y <= 1.0:
+                _dot(cx, cy, (KEY_R + 1) * px, PALETTE["key_edge"])
+                _dot(cx, cy, KEY_R * px, color)
+            else:  # off the graph: a triangle on its edge, pointing to where the point is
+                _arrow(cx, cy, 1.0 if y > 1.0 else -1.0, px, color)
         # Position markers under the graph.
         gpu.state.scissor_test_set(False)
         w = MARKER_W * px
@@ -488,6 +506,14 @@ def ramp_at(context, x, y):
     return None
 
 
+def _clamp01(v):
+    return min(max(v, 0.0), 1.0)
+
+
+def _inside(rect, x, y):
+    return rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]
+
+
 def _segment_interpolation(keys, x):
     """The interpolation of the stretch containing x (a new key there keeps the shape's style)."""
     before = [k for k in sorted(keys) if k[0] <= x]
@@ -511,9 +537,14 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         x, y = event.mouse_region_x, event.mouse_region_y
         hit = ramp_at(context, x, y)
         tree = getattr(context.space_data, "edit_tree", None)
-        if hit is None:  # a click anywhere else clears the points' selection
-            if tree is not None and deselect_tree(tree):
-                ce._redraw(context)
+        if hit is None:
+            # A click outside the node clears the points' selection. On the node it
+            # is kept: its buttons (delete, the point fields) act on the selection.
+            if tree is not None:
+                keep = [r for n in tree.nodes for r in getattr(n, "bex_ramps", ())
+                        if selected_indices(r) and _inside(ce.node_rect(n, context.region), x, y)]
+                if deselect_tree(tree, keep=keep[0] if keep else None):
+                    ce._redraw(context)
             return {"PASS_THROUGH"}
         node, ramp, graph, markers, px = hit
         deselect_tree(node.id_data, keep=ramp)
@@ -524,7 +555,7 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         # nearest marker and drags only the position.
         grab, best = None, HIT_R * px
         for i, (kx, ky, _interp) in enumerate(keys):
-            cx, cy = _to_px(graph, kx, ky)
+            cx, cy = _to_px(graph, kx, _clamp01(ky))
             d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
             if d <= best:
                 grab, best = i, d
@@ -583,7 +614,9 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
             # The selection moves as one: the move stops where its first point hits an edge.
             ps, vs = [p for p, _v in self.start.values()], [v for _p, v in self.start.values()]
             dx = min(max(dx, -min(ps)), 1.0 - max(ps))
-            dy = min(max(dy, -min(vs)), 1.0 - max(vs))
+            inside = [v for v in vs if 0.0 <= v <= 1.0]  # values past 0-1 (typed) don't stop it
+            if inside:
+                dy = min(max(dy, -min(inside)), 1.0 - max(inside))
             global _quiet
             _quiet = True
             try:

@@ -276,6 +276,15 @@ def box_rect(node, region):
     return round(x0 + SIDE * px), round(y0), round(x1 - SIDE * px), round(y1), px
 
 
+def node_rect(node, region):
+    """(x0, y0, x1, y1) of the whole node in region pixels."""
+    s = _ui_scale()
+    ox, oy, zoom = _view_map(region)
+    loc = node.location_absolute
+    x0, y1 = (loc.x * s - ox) * zoom, (loc.y * s - oy) * zoom
+    return x0, y1 - node.dimensions.y * zoom, x0 + node.width * s * zoom, y1
+
+
 def node_top(node, region):
     """(y, zoom): the node's top edge in region pixels, and region pixels per
     Blender pixel (node-editor view units, which already include the UI scale)."""

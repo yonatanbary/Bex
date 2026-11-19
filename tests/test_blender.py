@@ -574,6 +574,10 @@ def test_ramp_actions():
     assert ramp.selected == 1
     ramp.point = 9
     assert ramp.selected == 1  # clamped to the last point
+    # Values may go past 0-1 (typed in the field); the curve isn't clipped.
+    ramp_widget.set_keys(node, ramp, [(0.0, -1.0, "LINEAR"), (1.0, 2.0, "LINEAR")])
+    zs = sorted(v.co.z for v in evaluate(obj).vertices)
+    assert zs[0] == pytest_approx(-1.0) and zs[-1] == pytest_approx(2.0), zs
 
 
 def test_ramp_mouse_editing():
@@ -583,8 +587,9 @@ def test_ramp_mouse_editing():
     ramp = node.bex_ramps["r"]
     ramp.expanded = True
     # No Node Editor in background: put the code box at a known place.
-    box_rect, node_top, shows_code = ce.box_rect, ce.node_top, ce._shows_code
+    box_rect, node_top, node_rect, shows_code = ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code
     ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce.node_rect = lambda n, r: (-10, -50, 210, 600)
     ce.node_top = lambda n, r: (600.0, 1.0)
     ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
     try:
@@ -662,13 +667,15 @@ def test_ramp_mouse_editing():
         assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
         release()
         assert rw.selected_indices(ramp) == [0]
+        # On the node (its delete button, point fields) the selection stays.
+        assert op.invoke(ctx, event(100, 50)) == {"PASS_THROUGH"} and rw.selected_indices(ramp) == [0]
         assert op.invoke(ctx, event(-500, -500)) == {"PASS_THROUGH"} and rw.selected_indices(ramp) == []
         # The last point can't be deleted.
         assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
         release()
         assert delete.invoke(ctx, event(0, 0)) == {"FINISHED"} and len(ramp.keys) == 1
     finally:
-        ce.box_rect, ce.node_top, ce._shows_code = box_rect, node_top, shows_code
+        ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code = box_rect, node_top, node_rect, shows_code
 
 
 def test_group():

@@ -88,6 +88,8 @@ Units are node-editor units at zoom 1, before UI scale.
 | The geometry reaching a socket can't be read from Python | a static guess from the node graph | `upstream.py` |
 | `view_to_region` returns whole pixels (the box jumps while zooming) | our own float view mapping | `code_editor._view_map` |
 | `DOUBLE_CLICK` events arrive unreliably | clicks are counted by the operator | `code_editor` (`Session.clicks`) |
+| The active tool's keymap ("Node Tool: Tweak / Select Box / Select Lasso / Select Circle", each also "(fallback)") is checked before "Node Editor", and its Shift-click `node.select` (toggle) doesn't pass through | the ramp's click item is added to those tool keymaps too (add-on items run before Blender's in the same keymap) | `node.register` |
+| The Mac key labelled "delete" sends `BACK_SPACE`, not `DEL` | ramp point delete is bound to both | `node.register` |
 | The Float Curve widget updates only on mouse release | moot: our ramp widget writes the curve on every move | `ramp_widget.write_curve` |
 
 ## Drawing quirks

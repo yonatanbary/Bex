@@ -526,8 +526,18 @@ def register():
         # any=True: Shift-click (range) and Ctrl+click (delete) must reach it too.
         _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_edit.bl_idname, "LEFTMOUSE", "PRESS",
                                                  any=True)))
+        # The active tool's keymap is checked before "Node Editor", and its Shift-click
+        # node.select (toggle) doesn't pass through, so the ramp item goes there too.
+        # Within one keymap, add-on items run before Blender's own.
+        for tool in ("Tweak", "Select Box", "Select Lasso", "Select Circle"):
+            for suffix in ("", " (fallback)"):
+                tkm = kc.keymaps.new(name=f"Node Tool: {tool}{suffix}", space_type="NODE_EDITOR",
+                                     region_type="WINDOW", tool=True)
+                _keymaps.append((tkm, tkm.keymap_items.new(ramp_widget.BEX_OT_ramp_edit.bl_idname,
+                                                           "LEFTMOUSE", "PRESS", any=True)))
         # Delete / X delete the selected ramp points, never the node (they pass through when none are).
-        for key in ("DEL", "X"):
+        # BACK_SPACE is the key labelled "delete" on a Mac keyboard.
+        for key in ("DEL", "BACK_SPACE", "X"):
             _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_delete.bl_idname, key, "PRESS")))
         # A click on a wrangle's code starts the editor; elsewhere it passes through.
         _keymaps.append((km, km.keymap_items.new(code_editor.BEX_OT_code_edit.bl_idname, "LEFTMOUSE", "PRESS")))
