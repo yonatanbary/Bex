@@ -1,5 +1,6 @@
 """Pure-Python tests for chramp() ramps (bex/ramp.py).  Run: python3 tests/test_ramp.py"""
 
+import math
 import sys
 import types
 from pathlib import Path
@@ -10,8 +11,8 @@ _pkg = types.ModuleType("bex")
 _pkg.__path__ = [str(_BEX)]
 sys.modules.setdefault("bex", _pkg)
 
-from bex.ramp import (DEFAULT_KEYS, PRESETS, STEP, evaluate, invert, polyline,  # noqa: E402
-                      reverse)
+from bex.ramp import (DEFAULT_KEYS, PRESETS, STEP, anchor_of, bezier_delete, bezier_insert,  # noqa: E402
+                      evaluate, from_bezier, handles_of, invert, is_anchor, polyline, reverse, to_bezier)
 
 
 def near(a, b, eps=1e-3):
@@ -88,6 +89,11 @@ def test_presets():
     assert near(evaluate(PRESETS["Valley"], 0.5), 0)
     assert near(evaluate(PRESETS["Steps"], 0.3), 1 / 3) and near(evaluate(PRESETS["Steps"], 0.9), 1)
     assert evaluate(PRESETS["Round"], 0.5) < 0.25 < evaluate(PRESETS["Sharp"], 0.5)
+    # Round and Sharp are quarter circles, each the other turned half around.
+    for i in range(1, 100):
+        x = i / 100
+        assert near(evaluate(PRESETS["Round"], x), 1 - math.sqrt(1 - x * x), 2e-3), x
+        assert near(evaluate(PRESETS["Sharp"], x), 1 - evaluate(PRESETS["Round"], 1 - x), 1e-3), x
 
 
 def test_reverse_and_invert():
@@ -121,6 +127,55 @@ def test_matches_houdini():
         if worst > 2e-3:
             wrong.append(f"{case['name']} / {case['mode']}: off by up to {worst:.4f}")
     assert not wrong, "differs from Houdini:\n  " + "\n  ".join(wrong)
+
+
+ROUND_BEZIER = ((0.0, 0.0, "BEZIER"), (0.8, 0.0, "BEZIER"), (0.9, 0.0, "BEZIER"), (1.0, 1.0, "BEZIER"))  # Houdini's Round
+
+
+def test_bezier_roles():
+    # 7 keys: anchors 0, 3, 6; handles 1, 2 hang off 0 and 3, handles 4, 5 off 3 and 6.
+    assert [i for i in range(7) if is_anchor(i, 7)] == [0, 3, 6]
+    assert [anchor_of(i, 7) for i in range(7)] == [0, 0, 3, 3, 3, 6, 6]
+    assert handles_of(3, 7) == [2, 4] and handles_of(0, 7) == [1] and handles_of(6, 7) == [5]
+
+
+def test_to_bezier_keeps_the_shape():
+    for mode in ("LINEAR", "CATMULL_ROM", "MONOTONE_CUBIC"):
+        keys = [(0.0, 0.2, mode), (0.3, 0.9, mode), (0.7, 0.1, mode), (1.0, 0.6, mode)]
+        b = to_bezier(keys)
+        assert len(b) == 10 and all(i == "BEZIER" for _, _, i in b)
+        for x in (0.05, 0.2, 0.5, 0.65, 0.9):
+            assert near(evaluate(b, x), evaluate(keys, x), 2e-3), (mode, x, evaluate(b, x), evaluate(keys, x))
+    back = from_bezier(to_bezier(keys), "LINEAR")
+    assert [(round(p, 6), round(v, 6)) for p, v, _ in back] == [(p, v) for p, v, _ in keys]
+
+
+def test_bezier_insert_keeps_the_shape():
+    keys = list(ROUND_BEZIER)
+    new, at = bezier_insert(keys, 0.6)
+    assert len(new) == 7 and at == 3 and near(new[at][0], 0.6, 1e-6)
+    for x in (0.1, 0.5, 0.6, 0.8, 0.95):
+        assert near(evaluate(new, x), evaluate(keys, x), 1e-3)
+    # Past the last anchor: a straight stretch.
+    new, at = bezier_insert([(0.0, 0.0, "BEZIER"), (0.2, 0.3, "BEZIER"), (0.4, 0.6, "BEZIER"), (0.5, 1.0, "BEZIER")], 0.8)
+    assert len(new) == 7 and at == 6 and new[6][:2] == (0.8, 1.0)
+
+
+def test_bezier_delete_takes_the_handles():
+    keys = [(i / 6, 0.0, "BEZIER") for i in range(7)]
+    assert [p for p, _, _ in bezier_delete(keys, [3])] == [keys[i][0] for i in (0, 1, 5, 6)]
+    assert [p for p, _, _ in bezier_delete(keys, [0])] == [keys[i][0] for i in (3, 4, 5, 6)]
+    assert [p for p, _, _ in bezier_delete(keys, [6])] == [keys[i][0] for i in (0, 1, 2, 3)]
+    assert bezier_delete(keys, [1, 2]) == keys  # handles alone: nothing
+    assert len(bezier_delete(keys, [0, 3, 6])) == 1  # one anchor stays
+
+
+def test_bezier_reverse_and_invert():
+    keys = list(ROUND_BEZIER)
+    r = reverse(keys)
+    for x in (0.05, 0.3, 0.7):
+        assert near(evaluate(r, x), evaluate(keys, 1 - x), 1e-3)
+    assert [v for _, v, _ in invert(keys)] == [1.0, 1.0, 1.0, 0.0]  # point order kept
 
 
 if __name__ == "__main__":

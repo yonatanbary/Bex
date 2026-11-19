@@ -596,7 +596,7 @@ def test_ramp_mouse_editing():
         ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
                                     window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
                                     area=None)
-        graph, markers, _label = rw.ramp_rects(node, None)[0]["r"]
+        graph, markers = rw.ramp_rects(node, None)[0]["r"]
         assert rw._to_px(graph, 0, 0) == (graph[0], graph[1])  # 0, 0 is the graph's corner
         assert rw._to_px(graph, 1, 1) == (graph[2], graph[3])
         def at(x, y):
@@ -674,6 +674,110 @@ def test_ramp_mouse_editing():
         assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
         release()
         assert delete.invoke(ctx, event(0, 0)) == {"FINISHED"} and len(ramp.keys) == 1
+    finally:
+        ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code = box_rect, node_top, node_rect, shows_code
+
+
+def test_ramp_bezier():
+    import types
+    from bex import code_editor as ce, ramp_widget as rw
+    R = rw.R
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    ramp.expanded = True
+    # Switching to Bezier adds two handles per stretch and keeps the shape.
+    rw.set_keys(node, ramp, [(0.0, 0.0, "MONOTONE_CUBIC"), (0.4, 0.8, "MONOTONE_CUBIC"), (1.0, 0.3, "MONOTONE_CUBIC")])
+    before = [R.evaluate(rw.keys_of(ramp), x) for x in (0.1, 0.3, 0.6, 0.9)]
+    ramp.interpolation = "BEZIER"
+    assert len(ramp.keys) == 7 and R.is_bezier(rw.keys_of(ramp))
+    assert all(abs(a - R.evaluate(rw.keys_of(ramp), x)) < 2e-3 for a, x in zip(before, (0.1, 0.3, 0.6, 0.9)))
+    for v in evaluate(obj).vertices:  # the geometry follows the Bezier curve
+        assert v.co.z == pytest_approx(R.evaluate(rw.keys_of(ramp), v.co.x * 0.5 + 0.5), 1e-2), (v.co.x, v.co.z)
+    # The point fields: an anchor carries its handles; Interpolation can't split the ramp.
+    ramp.selected = 3
+    handles = [(ramp.keys[i].position, ramp.keys[i].value) for i in (2, 4)]
+    ramp.point_value = 0.9
+    assert ramp.keys[3].value == pytest_approx(0.9)
+    assert [round(ramp.keys[i].value - v, 4) for i, (_p, v) in zip((2, 4), handles)] == [0.1, 0.1]
+    ramp.point_interpolation = "LINEAR"
+    assert R.is_bezier(rw.keys_of(ramp))
+    # Back to another mode keeps the anchors.
+    ramp.interpolation = "LINEAR"
+    assert len(ramp.keys) == 3 and [k.interpolation for k in ramp.keys] == ["LINEAR"] * 3
+    # Picking Bezier for one point switches the whole ramp.
+    ramp.point_interpolation = "BEZIER"
+    assert len(ramp.keys) == 7 and R.is_bezier(rw.keys_of(ramp))
+    # A preset replaces the keys, Bezier or not.
+    ramp.preset = "Round"
+    assert R.is_bezier(rw.keys_of(ramp)) and len(ramp.keys) == 4
+
+    box_rect, node_top, node_rect, shows_code = ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce.node_rect = lambda n, r: (-10, -50, 210, 600)
+    ce.node_top = lambda n, r: (600.0, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
+                                    window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
+                                    area=None)
+        graph, markers = rw.ramp_rects(node, None)[0]["r"]
+        def at(x, y):
+            return rw._to_px(graph, x, y)
+        def event(x, y, ctrl=False, shift=False):
+            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, shift=shift,
+                                         type="LEFTMOUSE", value="PRESS")
+        def move(x, y):
+            op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=x, mouse_region_y=y))
+        def release():
+            op.modal(ctx, types.SimpleNamespace(type="LEFTMOUSE", value="RELEASE", mouse_region_x=0, mouse_region_y=0))
+        op = types.SimpleNamespace()
+        for name in ("invoke", "modal", "_target"):
+            setattr(op, name, getattr(rw.BEX_OT_ramp_edit, name).__get__(op))
+        rw.set_keys(node, ramp, [(0.0, 0.0, "BEZIER"), (0.3, 0.0, "BEZIER"), (0.7, 1.0, "BEZIER"), (1.0, 1.0, "BEZIER")])
+        rw.deselect(ramp)
+        # A press on empty space splits the curve: a new anchor (and two handles) there.
+        shape = [R.evaluate(rw.keys_of(ramp), x) for x in (0.2, 0.8)]
+        assert op.invoke(ctx, event(*at(0.5, 0.5))) == {"RUNNING_MODAL"}
+        release()
+        assert len(ramp.keys) == 7 and ramp.selected == 3 and rw.selected_indices(ramp) == [3]
+        assert ramp.keys[3].position == pytest_approx(0.5, 1e-2)
+        assert all(abs(a - R.evaluate(rw.keys_of(ramp), x)) < 2e-2 for a, x in zip(shape, (0.2, 0.8)))
+        # Dragging an anchor moves its handles with it.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(start[3][0], start[3][1]))) == {"RUNNING_MODAL"}
+        move(*at(start[3][0] + 0.1, start[3][1] - 0.1))
+        release()
+        for i in (2, 3, 4):
+            assert ramp.keys[i].position == pytest_approx(start[i][0] + 0.1, 2e-2), i
+            assert ramp.keys[i].value == pytest_approx(start[i][1] - 0.1, 2e-2), i
+        assert ramp.keys[1].position == pytest_approx(start[1][0])  # other anchors' handles stay
+        # Dragging a handle swings the anchor's other handle into line (aligned handles),
+        # keeping that one's length; the anchor stays.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(*start[4]))) == {"RUNNING_MODAL"} and ramp.selected == 4
+        move(*at(start[4][0], start[4][1] + 0.2))
+        release()
+        assert ramp.keys[4].value == pytest_approx(start[4][1] + 0.2, 2e-2)
+        assert ramp.keys[3].value == pytest_approx(start[3][1])
+        a, h, o = ([ramp.keys[i].position, ramp.keys[i].value] for i in (3, 4, 2))
+        cross = (h[0] - a[0]) * (o[1] - a[1]) - (h[1] - a[1]) * (o[0] - a[0])
+        dot = (h[0] - a[0]) * (o[0] - a[0]) + (h[1] - a[1]) * (o[1] - a[1])
+        assert abs(cross) < 1e-4 and dot < 0, (cross, dot)  # on one line, opposite sides
+        length = math.hypot(start[2][0] - start[3][0], start[2][1] - start[3][1])
+        assert math.hypot(o[0] - a[0], o[1] - a[1]) == pytest_approx(length, 1e-3)
+        # A handle can't cross its anchor: dragged past it, it stops straight up / down.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(*start[4]))) == {"RUNNING_MODAL"}
+        move(*at(start[3][0] - 0.2, start[4][1]))
+        release()
+        assert ramp.keys[4].position == pytest_approx(ramp.keys[3].position, 1e-6)
+        assert ramp.keys[2].position == pytest_approx(ramp.keys[3].position, 1e-6)  # its partner, in line
+        assert (ramp.keys[4].value - ramp.keys[3].value) * (ramp.keys[2].value - ramp.keys[3].value) < 0
+        # Ctrl+click on a handle does nothing; on an anchor it goes with its handles.
+        assert op.invoke(ctx, event(*at(ramp.keys[4].position, ramp.keys[4].value), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 7
+        assert op.invoke(ctx, event(*at(ramp.keys[3].position, ramp.keys[3].value), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 4 and R.is_bezier(rw.keys_of(ramp))
     finally:
         ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code = box_rect, node_top, node_rect, shows_code
 
@@ -979,8 +1083,14 @@ def test_curve_builtins():
 
 
 class pytest_approx(float):
+    """A float equal to anything within `tol` (default 1e-4)."""
+    def __new__(cls, value, tol=1e-4):
+        obj = super().__new__(cls, value)
+        obj.tol = tol
+        return obj
+
     def __eq__(self, other):
-        return abs(self - other) < 1e-4
+        return abs(self - other) < self.tol
 
     __hash__ = float.__hash__
 

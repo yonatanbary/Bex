@@ -45,9 +45,9 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
 | `bex/code_editor.py` | On-node editor, Blender side: draw handler, `BEX_OT_code_edit` modal, compile on focus loss |
 | `bex/upstream.py` | Static guess of the named attributes reaching a wrangle's input (`incoming_attributes()`) |
 | `bex/library.py` | Library node groups (`GROUPS`, `ensure()`), and the **Add → BEX** menu |
-| `bex/ramp.py` | chramp() ramps in plain Python: keys `(position, value, interpolation)`, `INTERPOLATIONS`, `polyline()`, `evaluate()`, `reverse()` / `invert()`, `PRESETS` |
-| `bex/ramp_widget.py` | The ramp on the node: `BexRamp` data (keys, fold, point fields, preset, all-points `interpolation` menu), header and 2x2 button grid (`draw_layout`), the drawn graph and bold name (`draw_node`, placed by `ramp_rects`), mouse editing (`BEX_OT_ramp_edit`: drag, Shift-click range selection that drags as one, Ctrl+click deletes; selection is `ramp.selected` (active) + `key.select`, see `select_only` / `select_range` / `delete_selected`), `BEX_OT_ramp_delete` (Delete / X over a graph; passes through elsewhere, so the node is never deleted from a graph), the interpolation menu (`NODE_MT_bex_ramp_interpolation`, a text-less menu button: square, opens below; the ramp reaches it as `context.bex_ramp`) and `BEX_OT_ramp_interpolation` (sets every point), `BEX_OT_ramp_action` |
-| `bex/ramp_icons.py` | Icons Blender lacks, drawn in its style as preview icons (`icon(name)`): flips, fold / unfold chevrons, one per interpolation; and the preset thumbnails (`thumbnail()`). Plain Python except `icon()` |
+| `bex/ramp.py` | chramp() ramp maths in plain Python: evaluation, Bezier editing, presets (see **Ramps**) |
+| `bex/ramp_widget.py` | The ramp on the node: data, layout, drawn graph, mouse and key editing (see **Ramps**) |
+| `bex/ramp_icons.py` | Icons Blender lacks, drawn in its style as preview icons (`icon(name, dim)`), and the preset thumbnails (`thumbnail()`). Plain Python except `icon()` |
 | `bex/builder.py` | IR → nodes (`sync_interface()`, `build()`), plus per-row Group Inputs (`_split_group_inputs()`) and auto-layout (`_layout()`) |
 | `bex/node.py` | The node class, channel properties, operators, Add-menu entry, update events |
 | `bex/presets.py` | The **Presets** menu: built-in and user `.bex` scripts, Save as Preset |
@@ -57,6 +57,8 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
 | `tests/test_lang.py` | Compiler tests, plain `python3` |
 | `tests/test_editor.py` | Editor core tests (buffer, highlighter, completion, signatures, keys), plain `python3` |
 | `tests/test_blender.py` | End-to-end tests, run in background Blender |
+| `tests/test_ramp.py` | Ramp maths tests, plain `python3`; compares against `houdini_ramps.json` |
+| `tests/houdini_ramps.py` | Samples Houdini's own ramps into `houdini_ramps.json` (run with `hython`) |
 | `.vscode/settings.json` | Blender Development extension config (reload on save, `*.bex` as Python) |
 
 ## `bex/lang/lexer.py`
@@ -192,11 +194,71 @@ Visible, reusable node groups for the built-in functions that take several nodes
 - **Bump a group's `version` when you change its `build`.**
 - `BEX_OT_add_library_node` (`bex.add_library_node`, `key`): ensures the group, then calls `node.add_node` with `node_tree` set. `NODE_MT_bex_library` is the **BEX** submenu, appended under **BEX Wrangle** in the Add menu by `node._add_menu`.
 
+## Ramps (`chramp()`)
+
+`chramp(name, pos)` reads a Houdini-style ramp whose keys live on the wrangle node, edited
+on a graph drawn on the node. The node graph can't run Houdini's interpolations, so the
+ramp is sampled into straight pieces for a Float Curve (`builder.set_curve`).
+
+### `bex/ramp.py` (no bpy)
+
+- A ramp is a list of keys `(position, value, interpolation)`; a key's interpolation shapes
+  the stretch to the next key. `INTERPOLATIONS`: `CONSTANT LINEAR CATMULL_ROM MONOTONE_CUBIC BSPLINE BEZIER`.
+  Positions are 0–1; values may go past 0–1.
+- `polyline(keys)` → `[(x, y)]` from x = 0 to 1 (held past the end keys, x rising, `simplify()`d);
+  `evaluate(keys, x)` reads it. Matched to Houdini's own lookup (`test_matches_houdini`):
+  Catmull-Rom (`_catmull_rom`), Monotone Cubic (`_tangents`, flat ends) and B-spline
+  (`_bspline_curve`, ends tripled) per Houdini's rules; every basis but Bezier reads keys in position order.
+- **Bezier** is read in **point order**, like Houdini: from the first key, each key and the next
+  three are one cubic (anchor, handle, handle, anchor); missing control points repeat the last key.
+  Keys 0, 3, 6… and the last are anchors (`is_anchor`, `anchor_of`, `handles_of`, `bezier_segments`).
+  BEX keeps Bezier a whole-ramp mode with 3k + 1 keys: `to_bezier()` adds two handles per stretch
+  along the curve's slope (shape kept; Constant and B-spline only approximated), `from_bezier()`
+  keeps the anchors, `bezier_insert()` splits a cubic with de Casteljau (shape kept; past the ends
+  it adds a straight stretch), `bezier_delete()` removes anchors with their handles (handles alone stay).
+- `reverse()` / `invert()` (Bezier keeps its point order), `PRESETS` (Houdini's `float.ramp`
+  presets, except Round and Sharp: quarter-circle Beziers, handles at `KAPPA` = 4(√2 − 1)/3,
+  each the other turned half around), `DEFAULT_KEYS` (Linear).
+
+### `bex/ramp_widget.py`
+
+- Data: `BexRampKey` (`position`, `value`, `interpolation`, `select`) and `BexRamp` (`keys`,
+  `selected` = the active point, `expanded`, `show_point`, `point` (Point No.), `preset`,
+  `interpolation` (header menu, every point: `set_mode()`), and the point-field proxies
+  `point_position` / `point_value` / `point_interpolation`). On the node as `bex_ramps`;
+  `ensure_ramps()` after each compile keeps up to `RAMP_LIMIT` unused ones. `_owner()` finds a
+  key's node by pointer (RNA has no paths into custom node properties). `write_curve()` refills
+  the Float Curve on every change (`_quiet` batches many changes into one write).
+- Selection: `key.select` (highlighted; Delete removes them) plus the active point.
+  `select_only`, `select_range` (Shift-click: position order; Bezier: anchors only),
+  `delete_selected` (Bezier: anchors with their handles), `deselect_tree`. A click outside the
+  node clears the selection; a click on the node keeps it, so its buttons act on it.
+- Bezier editing: an anchor carries its handles (`carried()`, `move_point()`); handles are
+  aligned (`align_sibling()`: the other handle swings into line, keeping its length) and stay on
+  their side of the anchor (`keep_side()`: half a turn, never crossing).
+- Layout, `draw_layout()`: header row (the name as a plain label; interpolation menu
+  `NODE_MT_bex_ramp_interpolation` → `BEX_OT_ramp_interpolation`, flips, preset thumbnails), the
+  2x2 grid left of the graph (add / delete `BEX_OT_ramp_action`, point-fields and fold toggles),
+  an empty label the graph is drawn into, and the point fields indented by `POINT_INDENT`
+  (read-only with several points selected; Interpolation read-only in a Bezier ramp).
+  On a muted node our preview icons use dimmed copies (Blender doesn't dim those).
+- Drawing, `draw_node()` (from `code_editor._draw`, faded with the node): back, `GRID` × `GRID`
+  lines when expanded, the area and the curve (`CURVE_W`), dots (Bezier handles hollow, with a
+  purple line to their anchor), a triangle on the edge for a value past 0–1 (`_arrow`), and
+  position markers (anchors only). `ramp_rects()` places each graph counted down from the node's
+  top in Blender pixels (`_row_sizes`, `_separator_height` for the line under Run Over), following
+  `node.draw_buttons`; keep the two in step.
+- Editing: `BEX_OT_ramp_edit` (LEFTMOUSE, also in the node tool keymaps): drag points (the selection
+  moves as one, stopping at 0–1 unless a value already sits past it), click empty space to add a
+  point (Bezier: split the curve), Shift-click for a range, Ctrl+click deletes. `ramp_at()` hit-tests.
+  `BEX_OT_ramp_delete` (Delete, Backspace, X) deletes the selected points and passes through when
+  none are selected.
+
 ## `bex/code_editor.py`
 
 The on-node editor, Blender side. Built on `bex/editor/` (buffer, highlighter, keys).
 
-- Placement: `reserve(layout, node)` (called last in `draw_buttons`) adds an empty label scaled to `box_height()`. `box_rect(node, region)` finds it from the node's **bottom** edge: below it come only the input socket rows (`SOCKET_ROW`) and `BOTTOM_PAD`; `SIDE` is the horizontal inset. These constants were measured from Blender 5.2 screenshots (UI scale 0.6 to 2). Python can't read widget positions, so re-measure if Blender changes node drawing. Sizes are node-editor units × `preferences.system.ui_scale` × zoom. `node_top(node, region)` gives the node's top edge and the zoom; the ramp graphs (`ramp_widget.ramp_rects`) are counted down from it in Blender pixels with Blender's rounding (`_row_sizes`), so nothing below a graph can move it.
+- Placement: `reserve(layout, node)` (called last in `draw_buttons`) adds an empty label scaled to `box_height()`. `box_rect(node, region)` finds it from the node's **bottom** edge: below it come only the input socket rows (`SOCKET_ROW`) and `BOTTOM_PAD`; `SIDE` is the horizontal inset. These constants were measured from Blender 5.2 screenshots (UI scale 0.6 to 2). Python can't read widget positions, so re-measure if Blender changes node drawing. Sizes are node-editor units × `preferences.system.ui_scale` × zoom. `node_top(node, region)` gives the node's top edge and the zoom, `node_rect()` the whole node; the ramp graphs (`ramp_widget.ramp_rects`) are counted down from it in Blender pixels with Blender's rounding (`_row_sizes`), so nothing below a graph can move it.
 - The reserved block is the code box (`box_height(lines, node.code_scale)`) plus the info strip (`info_height(node)`) under it, so the strip needs no layout measuring of its own.
 - `_draw()`: `SpaceNodeEditor` POST_PIXEL handler. Paints each visible wrangle's code in Blender's monospace font (`FONT_ID = 1`), clipped with a scissor clamped to the region (`_clip()`: Metal drops the whole draw for a scissor outside the region), using the calm fixed `PALETTE` (highlight kind → colour via `_COLOR_OF`: neutral text, dim punctuation, soft colours for keywords, attributes, numbers, strings). The outline (`PALETTE`): `focus` blue while edited, `error` red, `evaluated` green when `node.is_up_to_date()`. The edited one also shows selection (rows whose line break is selected fill to the box's right edge), cursor and the inline completion as ghost text (the rest of the line shifts right, `_split_spans`). The box shows at least `MIN_ROWS = 10` and up to `MAX_ROWS = 16` lines; longer scripts scroll. `box_height()` includes the horizontal scrollbar row, so the bar never covers the last line. The outline is drawn last, over the line numbers and scrollbars. `node.code_scale` scales the font and line height.
 - Line numbers: a gutter on the left (`gutter_width()`: the last line number's digits, at least `MIN_DIGITS`, plus `GUTTER_PAD` characters each side), slightly lighter than the code (`PALETTE` `gutter`), numbers right-aligned and dim. While editing, the cursor line's gutter row and number are highlighted, and `Line N, Col M` is drawn right-aligned on the info strip's first line (that line is shortened with `_fit`). The gutter is painted after the code, so text scrolled sideways slides under it. `text_left()` is where column 0 starts; drawing, `scrollbars()` and mouse hits all use it.
@@ -226,7 +288,7 @@ The on-node editor, Blender side. Built on `bex/editor/` (buffer, highlighter, k
 - `BexWrangleNode(GeometryNodeCustomGroup)`, idname `GeometryNodeBexWrangle`:
   - Properties: `bex_ramps` (the chramp() keys, `ramp_widget.BexRamp` by name; `ensure_ramps()` after each compile, `ramps()` = the last good compile's names, drawn under the ch* fields), `script` (Text, not drawn), `domain`, `group` (the Group field), `error`, `warning`, `compiled_key`, `saved_values`, `info` (JSON reads / writes / node count of the last good compile), `code_scale`.
   - `init` creates the node's own group and its own script Text from `TEMPLATE` (`_new_text()`). `copy` copies both the group and the script, so duplicates are independent. `draw_label` is "BEX Wrangle" for an own script, else "BEX: name".
-  - `draw_buttons`: Group, Run Over, the error (only when there's no script; otherwise it's drawn under the code), `draw_channels()` (each ch* value as a property, greyed out with a link icon when its socket is linked) and a separator line, then a right-aligned row with the **Presets** menu and Edit (pencil), then the reserved code box (`code_editor.reserve`). The code is always shown.
+  - `draw_buttons`: Group, Run Over, a separator line when there are ch* fields or ramps, the error (only when there's no script; otherwise it's drawn under the code), `draw_channels()` (each ch* value as a property, greyed out with a link icon when its socket is linked) then each ramp (`ramp_widget.draw_layout`) and a separator line, then a right-aligned row with the **Presets** menu and Edit (pencil), then the reserved code box (`code_editor.reserve`). The code is always shown.
   - `channels()`: the enabled non-geometry inputs. ch* values are **properties, not inputs**: `hide_channel_sockets()` (after each build, and from `update()` when links change) hides every unlinked channel socket. The sockets stay in the group interface, which carries the values and keyframes; a linked one (Ctrl+H) stays visible.
   - `is_up_to_date()`: the compiled key matches the current script, Group and domain (drives the green outline).
   - `sync(force, pending_line=None)`: the key is `version|domain|md5(group + src)` (`_key()`, + `|pending` while ch* names are held back). `warning` is set from `program.warnings`. It recompiles on change, with `keep_stale` while pending. On `BexError` it keeps the last good nodes and sets `error`. On any other exception it logs the traceback. Every rebuild calls `_redraw()`.
@@ -241,7 +303,8 @@ The on-node editor, Blender side. Built on `bex/editor/` (buffer, highlighter, k
   - `bex.update_node`: re-reads the script's file, then forces a rebuild of this node (no button any more; available from F3 search).
   - `bex.edit_nodes`: goes inside the wrangle with `space.path.append(node_tree, node=node)`, because Blender's Tab only enters built-in group nodes. It's bound to **Tab** in the addon keymap (registered in `register()`, removed in `unregister()`); on other nodes its poll fails and Tab falls through to Blender's own group edit. Edits made inside are replaced on the next recompile.
   - `bex.recompile`: forces a rebuild of every wrangle.
-- `register()` also registers `library` (its operator and menu), `presets`, `code_editor` (its operators, draw handler and the LEFTMOUSE / wheel / trackpad keymap items) and the app handlers.
+- `_field(layout, node, label, width=None, indent=0)`: a right-aligned label in a fixed `LABEL_WIDTH` column, then the field; `indent` moves both right.
+- `register()` also registers `ramp_widget` (first: `bex_ramps` uses its types), `library` (its operator and menu), `presets`, `code_editor` (its operators, draw handler and the LEFTMOUSE / wheel / trackpad keymap items), the ramp keymap items (`bex.ramp_edit` on LEFTMOUSE in "Node Editor" and in the "Node Tool: …" keymaps, which Blender checks first; `bex.ramp_delete` on DEL, BACK_SPACE and X) and the app handlers.
 
 ## `bex/presets.py`
 
@@ -259,10 +322,10 @@ python3 tests/test_ramp.py
 "/Applications/Blender 5.2.app/Contents/MacOS/Blender" -b --factory-startup --python tests/test_blender.py
 ```
 
-- `test_ramp.py`: ramp maths (`bex/ramp.py`), and `test_matches_houdini`: every interpolation against Houdini's own `hou.Ramp`, sampled into `houdini_ramps.json` by `hython tests/houdini_ramps.py` (re-run it after changing its cases).
+- `test_ramp.py`: ramp maths (`bex/ramp.py`: presets, the quarter-circle Round / Sharp, Bezier roles, to/from Bezier, insert, delete, reverse / invert), and `test_matches_houdini`: every interpolation against Houdini's own ramps, sampled into `houdini_ramps.json` by `hython tests/houdini_ramps.py` (re-run it after changing its cases; Bezier cases go through a real ramp parameter, because a bare `hou.Ramp` sorts its keys).
 - `test_lang.py`: Python syntax (indentation, elif, one-line blocks, chained comparisons, `**` `//`, error hints), Python-style variables, folding, attribute types, sequencing, if→switch, scopes, the write plan (Selection instead of Switch, Set Position Offset, captures only when needed), for-unroll, channels, the pending line, CSE, functions, error messages and lines, `.0`–`.2` components, the Group (expressions, Houdini patterns, `@group_`, types, warnings), other inputs (`point`/`prim`, `@opinputN_`, counts, `nearpoint`, no captures for other-input reads, errors), the curve built-ins and the domain-aware index built-ins (with their hints).
 - `test_editor.py`: buffer editing, selection, movement, undo grouping (word steps, Backspace runs), VS Code-style `select_at`, `suggest`, `signature_at` (nesting, strings, comments, lines) and every function having a signature; highlighter kinds (including `@P.1`), coverage, block comments, fuzzing; key mapping (platform modifiers, clipboard, exit, zoom) and `View`.
-- `test_blender.py`: real evaluated geometry. Covers bounding box / mapping functions, `@curveu` / `@curvelength` on curves, the index built-ins per domain, the library groups (shared, nested, found after a rename, rebuilt on a version bump, usable in a user tree), position and channels, attributes and sequencing, swap semantics, the write plan (conditional writes keep old values, also from another domain; Offset with Selection; captures only when needed), the face domain, keeping the last good nodes on error, sync_all and copy, hidden own scripts, presets, channels as properties, the Group (several writes, constant writes, float attributes, patterns, bad groups), other inputs (an Object Info into "Input 2": point(), @opinput1_, npoints, nearpoint, getbbox_max(1), the four inputs always present and keeping their links), scrolling, the pending line (inputs held back, not removed, values remembered), incoming attributes (object data, Store/Remove Named Attribute, upstream wrangles, group nodes), typing through the editor's key path (Tab-accepting completions, compiling only on focus loss, Esc hiding the signature help before leaving, undo history kept across refocus and per script), and the layout (no overlaps, links flow left to right, per-row Group Inputs).
+- `test_blender.py`: real evaluated geometry. Covers bounding box / mapping functions, `@curveu` / `@curvelength` on curves, the index built-ins per domain, the library groups (shared, nested, found after a rename, rebuilt on a version bump, usable in a user tree), position and channels, attributes and sequencing, swap semantics, the write plan (conditional writes keep old values, also from another domain; Offset with Selection; captures only when needed), the face domain, keeping the last good nodes on error, sync_all and copy, hidden own scripts, presets, channels as properties, the Group (several writes, constant writes, float attributes, patterns, bad groups), other inputs (an Object Info into "Input 2": point(), @opinput1_, npoints, nearpoint, getbbox_max(1), the four inputs always present and keeping their links), scrolling, the pending line (inputs held back, not removed, values remembered), incoming attributes (object data, Store/Remove Named Attribute, upstream wrangles, group nodes), typing through the editor's key path (Tab-accepting completions, compiling only on focus loss, Esc hiding the signature help before leaving, undo history kept across refocus and per script), the layout (no overlaps, links flow left to right, per-row Group Inputs), and ramps (chramp() nodes, header actions and the interpolation menu, mouse editing with selection and delete, values past 0–1, Bezier: switching, splitting, anchors carrying handles, aligned handles that don't cross).
 - The draw placement can only be checked with a UI: run Blender without `-b` and with `--enable-event-simulate`, then screenshot (`bpy.ops.screen.screenshot`).
 
 ## Adding a language function (checklist)

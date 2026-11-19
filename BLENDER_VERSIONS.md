@@ -81,7 +81,6 @@ Units are node-editor units at zoom 1, before UI scale.
 | No way to read widget positions | measured sizes (above) | `code_editor.box_rect`, `ramp_widget.ramp_rects` |
 | `layout.split` only splits by fraction | the fraction is computed from `node.width` for a fixed label column | `node._field` |
 | No vertical double-arrow / small fold icons built in | our own icons as previews (`icon_value`); their pixels must be **premultiplied** alpha, or transparent parts draw white | `ramp_icons.raster` |
-| No font weight from Python (`layout.label`, `blf`) | the ramp's name is drawn by us, smeared sideways for a bold look | `ramp_widget._draw_label` |
 | `path_from_id()` can't make paths into a custom node's properties | the owner of a ramp key is found by pointer | `ramp_widget._owner` |
 | Tab only enters built-in group nodes | `bex.edit_nodes` pushes the path itself, bound to Tab | `node.py` |
 | No event for typing in the Text Editor or files changing on disk | a 1 s timer, only for texts open in an editor or linked to a file | `node._watch` |
@@ -89,6 +88,7 @@ Units are node-editor units at zoom 1, before UI scale.
 | `view_to_region` returns whole pixels (the box jumps while zooming) | our own float view mapping | `code_editor._view_map` |
 | `DOUBLE_CLICK` events arrive unreliably | clicks are counted by the operator | `code_editor` (`Session.clicks`) |
 | The active tool's keymap ("Node Tool: Tweak / Select Box / Select Lasso / Select Circle", each also "(fallback)") is checked before "Node Editor", and its Shift-click `node.select` (toggle) doesn't pass through | the ramp's click item is added to those tool keymaps too (add-on items run before Blender's in the same keymap) | `node.register` |
+| A layout separator's height can't be read | taken from Blender's source: `int(int(0.3 * widget unit) * factor)`, plus the row gap; not yet confirmed on screen | `ramp_widget._separator_height` |
 | The Mac key labelled "delete" sends `BACK_SPACE`, not `DEL` | ramp point delete is bound to both | `node.register` |
 | The Float Curve widget updates only on mouse release | moot: our ramp widget writes the curve on every move | `ramp_widget.write_curve` |
 

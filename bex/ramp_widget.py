@@ -9,7 +9,6 @@ whenever a key changes, so dragging updates the result live.
 
 import math
 
-import blf
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
@@ -19,28 +18,25 @@ from . import ramp as R
 from . import ramp_icons
 
 # -- sizes (node-editor units at zoom 1, before UI scale) -----------------------
-GRAPH_H = 110.0      # the graph, unfolded
+GRAPH_H = 130.0      # the graph, unfolded
 STRIP_H = 34.0       # folded: a strip, still editable by dragging
 MARKER_H = 16.0      # the row of position markers under the graph
 MARKER_GAP = 4.0     # between the graph's bottom edge and a marker's tip
 KEY_R = 4.0          # key dot radius
+CURVE_W = 0.9        # the curve's stroke width
+HANDLE_R = 3.0       # Bezier handle (hollow dot) radius
 ARROW_W = 3.0        # half width of the triangle drawn for a point whose value is past 0-1
 HIT_R = 8.0          # how close a press must be to grab a key or marker
 MARKER_W = 5.0       # half width of a marker
 TOGGLES_W = 40.0     # the 2x2 button grid left of the graph (add / delete, point fields / fold)
 TOGGLES_GAP = 4.0    # between that column and the graph
+POINT_INDENT = 14.0  # the point fields sit this much right of the node's other fields: they belong to the ramp
 # Where the graph goes is counted down from the node's top edge, in Blender pixels
 # rounded the way Blender rounds them (see `_row_sizes`), so nothing below a graph
 # (its point fields, the code box) can move it. Python can't read widget positions.
 BODY_TOP = 16.7      # Blender px: the gap between the output socket row and the first field (measured, 5.2)
 RAMP_LIMIT = 16      # remembered ramps no longer in the script, per node
-GRID = 4             # grid divisions, the same both ways: cells are square only when the graph is
-# The ramp's name is drawn by us, in bold: Blender's layout and blf can't set a font
-# weight from Python. Measured against Blender's own labels (5.2).
-LABEL_POINTS = 11.0  # Blender's UI text size (points)
-LABEL_X = 0.8        # Blender px from the body's left edge to the text
-LABEL_BASE = 13.8    # Blender px from the row's bottom to the text baseline
-LABEL_BOLD = 1.4     # faux bold: the text is smeared this far to the right (Blender px)
+GRID = 6             # grid divisions, the same both ways: cells are square only when the graph is
 
 PALETTE = {
     "back": (0.20, 0.20, 0.205, 1.0),
@@ -50,8 +46,8 @@ PALETTE = {
     "key": (0.86, 0.92, 0.70, 1.0),
     "key_edge": (0.10, 0.10, 0.10, 1.0),
     "selected": (0.98, 0.76, 0.20, 1.0),
+    "handle_line": (0.62, 0.45, 0.85, 1.0),  # Bezier handle to its anchor
     "marker": (0.75, 0.75, 0.75, 1.0),
-    "label": (0.94, 0.94, 0.94, 1.0),
 }
 
 _quiet = False     # set while many keys change at once; one curve write at the end
@@ -88,8 +84,9 @@ class BexRampKey(bpy.types.PropertyGroup):
     select: bpy.props.BoolProperty(options=set())  # part of a Shift-click range
 
 
-def _preset_items(_self, _context):
-    icons = _preset_icons()
+def _preset_items(self, _context):
+    node, _ = _owner(self)
+    icons = _preset_icons(dim=bool(node and node.mute))
     return [(name, name, "", icons.get(name, 0), i) for i, name in enumerate(R.PRESETS)]
 
 
@@ -136,7 +133,141 @@ def _get_interp(self):
 def _set_interp(self, index):
     node, _ = _owner(self)
     if node is not None:
-        set_keys(node, self, [(p, v, _INTERP_IDS[index]) for p, v, _i in keys_of(self)])
+        set_mode(node, self, _INTERP_IDS[index])
+
+
+def set_mode(node, ramp, mode):
+    """Every point to `mode`. Bezier is a whole-ramp mode: switching to it adds two
+    handles per stretch, keeping the shape; switching away keeps the anchors."""
+    keys = keys_of(ramp)
+    if R.is_bezier(keys) == (mode == "BEZIER"):
+        new = [(p, v, mode) for p, v, _i in keys]
+    else:
+        new = R.to_bezier(keys) if mode == "BEZIER" else R.from_bezier(keys, mode)
+    if len(new) == len(keys):
+        set_keys(node, ramp, new)
+        return
+    active = keys[min(ramp.selected, len(keys) - 1)][0] if keys else 0.0
+    deselect(ramp)
+    set_keys(node, ramp, new)
+    ramp.selected = _nearest_anchor(new, active)
+
+
+def _nearest_anchor(keys, x):
+    picks = [i for i in range(len(keys)) if not R.is_bezier(keys) or R.is_anchor(i, len(keys))]
+    return min(picks, key=lambda i: abs(keys[i][0] - x)) if picks else 0
+
+
+# The point fields edit the active point. In a Bezier ramp an anchor carries its
+# handles, and Interpolation is read-only (Bezier is set for the whole ramp from
+# the header); picking Bezier for one point switches the whole ramp.
+def _active_key(ramp):
+    return ramp.keys[min(ramp.selected, len(ramp.keys) - 1)] if ramp.keys else None
+
+
+def _get_point_position(self):
+    key = _active_key(self)
+    return key.position if key else 0.0
+
+
+def _set_point_position(self, x):
+    if self.keys:
+        move_point(self, min(self.selected, len(self.keys) - 1), x, None)
+
+
+def _get_point_value(self):
+    key = _active_key(self)
+    return key.value if key else 0.0
+
+
+def _set_point_value(self, y):
+    if self.keys:
+        move_point(self, min(self.selected, len(self.keys) - 1), None, y)
+
+
+def _get_point_interp(self):
+    key = _active_key(self)
+    return _INTERP_IDS.index(key.interpolation if key else R.DEFAULT_INTERPOLATION)
+
+
+def _set_point_interp(self, index):
+    node, _ = _owner(self)
+    mode = _INTERP_IDS[index]
+    if node is None or not self.keys or R.is_bezier(keys_of(self)):
+        return
+    if mode == "BEZIER":
+        set_mode(node, self, mode)
+    else:
+        _active_key(self).interpolation = mode
+
+
+def carried(ramp, indices):
+    """The handles that move with `indices`: in a Bezier ramp, the handles of the
+    anchors among them (not already in `indices`)."""
+    n = len(ramp.keys)
+    if not n or ramp.keys[0].interpolation != "BEZIER" or not R.is_bezier(keys_of(ramp)):
+        return []
+    out = {h for i in indices if R.is_anchor(i, n) for h in R.handles_of(i, n)}
+    return sorted(out - set(indices))
+
+
+def sibling(ramp, h):
+    """The other handle of handle h's anchor, or None (an end anchor has one)."""
+    n = len(ramp.keys)
+    a = R.anchor_of(h, n)
+    others = [j for j in R.handles_of(a, n) if j != h]
+    return others[0] if others and a != h else None
+
+
+def keep_side(ramp, h):
+    """A handle stays on its side of its anchor (the one before it left, the one
+    after it right): it can swing half a turn, from straight up to straight down,
+    but not past the anchor, so the two handles never cross."""
+    a = R.anchor_of(h, len(ramp.keys))
+    hk, ak = ramp.keys[h], ramp.keys[a]
+    if h < a and hk.position > ak.position:
+        hk.position = ak.position
+    elif h > a and hk.position < ak.position:
+        hk.position = ak.position
+
+
+def align_sibling(ramp, h):
+    """Bezier handles are aligned: after handle h moves, the other handle of its
+    anchor swings round to stay on the line through the anchor, keeping its length."""
+    o = sibling(ramp, h)
+    if o is None:
+        return
+    a = ramp.keys[R.anchor_of(h, len(ramp.keys))]
+    hk, ok = ramp.keys[h], ramp.keys[o]
+    dx, dy = hk.position - a.position, hk.value - a.value
+    d = math.hypot(dx, dy)
+    if d < 1e-9:
+        return
+    length = math.hypot(ok.position - a.position, ok.value - a.value)
+    ok.position = _clamp01(a.position - dx / d * length)
+    ok.value = a.value - dy / d * length
+
+
+def move_point(ramp, index, x=None, y=None):
+    """Put point `index` at position x / value y (None keeps it); its handles follow."""
+    global _quiet
+    node, _ = _owner(ramp)
+    key = ramp.keys[index]
+    dx = 0.0 if x is None else x - key.position
+    dy = 0.0 if y is None else y - key.value
+    _quiet = True
+    try:
+        key.position, key.value = key.position + dx, key.value + dy
+        for h in carried(ramp, [index]):
+            k = ramp.keys[h]
+            k.position, k.value = _clamp01(k.position + dx), k.value + dy
+        if R.is_bezier(keys_of(ramp)) and not R.is_anchor(index, len(ramp.keys)):
+            keep_side(ramp, index)
+            align_sibling(ramp, index)
+    finally:
+        _quiet = False
+    if node is not None:
+        write_curve(node, ramp)
 
 
 class BexRamp(bpy.types.PropertyGroup):
@@ -152,6 +283,16 @@ class BexRamp(bpy.types.PropertyGroup):
     preset_index: bpy.props.IntProperty(default=list(R.PRESETS).index("Linear"), options=set())
     preset: bpy.props.EnumProperty(name="Preset", items=_preset_items, get=_get_preset, set=_set_preset,
                                    options=set(), description="Replace the ramp with a preset shape")
+    point_position: bpy.props.FloatProperty(name="Position", min=0.0, max=1.0, get=_get_point_position,
+                                            set=_set_point_position, options=set(),
+                                            description="Where the point sits along the ramp, 0 to 1")
+    point_value: bpy.props.FloatProperty(name="Value", soft_min=0.0, soft_max=1.0, get=_get_point_value,
+                                         set=_set_point_value, options=set(),
+                                         description="The ramp's value at this point")
+    point_interpolation: bpy.props.EnumProperty(name="Interpolation", items=R.INTERPOLATIONS, get=_get_point_interp,
+                                                set=_set_point_interp, options=set(),
+                                                description="How the ramp runs from this point to the next "
+                                                            "(Bezier switches the whole ramp)")
     interpolation: bpy.props.EnumProperty(name="Interpolation", items=_interp_items, get=_get_interp,
                                           set=_set_interp, options=set(),
                                           description="Set how the ramp runs between points, for every point")
@@ -215,19 +356,36 @@ def select_range(ramp, index):
     """Select every point from the active one to `index`, in position order (the
     active point stays the anchor for the next Shift-click). With nothing selected
     it starts a new range at `index`."""
+    keys = keys_of(ramp)
+    n = len(keys)
+    bezier = R.is_bezier(keys)
+    if bezier:  # handles move with their anchors: a range is of anchors
+        index = R.anchor_of(index, n)
     if not selected_indices(ramp):
         select_only(ramp, index)
         return
-    order = sorted(range(len(ramp.keys)), key=lambda i: ramp.keys[i].position)
-    anchor = min(ramp.selected, len(ramp.keys) - 1)
+    order = sorted((i for i in range(n) if not bezier or R.is_anchor(i, n)), key=lambda i: keys[i][0])
+    anchor = min(ramp.selected, n - 1)
+    if bezier:
+        anchor = R.anchor_of(anchor, n)
     a, b = sorted((order.index(anchor), order.index(index)))
     for i, k in enumerate(ramp.keys):
         k.select = i in order[a:b + 1]
 
 
 def delete_selected(node, ramp, doomed=None):
-    """Delete the selected points (or `doomed`); a ramp keeps at least one."""
+    """Delete the selected points (or `doomed`); a ramp keeps at least one. In a
+    Bezier ramp an anchor goes with its handles, and handles alone stay."""
     doomed = selected_indices(ramp) if doomed is None else doomed
+    keys = keys_of(ramp)
+    if R.is_bezier(keys):
+        new = R.bezier_delete(keys, doomed)
+        if len(new) != len(keys):
+            active = keys[min(ramp.selected, len(keys) - 1)][0]
+            deselect(ramp)
+            set_keys(node, ramp, new)
+            ramp.selected = _nearest_anchor(new, active)
+        return
     if len(doomed) >= len(ramp.keys):
         doomed = [i for i in doomed if i != min(ramp.selected, len(ramp.keys) - 1)]
     if not doomed:
@@ -275,8 +433,10 @@ def graph_height(ramp):
 def draw_layout(layout, node, ramp, field):
     """The ramp's header row, the space the graph is drawn into, and the
     selected point's fields. `field(layout, node, label, width)` is node._field."""
+    # Blender greys out a muted node's buttons, but not preview icons: ours get dimmed copies.
+    dim = node.mute
     row = layout.row(align=True)
-    row.label(text="")  # the name is drawn in bold by draw_node
+    row.label(text=ui_label(ramp.name))
     tools = row.row(align=True)
     tools.alignment = "RIGHT"
     tools.emboss = "PULLDOWN_MENU"  # one look for menus and buttons: no background until hovered
@@ -285,9 +445,9 @@ def draw_layout(layout, node, ramp, field):
     # A menu button without text: square, no arrow; it opens below, left-aligned.
     tools.context_pointer_set("bex_ramp", ramp)
     tools.menu(NODE_MT_bex_ramp_interpolation.bl_idname, text="",
-               icon_value=ramp_icons.icon("INTERP_" + ramp.interpolation))
+               icon_value=ramp_icons.icon("INTERP_" + ramp.interpolation, dim))
     for action, icon in (("REVERSE", "FLIP_X"), ("INVERT", "FLIP_Y")):
-        op = tools.operator("bex.ramp_action", text="", icon_value=ramp_icons.icon(icon))
+        op = tools.operator("bex.ramp_action", text="", icon_value=ramp_icons.icon(icon, dim))
         op.ramp, op.action = ramp.name, action
     tools.template_icon_view(ramp, "preset", show_labels=True, scale=1.0, scale_popup=4.0)
     # Left of the graph, under the label: a 2x2 grid of buttons, add / delete over
@@ -302,18 +462,23 @@ def draw_layout(layout, node, ramp, field):
     toggles = grid.row(align=True)
     toggles.emboss = "PULLDOWN_MENU"  # no background until hovered (their icons show the state)
     toggles.prop(ramp, "show_point", text="", icon="DISCLOSURE_TRI_DOWN" if ramp.show_point else "DISCLOSURE_TRI_RIGHT")
-    toggles.prop(ramp, "expanded", text="", icon_value=ramp_icons.icon("FOLD" if ramp.expanded else "UNFOLD"))
+    toggles.prop(ramp, "expanded", text="", icon_value=ramp_icons.icon("FOLD" if ramp.expanded else "UNFOLD", dim))
     space = body.column()
     space.scale_y = graph_height(ramp) / ce.UNIT_Y
     space.label(text="")
     if ramp.show_point and ramp.keys:
-        key = ramp.keys[min(ramp.selected, len(ramp.keys) - 1)]
+        plain = field
+
+        def field(lay, n, label, width=None):
+            return plain(lay, n, label, width, indent=POINT_INDENT)
         field(layout, node, "Point No.", 80).prop(ramp, "point", text="")
         fields = layout.column()
         fields.enabled = len(selected_indices(ramp)) < 2  # with several points selected the fields are read-only
-        field(fields, node, "Position").prop(key, "position", text="", slider=True)
-        field(fields, node, "Value").prop(key, "value", text="", slider=True)
-        field(fields, node, "Interpolation", 130).prop(key, "interpolation", text="")
+        field(fields, node, "Position").prop(ramp, "point_position", text="", slider=True)
+        field(fields, node, "Value").prop(ramp, "point_value", text="", slider=True)
+        interp = field(fields, node, "Interpolation", 130)
+        interp.enabled = not R.is_bezier(keys_of(ramp))  # Bezier: set for the whole ramp in the header
+        interp.prop(ramp, "point_interpolation", text="")
 
 
 def _row_sizes():
@@ -327,10 +492,19 @@ def _row_sizes():
     return row, int(5.0 * scale + 1e-4)
 
 
+SEPARATOR_FACTOR = 0.5  # the line under Run Over (node.draw_buttons)
+
+
+def _separator_height(row):
+    """Blender px of `layout.separator(factor=SEPARATOR_FACTOR)` in a node: Blender
+    makes it int(int(0.3 * widget unit) * factor) tall (interface_layout, 5.2)."""
+    return int(int(0.3 * row) * SEPARATOR_FACTOR)
+
+
 def ramp_rects(node, region):
-    """{name: (graph rect, marker rect, label baseline (x, y))} in region pixels, rects (x0, y0, x1, y1);
+    """{name: (graph rect, marker rect)} in region pixels, rects (x0, y0, x1, y1);
     and px. Counted down from the node's top, following `draw_buttons`: header and
-    output socket, Group, Run Over, the ch*() column (aligned: no gaps), then each
+    output socket, Group, Run Over, the line under it, the ch*() column (aligned: no gaps), then each
     ramp's label row, graph row and point fields."""
     x0, _y0, x1, _y1, px = ce.box_rect(node, region)
     top, zoom = ce.node_top(node, region)
@@ -339,16 +513,17 @@ def ramp_rects(node, region):
     gx0 = x0 + (TOGGLES_W + TOGGLES_GAP) * px  # right of the toggle buttons
     y = 2 * row + BODY_TOP + 2 * (row + gap)  # down to below Run Over
     chans = len(node.channels())
+    if chans or node.ramps():  # the line under Run Over
+        y += _separator_height(row) + gap
     if chans:
         y += chans * row + gap
     rects = {}
     for ramp in shown_ramps(node):
-        label = (x0 + LABEL_X * zoom, top - (y + row - LABEL_BASE) * zoom)  # x0: the body's left edge
         y += row + gap  # the label row
         h = graph_height(ramp) * unit
         graph_top = top - y * zoom
         markers = (gx0, graph_top - h * zoom, x1, graph_top - (h - MARKER_H * unit) * zoom)
-        rects[ramp.name] = ((gx0, markers[3], x1, graph_top), markers, label)
+        rects[ramp.name] = ((gx0, markers[3], x1, graph_top), markers)
         y += max(2 * row, h) + gap + (4 * (row + gap) if ramp.show_point else 0)
     return rects, px
 
@@ -401,28 +576,13 @@ def _arrow(x, y, direction, px, color):
     _tris(tri(ARROW_W * px, 1.0 * px), color)
 
 
-def _draw_label(region, text, at, px):
-    """The ramp's name at baseline `at`, in the UI font, drawn twice for a bold look."""
-    x, y = at
-    size = LABEL_POINTS * px
-    if not (-size < y < region.height + size and x < region.width):
-        return
-    blf.size(0, size)
-    blf.color(0, *ce._ink(PALETTE["label"]))
-    bold = LABEL_BOLD * px / (ce._ui_scale() or 1.0)  # px / ui_scale = zoom
-    for dx in (0.0, bold / 2, bold):
-        blf.position(0, x + dx, y, 0)
-        blf.draw(0, text)
-
-
 def draw_node(node, region, vx, vy):
     """Paint every ramp graph of a wrangle (called from code_editor's draw handler)."""
     if not node.bex_ramps:
         return
     rects, px = ramp_rects(node, region)
     for ramp in shown_ramps(node):
-        graph, markers, label = rects[ramp.name]
-        _draw_label(region, ui_label(ramp.name), label, px)
+        graph, markers = rects[ramp.name]
         if graph[2] < 0 or graph[0] > region.width or markers[1] > region.height or graph[3] < 0:
             continue
         gpu.state.blend_set("ALPHA")
@@ -439,17 +599,29 @@ def draw_node(node, region, vx, vy):
         pts = [_to_px(graph, x, y) for x, y in R.polyline(keys)]  # spans x = 0..1
         _tris([p for a, b in zip(pts, pts[1:]) for p in (a, b, (a[0], graph[1]), b, (b[0], graph[1]), (a[0], graph[1]))],
               PALETTE["fill"])
-        _line(region, pts, PALETTE["line"], max(1.0, 1.2 * px))
+        _line(region, pts, PALETTE["line"], max(1.0, CURVE_W * px))
         picked = [k.select for k in ramp.keys]
         # Dots may hang over the graph's edges (a key at 0 or 1).
         gpu.state.scissor_test_set(False)
         r = (KEY_R + 1) * px
         if not ce._clip(region, vx, vy, graph[0] - r, graph[1] - r, graph[2] + r, graph[3] + r):
             continue
+        n = len(keys)
+        bezier = R.is_bezier(keys)
+        if bezier:  # handle lines first, under the dots (drawn like Houdini's, in purple)
+            for i in range(n):
+                if not R.is_anchor(i, n):
+                    a = R.anchor_of(i, n)
+                    _line(region, [_to_px(graph, keys[a][0], _clamp01(keys[a][1])),
+                                   _to_px(graph, keys[i][0], _clamp01(keys[i][1]))],
+                          PALETTE["handle_line"], max(1.0, 1.0 * px))
         for i, (x, y, _interp) in enumerate(keys):
             cx, cy = _to_px(graph, x, _clamp01(y))
             color = PALETTE["selected" if picked[i] else "key"]
-            if 0.0 <= y <= 1.0:
+            if bezier and not R.is_anchor(i, n) and 0.0 <= y <= 1.0:  # a handle: a hollow dot
+                _dot(cx, cy, (HANDLE_R + 1) * px, color)
+                _dot(cx, cy, (HANDLE_R - 0.5) * px, PALETTE["back"])
+            elif 0.0 <= y <= 1.0:
                 _dot(cx, cy, (KEY_R + 1) * px, PALETTE["key_edge"])
                 _dot(cx, cy, KEY_R * px, color)
             else:  # off the graph: a triangle on its edge, pointing to where the point is
@@ -459,6 +631,8 @@ def draw_node(node, region, vx, vy):
         w = MARKER_W * px
         if ce._clip(region, vx, vy, markers[0] - w, markers[1], markers[2] + w, markers[3]):
             for i, (x, _y, _interp) in enumerate(keys):
+                if bezier and not R.is_anchor(i, n):
+                    continue  # markers are for anchors; handles go with them
                 cx = _to_px(graph, x, 0)[0]
                 top, bottom = markers[3] - MARKER_GAP * px, markers[1] + 1 * px
                 mid = top - w
@@ -470,20 +644,23 @@ def draw_node(node, region, vx, vy):
 
 # -- presets thumbnails --------------------------------------------------------
 
-def _preset_icons():
-    """{preset name: icon id}: thumbnails drawn from the same ramp maths."""
+def _preset_icons(dim=False):
+    """{preset name: icon id}: thumbnails drawn from the same ramp maths; `dim`: the
+    muted node's see-through copies."""
     global _previews
     if _previews is None:
         import bpy.utils.previews
         _previews = bpy.utils.previews.new()
     icons = {}
     for name, keys in R.PRESETS.items():
-        pv = _previews.get(name)
+        key = name + ("~dim" if dim else "")
+        pv = _previews.get(key)
         if pv is None:
-            pv = _previews.new(name)
+            pv = _previews.new(key)
             size = ramp_icons.THUMB
             pv.image_size = (size, size)
-            pv.image_pixels_float = ramp_icons.thumbnail(keys, size)
+            pixels = ramp_icons.thumbnail(keys, size)
+            pv.image_pixels_float = ramp_icons.dimmed(pixels) if dim else pixels
         icons[name] = pv.icon_id
     return icons
 
@@ -499,7 +676,7 @@ def ramp_at(context, x, y):
             continue
         rects, px = ramp_rects(node, context.region)
         for ramp in shown_ramps(node):
-            graph, markers, _label = rects[ramp.name]
+            graph, markers = rects[ramp.name]
             reach = HIT_R * px  # end keys hang over the edges
             if graph[0] - reach <= x <= graph[2] + reach and markers[1] <= y <= graph[3] + reach:
                 return node, ramp, graph, markers, px
@@ -553,22 +730,27 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         # A dot under the press wins, even where it hangs over the marker row
         # (a key at value 0); otherwise a press in the marker row takes the
         # nearest marker and drags only the position.
+        n = len(keys)
+        bezier = R.is_bezier(keys)
         grab, best = None, HIT_R * px
         for i, (kx, ky, _interp) in enumerate(keys):
             cx, cy = _to_px(graph, kx, _clamp01(ky))
             d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
-            if d <= best:
+            if d < best or (d == best and grab is None):  # ties: the lower index (an anchor before its handle)
                 grab, best = i, d
         on_markers = grab is None and y < markers[3]
         if on_markers:
             best = HIT_R * px
             for i, (kx, _ky, _interp) in enumerate(keys):
+                if bezier and not R.is_anchor(i, n):
+                    continue
                 d = abs(x - _to_px(graph, kx, 0)[0])
                 if d <= best:
                     grab, best = i, d
         if grab is not None and event.ctrl:
-            select_only(ramp, grab)
-            delete_selected(node, ramp)
+            if not bezier or R.is_anchor(grab, n):  # a handle alone isn't deleted
+                select_only(ramp, grab)
+                delete_selected(node, ramp)
             return {"FINISHED"}
         if grab is None:
             if on_markers:
@@ -576,12 +758,19 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
                 ce._redraw(context)
                 return {"FINISHED"}
             nx, ny = _from_px(graph, x, y)
-            nx, ny = min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0)
-            k = ramp.keys.add()
-            k.interpolation = _segment_interpolation(keys, nx)
-            k.position, k.value = nx, ny
-            grab = len(ramp.keys) - 1
-            select_only(ramp, grab)
+            nx, ny = _clamp01(nx), _clamp01(ny)
+            if bezier:  # split the curve there (same shape), then lift the new anchor to the press
+                new, grab = R.bezier_insert(keys, nx)
+                deselect(ramp)
+                set_keys(node, ramp, new)
+                select_only(ramp, grab)
+                move_point(ramp, grab, None, ny)
+            else:
+                k = ramp.keys.add()
+                k.interpolation = _segment_interpolation(keys, nx)
+                k.position, k.value = nx, ny
+                grab = len(ramp.keys) - 1
+                select_only(ramp, grab)
         elif event.shift:
             select_range(ramp, grab)
         elif not ramp.keys[grab].select or len(selected_indices(ramp)) < 2:
@@ -592,7 +781,10 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         self.collapse = not event.shift
         self.graph = graph
         self.press = _from_px(graph, x, y)
-        self.start = {i: (ramp.keys[i].position, ramp.keys[i].value) for i in selected_indices(ramp)}
+        picked = selected_indices(ramp)
+        self.start = {i: (ramp.keys[i].position, ramp.keys[i].value) for i in picked}
+        # Handles riding along with their anchors (they don't stop the move).
+        self.ride = {i: (ramp.keys[i].position, ramp.keys[i].value) for i in carried(ramp, picked)}
         self.moved = False
         context.window_manager.modal_handler_add(self)
         ce._redraw(context)
@@ -623,6 +815,17 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
                 for i, (p, v) in self.start.items():
                     if i < len(ramp.keys):
                         ramp.keys[i].position, ramp.keys[i].value = p + dx, v + dy
+                for i, (p, v) in self.ride.items():
+                    if i < len(ramp.keys):
+                        ramp.keys[i].position, ramp.keys[i].value = _clamp01(p + dx), v + dy
+                # A handle dragged without its anchor keeps the other handle in line.
+                if R.is_bezier(keys_of(ramp)):
+                    n = len(ramp.keys)
+                    for i in self.start:
+                        if i < n and not R.is_anchor(i, n) and R.anchor_of(i, n) not in self.start:
+                            keep_side(ramp, i)
+                            if sibling(ramp, i) not in self.start:
+                                align_sibling(ramp, i)
             finally:
                 _quiet = False
             write_curve(node, ramp)
@@ -733,17 +936,27 @@ class BEX_OT_ramp_action(bpy.types.Operator):
             return {"CANCELLED"}
         keys = keys_of(ramp)
         sel = min(ramp.selected, len(keys) - 1)
+        bezier = R.is_bezier(keys)
+        if bezier:
+            sel = R.anchor_of(sel, len(keys))
         if self.action == "ADD":
-            order = sorted(range(len(keys)), key=lambda i: keys[i][0])
+            order = sorted((i for i in range(len(keys)) if not bezier or R.is_anchor(i, len(keys))),
+                           key=lambda i: keys[i][0])
             at = order.index(sel)
             x0 = keys[order[at]][0]
             x1 = keys[order[at + 1]][0] if at + 1 < len(order) else 1.0
             if at + 1 >= len(order) and x0 >= 1.0:  # the last key sits at the end: go left
                 x1, x0 = x0, keys[order[at - 1]][0] if at > 0 else 0.0
             x = (x0 + x1) / 2
-            keys.append((x, R.evaluate(keys, x), keys[sel][2]))
-            set_keys(node, ramp, keys)
-            select_only(ramp, len(keys) - 1)
+            if bezier:  # split the curve there, same shape
+                new, at = R.bezier_insert(keys, x)
+                deselect(ramp)
+                set_keys(node, ramp, new)
+                select_only(ramp, at)
+            else:
+                keys.append((x, R.evaluate(keys, x), keys[sel][2]))
+                set_keys(node, ramp, keys)
+                select_only(ramp, len(keys) - 1)
         elif self.action == "DELETE":
             delete_selected(node, ramp, selected_indices(ramp) or [sel])
         else:
@@ -751,7 +964,7 @@ class BEX_OT_ramp_action(bpy.types.Operator):
             selected_pos = keys[sel][0] if self.action == "INVERT" else 1.0 - keys[sel][0]
             had_selection = bool(selected_indices(ramp))
             set_keys(node, ramp, new)
-            active = min(range(len(new)), key=lambda i: abs(new[i][0] - selected_pos))
+            active = _nearest_anchor(new, selected_pos)
             if had_selection:
                 select_only(ramp, active)
             else:

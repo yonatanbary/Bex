@@ -124,10 +124,22 @@ def fold_shapes(fold):
 _SHAPE = ((0.0, 0.0), (1.0, 1.0))
 
 
+def _diamond(x, y, r=0.06):
+    return [("tri", ((x - r, y), (x, y - r), (x + r, y))), ("tri", ((x - r, y), (x, y + r), (x + r, y)))]
+
+
 def interpolation_shapes(mode):
+    m, s = 0.16, 0.68  # margin and span of the 0-1 square inside the icon
+    if mode == "BEZIER":  # an S with its two handles
+        keys = [(0.0, 0.0, mode), (0.7, 0.0, mode), (0.3, 1.0, mode), (1.0, 1.0, mode)]
+        curve = [(m + s * x, m + s * y) for x, y in R.polyline(keys)]
+        shapes = [("line", curve)]
+        for (ax, ay), (hx, hy) in (((0.0, 0.0), (0.7, 0.0)), ((1.0, 1.0), (0.3, 1.0))):
+            shapes.append(("line", [(m + s * ax, m + s * ay), (m + s * hx, m + s * hy)]))
+            shapes += _diamond(m + s * hx, m + s * hy)
+        return shapes
     keys = [(x, y, mode) for x, y in _SHAPE]
     line = R.polyline(keys)
-    m, s = 0.16, 0.68  # margin and span of the 0-1 square inside the icon
     if mode == "CONSTANT":
         pts = [(m + s * x, m + s * y) for x, y in line]
     else:
@@ -145,16 +157,27 @@ SHAPES = {
 
 
 # -- Blender side --------------------------------------------------------------
-def icon(name):
-    """The icon id of SHAPES[name] (drawn once per session)."""
+DIM = 0.5  # an icon on a muted node: Blender dims its own icons there, not preview icons
+
+
+def dimmed(pixels, amount=DIM):
+    """Premultiplied RGBA made see-through by `amount` (every channel scales)."""
+    return [c * amount for c in pixels]
+
+
+def icon(name, dim=False):
+    """The icon id of SHAPES[name] (drawn once per session); `dim`: the muted look."""
     global _previews
     if _previews is None:
         import bpy.utils.previews
         _previews = bpy.utils.previews.new()
-    pv = _previews.get(name)
+    key = name + ("~dim" if dim else "")
+    pv = _previews.get(key)
     if pv is None:
-        pv = _previews.new(name)
+        pv = _previews.new(key)
         pixels = raster(SHAPES[name]())
+        if dim:
+            pixels = dimmed(pixels)
         pv.icon_size = pv.image_size = (SIZE, SIZE)
         pv.icon_pixels_float = pixels
         pv.image_pixels_float = pixels

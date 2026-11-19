@@ -63,18 +63,19 @@ MENU_WIDTH = 130    # Run Over's menu keeps this width instead of reaching the r
 NODE_PAD = 16       # the node's inner margins, left + right (node units)
 
 
-def _field(layout, node, label, width=None):
+def _field(layout, node, label, width=None, indent=0.0):
     """`label` right-aligned in a fixed-width column, and a layout for the field
     after it (`width` wide when given, else to the right edge). Rows split by
-    fractions, so the fractions come from the node's width."""
+    fractions, so the fractions come from the node's width. `indent` moves the
+    label and field right (node units), under something they belong to."""
     inner = max(1.0, node.width - NODE_PAD)
-    split = layout.split(factor=min(0.9, LABEL_WIDTH / inner))
+    split = layout.split(factor=min(0.9, (LABEL_WIDTH + indent) / inner))
     head = split.row()
     head.alignment = "RIGHT"
     head.label(text=label)
     if width is None:
         return split
-    rest = max(1.0, inner - LABEL_WIDTH)
+    rest = max(1.0, inner - LABEL_WIDTH - indent)
     return split.split(factor=min(1.0, width / rest))
 
 
@@ -136,6 +137,8 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         layout.context_pointer_set("node", self)  # for the Presets menu's operators
         _field(layout, self, "Group").prop(self, "group", text="")
         _field(layout, self, "Run Over", MENU_WIDTH).prop(self, "domain", text="")
+        if self.channels() or self.ramps():  # a line between the node's settings and the script's
+            layout.separator(factor=ramp_widget.SEPARATOR_FACTOR, type="LINE")
         if self.error and not self.script:  # else it's shown under the code
             col = layout.column(align=True)
             col.alert = True
