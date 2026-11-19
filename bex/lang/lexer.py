@@ -35,7 +35,10 @@ _TOKEN_RE = re.compile(
     re.X,
 )
 
+_KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "and", "or", "not", "return"})
 _PREFIX_TYPES = {"f": "float", "i": "int", "v": "vector", "b": "bool"}
+# TODO: s@ string attributes. Blender 5.2 and 5.3 list STRING for Store / Named Attribute
+# but refuse it, so geometry nodes can't hold text per element yet. See BLENDER_VERSIONS.md.
 
 # C/VEX habits -> what to write instead.
 _HINTS = {
@@ -53,6 +56,16 @@ _WS_RE = re.compile(r"[ \t\r]*")
 
 def _indent_width(ws):
     return sum(4 if c == "\t" else 1 for c in ws if c != "\r")
+
+
+def _is_component(text, src, start, toks):
+    """`.1` written right after a name, attribute, `)` or `]` picks a component."""
+    if not (text[0] == "." and text[1:].isdigit()) or not toks or start == 0 or src[start - 1] in " \t\r\n":
+        return False
+    prev = toks[-1]
+    if prev.kind == "ident":
+        return prev.val not in _KEYWORDS  # `else.5` is still else 0.5
+    return prev.kind == "attr" or (prev.kind == "op" and prev.val in (")", "]"))
 
 
 def tokenize(src):
@@ -104,6 +117,9 @@ def tokenize(src):
             pass
         elif kind == "bad":
             raise BexError(_HINTS.get(text, f"unexpected character {text!r}"), line)
+        elif kind == "num" and _is_component(text, src, m.start(), toks):
+            toks.append(Token("op", ".", line))  # @P.1 is @P[1], not @P followed by 0.1
+            toks.append(Token("num", int(text[1:]), line))
         elif kind == "num":
             is_float = any(c in text for c in ".eE")
             toks.append(Token("num", float(text) if is_float else int(text), line))

@@ -9,10 +9,11 @@ the end of the script.
 """
 
 import math
+import re
 from dataclasses import dataclass, field
 
-from .lexer import BexError
-from .parser import parse
+from .lexer import _PREFIX_TYPES, BexError
+from .parser import N, parse, parse_group
 
 MAX_LOOP_ITERATIONS = 1024
 RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3}
@@ -51,7 +52,26 @@ class Program:
     writes: list = field(default_factory=list)  # [(attribute, type, Val)] in script order
     source: list = field(default_factory=list)  # script lines, used to label the generated nodes
     pending: list = field(default_factory=list)  # ch*() names held back on the line being edited
+    ramps: list = field(default_factory=list)  # chramp() names, first-use order
+    shared_ramps: set = field(default_factory=set)  # ramps read at more than one position
     reads: list = field(default_factory=list)  # [(attribute, type)] read from the incoming geometry
+    group: object = None  # Val (bool) choosing the elements to write, None = all
+    group_source: str = ""  # the Group expression, used to label its nodes
+    warnings: list = field(default_factory=list)  # problems that don't stop the build (a bad Group)
+    inputs: list = field(default_factory=list)  # extra geometry inputs the script reads (1-3), sorted
+    stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
+    captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
+
+
+@dataclass
+class Store:
+    """One write node: Store Named Attribute, or Set Position for `P`."""
+    name: str
+    type: str
+    value: Val  # the value to write (Set Position: the Offset when `offset`)
+    selection: object = None  # bool Val: which elements are written, None = all
+    conds: list = field(default_factory=list)  # the bool Vals ANDed into `selection` (Group first)
+    offset: bool = False  # Set Position: `value` goes into Offset, not Position
 
 
 # Built-in attributes that read from a field node instead of a named attribute.
@@ -62,12 +82,37 @@ BUILTINS = {
     "ptnum": ("int", "index", 0),
     "elemnum": ("int", "index", 0),
     "primnum": ("int", "index", 0),
+    "curvenum": ("int", "index", 0),
+    "vtxnum": ("int", "index", 0),
+    "edgenum": ("int", "index", 0),
     "index": ("int", "index", 0),
     "id": ("int", "id", 0),
     "Time": ("float", "time", 0),
     "Frame": ("float", "time", 1),
+    "curveu": ("float", "spline_parameter", 0),  # 0-1 along each curve (Spline Parameter's Factor)
+    "curvelength": ("float", "spline_parameter", 1),  # distance along the curve from its start
 }
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "index", "Time", "Frame"}
+# Index built-ins that depend on the Run Over domain, like Formula to Nodes / Houdini:
+# name -> {domain: (input kind, output)}. @elemnum / @index are always the element's index.
+DOMAIN_INDEX = {
+    "ptnum": {"POINT": ("index", 0), "INSTANCE": ("index", 0), "CORNER": ("vertex_of_corner", 0)},
+    "primnum": {"FACE": ("index", 0), "CURVE": ("index", 0), "CORNER": ("face_of_corner", 0)},
+    "curvenum": {"CURVE": ("index", 0), "POINT": ("curve_of_point", 0)},
+    "vtxnum": {"CORNER": ("index", 0)},
+    "edgenum": {"EDGE": ("index", 0)},
+}
+INDEX_HINTS = {
+    "ptnum": "@ptnum is a point's number; this runs over {d}. Use @elemnum for this element's index",
+    "primnum": "@primnum is a face's or curve's number, and a point can belong to several faces. "
+               "On curve points use @curvenum, or set Run Over to Faces or Curves",
+    "curvenum": "@curvenum is the curve a point belongs to; run over Points or Curves",
+    "vtxnum": "@vtxnum is a face corner's number; run over Corners",
+    "edgenum": "@edgenum is an edge's number; run over Edges",
+}
+
+# Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
+COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
+READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
 
 
@@ -170,15 +215,116 @@ COMPARE = {
     "!=": ("NOT_EQUAL", lambda a, b: a != b),
 }
 CHANNELS = {"chf": "float", "chi": "int", "chv": "vector", "chb": "bool"}
+RAMPS = {"chramp": "float"}  # a ramp on the node (a Float Curve), looked up at a 0-1 position
 # Bounding box of the geometry that entered the node. The optional first argument
 # is the input number, as in VEX (only input 0 exists).
 BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox")
 # Every function name Compiler.call accepts (used by the editor's highlighter). Keep in sync with call().
-FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset({
+# Geometry inputs, like a wrangle's four: 0 is the incoming geometry, 1-3 are the
+# node's "Input N" sockets (always there).
+MAX_INPUT = 3
+SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
+COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
+# Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
+INPUT_SOCKETS = tuple(f"Input {n + 1}" for n in range(1, MAX_INPUT + 1))
+OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
+
+FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | frozenset(RAMPS) | frozenset({
     "log", "log10", "clamp", "lerp", "mix", "fit", "efit", "fit01", "fit11", "smoothstep",
     "length", "normalize", "dot", "cross", "distance", "set", "vector", "float", "bool", "int",
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
-}) | frozenset(BBOX)
+    "nearpoint",
+}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS)
+
+# Signature help shown while typing a call: name -> (parameters, one-line summary).
+# BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
+# Keep the summaries short and plain: what it gives you, in a few words.
+SIGNATURES = {
+    # Math
+    "sin": (("angle",), "Sine of an angle in radians."),
+    "cos": (("angle",), "Cosine of an angle in radians."),
+    "tan": (("angle",), "Tangent of an angle in radians."),
+    "asin": (("value",), "Inverse sine, in radians."),
+    "acos": (("value",), "Inverse cosine, in radians."),
+    "atan": (("value",), "Inverse tangent, in radians."),
+    "atan2": (("y", "x"), "Angle of the point (x, y), in radians."),
+    "sinh": (("value",), "Hyperbolic sine."),
+    "cosh": (("value",), "Hyperbolic cosine."),
+    "tanh": (("value",), "Hyperbolic tangent."),
+    "radians": (("degrees",), "Degrees to radians."),
+    "degrees": (("radians",), "Radians to degrees."),
+    "sqrt": (("value",), "Square root. 0 for negative numbers."),
+    "pow": (("base", "exponent"), "base to the power of exponent."),
+    "exp": (("value",), "e to the power of value."),
+    "log": (("value",), "Natural logarithm."),
+    "log10": (("value",), "Base 10 logarithm."),
+    "abs": (("value",), "Drops the minus sign."),
+    "sign": (("value",), "-1, 0 or 1, depending on the sign."),
+    "floor": (("value",), "Rounds down."),
+    "ceil": (("value",), "Rounds up."),
+    "round": (("value",), "Rounds to the nearest whole number."),
+    "trunc": (("value",), "Cuts off the decimals."),
+    "frac": (("value",), "Just the decimals: frac(2.75) is 0.75."),
+    "min": (("a", "b"), "The smaller of the two."),
+    "max": (("a", "b"), "The larger of the two."),
+    "clamp": (("value", "min", "max"), "Keeps value between min and max."),
+    "mod": (("value", "divisor"), "Remainder after division. Never negative for a positive divisor."),
+    "fmod": (("value", "divisor"), "Same as mod()."),
+    "wrap": (("value", "min", "max"), "Wraps value around to stay between min and max."),
+    "snap": (("value", "step"), "Rounds down to a multiple of step."),
+    "pingpong": (("value", "length"), "Goes from 0 to length and back, over and over."),
+    # Ranges and blending
+    "fit": (("value", "old_min", "old_max", "new_min", "new_max"),
+            "Moves value from the old range to the new one, clamped."),
+    "efit": (("value", "old_min", "old_max", "new_min", "new_max"),
+             "Like fit(), but not clamped."),
+    "fit01": (("value", "new_min", "new_max"), "Moves value from 0 to 1 into the new range."),
+    "fit11": (("value", "new_min", "new_max"), "Moves value from -1 to 1 into the new range."),
+    "smoothstep": (("min", "max", "value"), "0 below min, 1 above max, a smooth curve between."),
+    "smooth": (("min", "max", "value"), "Same as smoothstep()."),
+    "smootherstep": (("min", "max", "value"), "Like smoothstep(), with softer ends."),
+    "lerp": (("a", "b", "t"), "Blends from a (t = 0) to b (t = 1)."),
+    "mix": (("a", "b", "t"), "Same as lerp()."),
+    # Vectors
+    "set": (("x", "y", "z"), "Makes a vector."),
+    "length": (("vector",), "How long the vector is."),
+    "normalize": (("vector",), "Same direction, length 1."),
+    "dot": (("a", "b"), "Dot product of two vectors."),
+    "cross": (("a", "b"), "A vector at right angles to both."),
+    "distance": (("a", "b"), "Distance between two points."),
+    # Types
+    "vector": (("x", "y", "z"), "Makes a vector. With one value, all three are set to it."),
+    "float": (("value",), "Turns value into a float."),
+    "int": (("value",), "Turns value into a whole number, cutting off the decimals."),
+    "bool": (("value",), "True unless value is 0."),
+    # Noise and random
+    "noise": (("position",), "Smooth noise, roughly between 0 and 1."),
+    "vnoise": (("position",), "Smooth noise as a vector, one value per axis."),
+    "rand": (("seed",), "Random number between 0 and 1. Same seed, same number."),
+    "vrand": (("seed",), "Random vector, each axis between 0 and 1."),
+    # Node values
+    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed."),
+    "chi": (("name", "[default]"), "A whole number value on the node."),
+    "chv": (("name", "[default]"), "A vector value on the node."),
+    "chb": (("name", "[default]"), "A checkbox on the node."),
+    "chramp": (("name", "position"), "A ramp drawn on the node, read at position 0 to 1."),
+    # Bounding box
+    "getbbox_min": (("[input]",), "Lowest corner of the geometry's bounding box."),
+    "getbbox_max": (("[input]",), "Highest corner of the geometry's bounding box."),
+    "getbbox_size": (("[input]",), "Size of the geometry's bounding box."),
+    "getbbox_center": (("[input]",), "Center of the geometry's bounding box."),
+    "relbbox": (("[input]", "position"), "Where position sits in the bounding box, 0 to 1 on each axis."),
+    # Other inputs
+    "point": (("input", "name", "index"), 'Reads a point attribute from an input: point(1, "P", 0).'),
+    "prim": (("input", "name", "index"), "Reads a face attribute from an input."),
+    "vertex": (("input", "name", "index"), "Reads a corner attribute from an input."),
+    "npoints": (("input",), "Number of points on an input."),
+    "nprims": (("input",), "Number of faces on an input."),
+    "nvertices": (("input",), "Number of corners on an input."),
+    "nearpoint": (("input", "position"), "Index of the point on the input closest to position."),
+    # Loops
+    "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
+}
 
 
 class Compiler:
@@ -198,8 +344,11 @@ class Compiler:
         self.attr_types = {}  # attribute name -> type, fixed on first use
         self.written = []  # attribute names in first-write order
         self.params = {}  # channel name -> (type, default)
+        self.ramps = {}  # chramp() name -> {position Val} it is read at
         self.line = 0  # line used for error messages
-        self.stmt_line = 0  # line of the statement being executed
+        self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
+        self.bare_attributes = False
+        self.inputs = []  # extra geometry inputs (1-3) the script reads, first-use order
 
     # -- IR construction ---------------------------------------------------
     def err(self, msg):
@@ -367,21 +516,68 @@ class Compiler:
         """Bounding box of the incoming geometry: getbbox_min/max/size/center(), relbbox(p)."""
         n = 1 if name == "relbbox" else 0
         want(n, n + 1)
+        geo = 0
         if len(a) == n + 1:
-            if not (a[0].is_const and a[0].type == "int" and a[0].const == 0):
-                raise self.err(f"{name}() reads the node's input geometry, so its first argument can only be 0")
+            geo = self.input_number(a[0], name)
             a = a[1:]
         if name == "relbbox":
-            return self.node("group", "vector", (self.conv(a[0], "vector"),), name="relbbox")
+            return self.node("group", "vector", (self.conv(a[0], "vector"),), name="relbbox", input=geo)
         out = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center").index(name)
-        return self.node("group", "vector", (), out=out, name="bbox")
+        return self.node("group", "vector", (), out=out, name="bbox", input=geo)
+
+    # -- other inputs ---------------------------------------------------------
+    def input_number(self, v, fn):
+        """The geometry input a function reads: a constant 0-3 (1-3 are recorded in `inputs`)."""
+        if not (v.is_const and v.type == "int" and 0 <= v.const <= MAX_INPUT):
+            raise self.err(f"{fn}()'s first argument is the input number: 0 (Geometry), "
+                           f"or 1, 2, 3 for the sockets Input 2, Input 3, Input 4")
+        if v.const and v.const not in self.inputs:
+            self.inputs.append(v.const)
+        return v.const
+
+    def read_input(self, n, name, type):
+        """A field that reads `name` on input `n`. Its own IR node (`src`), so it is
+        never mixed up with, or captured as, the same read on this node's geometry."""
+        if name in BUILTINS:
+            _, kind, out = BUILTINS[name]
+            return self.node("input", type, (), out=out, name=kind, src=n)
+        return self.node("attr", type, (), name=name, dtype=type, src=n)
+
+    def sample(self, n, name, type, index, domain):
+        value = self.read_input(n, name, type)
+        index = self.conv(index, "int")
+        return self.node("sample", type, (value, index), input=n, domain=domain, dtype=type)
+
+    def sample_call(self, fn, args):
+        """point(1, "P", i) / prim() / vertex(): an attribute of element i on an input."""
+        if len(args) != 3 or args[1].kind != "str":
+            raise self.err(f'{fn}() takes an input number, an attribute name in quotes and an index, '
+                           f'e.g. {fn}(1, "P", @ptnum)')
+        n = self.input_number(self.eval(args[0]), fn)
+        name, type = _typed_name(args[1].value)
+        if not name:
+            raise self.err(f"{fn}() needs an attribute name")
+        if type is None:
+            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+        return self.sample(n, name, type, self.eval(args[2]), SAMPLE_FUNCS[fn])
+
+    def count(self, n, domain):
+        return self.node("count", "int", (), input=n, domain=domain)
+
+    def read_opinput(self, n, name, prefix_type):
+        if n > MAX_INPUT:
+            raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
+        self.input_number(Val("int", n), f"@opinput{n}")
+        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or KNOWN_TYPES.get(name, "float")
+        index = self.read_original("index", "int")
+        return self.sample(n, name, type, index, self.domain)
 
     def channel(self, name, args):
         type = CHANNELS[name]
         if not args or args[0].kind != "str":
             raise self.err(f'{name}() needs a name in quotes, e.g. {name}("amount")')
         label = args[0].value.strip()
-        if not label or label == "Geometry":
+        if not label or label == "Geometry" or label in INPUT_SOCKETS:
             raise self.err(f"'{label}' cannot be used as a {name}() name")
         if len(args) > 2:
             raise self.err(f"{name}() takes a name and an optional default value")
@@ -401,9 +597,30 @@ class Compiler:
             self.params[label] = (type, default.const)
         return self.node("param", type, (), name=label)
 
+    def ramp(self, name, args):
+        if not args or args[0].kind != "str":
+            raise self.err(f'{name}() needs a name in quotes, e.g. {name}("falloff", u)')
+        if len(args) != 2:
+            raise self.err(f"{name}() takes a name and a position, e.g. {name}(\"falloff\", u)")
+        label = args[0].value.strip()
+        if not label:
+            raise self.err(f"'{label}' cannot be used as a {name}() name")
+        pos = self.conv(self.eval(args[1]), "float")
+        if args[0].line == self.pending_line and label not in self.known_params and label not in self.ramps:
+            # Still being typed: act as the default (straight) ramp, and make no node yet.
+            if label not in self.pending:
+                self.pending.append(label)
+            return pos
+        self.ramps.setdefault(label, set()).add(pos)
+        return self.node("ramp", RAMPS[name], (pos,), name=label)
+
     def call(self, name, arg_nodes):
         if name in CHANNELS:
             return self.channel(name, arg_nodes)
+        if name in RAMPS:
+            return self.ramp(name, arg_nodes)
+        if name in SAMPLE_FUNCS:
+            return self.sample_call(name, arg_nodes)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
 
@@ -461,6 +678,13 @@ class Compiler:
                 return self.fold("vector", _wrap, x, hi, lo) or self.node("vmath", "vector", (x, hi, lo), op="WRAP")
             x, lo, hi = floats()
             return self.fold("float", _wrap, x, hi, lo) or self.node("math", "float", (x, hi, lo), op="WRAP")
+        if name in COUNT_FUNCS:
+            want(1)
+            return self.count(self.input_number(a[0], name), COUNT_FUNCS[name])
+        if name == "nearpoint":
+            want(2)
+            n = self.input_number(a[0], name)
+            return self.node("nearest", "int", (self.conv(a[1], "vector"),), input=n, domain="POINT")
         if name in BBOX:
             return self.bbox(name, a, want)
         if name in ("length", "normalize"):
@@ -518,6 +742,11 @@ class Compiler:
         return known
 
     def read_original(self, name, type):
+        if name in DOMAIN_INDEX:
+            found = DOMAIN_INDEX[name].get(self.domain)
+            if found is None:
+                raise self.err(INDEX_HINTS[name].format(d=self.domain.lower() + "s"))
+            return self.node("input", "int", (), out=found[1], name=found[0])
         if name in BUILTINS:
             _, kind, out = BUILTINS[name]
             return self.node("input", type, (), out=out, name=kind)
@@ -537,6 +766,8 @@ class Compiler:
             return val
         if name in CONSTANTS:
             return Val("float", CONSTANTS[name])
+        if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
+            return self.read_attr(name, self.attr_type(name, None))
         if name in self.half_set:
             raise self.err(f"'{name}' is only set in one branch of the if on line {self.half_set[name]}; "
                            f"give it a value before the if")
@@ -553,6 +784,8 @@ class Compiler:
             self.half_set.pop(target.name, None)
             return
         name = target.name
+        if OPINPUT_RE.match(name):
+            raise self.err(f"@{name} reads another input, it cannot be written")
         type = self.attr_type(name, target.type)
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
@@ -575,6 +808,11 @@ class Compiler:
         if k == "var":
             return self.lookup(e.name)
         if k == "attr":
+            m = OPINPUT_RE.match(e.name)
+            if m:
+                return self.read_opinput(int(m.group(1)), m.group(2), e.type)
+            if e.name in COUNT_ATTRS:
+                return self.count(0, COUNT_ATTRS[e.name])
             return self.read_attr(e.name, self.attr_type(e.name, e.type))
         if k == "member":
             v = self.eval(e.obj)
@@ -694,19 +932,195 @@ class Compiler:
 
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
-                       reads=list(self.reads))
+                       ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
+                       reads=list(self.reads), inputs=sorted(self.inputs))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
                 prog.writes.append((name, type, val))
         return prog
 
+    # -- write plan ---------------------------------------------------------
+    # Every written value means "computed from the incoming geometry". The write
+    # nodes run one after another, so a value only needs a Capture when it reads
+    # something an earlier write node in the chain has already changed.
 
-def compile_source(src, domain="POINT", pending_line=None, known_params=()):
-    """`pending_line` (1-based) and `known_params`: see Compiler."""
+    def plan_stores(self, prog, group=None):
+        """Fill `prog.stores` and `prog.captures` from `prog.writes`."""
+        written = {name for name, _, _ in prog.writes}
+        for name, type, val in prog.writes:
+            conds = [] if group is None else [group]
+            val = self._peel_selection(name, type, val, conds)
+            store = Store(name, type, val, conds=conds)
+            if name == "P" and "position" not in written:
+                off = self._position_offset(val)
+                if off is not None:
+                    store.value, store.offset = off, True
+            store.selection = self._and_all(conds)
+            prog.stores.append(store)
+        # Set Position goes last: nothing after it sees the moved points.
+        prog.stores.sort(key=lambda st: st.name == "P")
+        changed, seen = set(), set()
+        for st in prog.stores:
+            units = [(("@" + st.name) + (" offset" if st.offset else ""), st.type, st.value)]
+            units += [("Group" if group is not None and c is group else f"@{st.name} if", "bool", c)
+                      for c in st.conds]
+            for label, type, val in units:
+                key = (val.node, val.out)
+                if not val.is_const and key not in seen and _reads(val) & changed:
+                    seen.add(key)
+                    prog.captures.append((label, type, val))
+            changed |= _changes(st.name)
+
+    def _peel_selection(self, name, type, val, conds):
+        """`select(c, v, original)` writes `v` where `c`, which is the write node's
+        Selection: no Switch, no read of the old value."""
+        orig = self.read_original(name, type)
+        while not val.is_const and val.node.kind == "switch":
+            c, f, t = val.node.inputs
+            self.stmt_line = val.node.line
+            if _same(f, orig):
+                conds.append(c)
+                val = t
+            elif _same(t, orig):
+                conds.append(self.node("bmath", "bool", (c,), op="NOT"))
+                val = f
+            else:
+                break
+        return val
+
+    def _position_offset(self, val):
+        """The offset when `val` is the position plus something (`@P += x`,
+        `@P.z -= 1`), so Set Position's Offset input does the adding."""
+        if val.is_const:
+            return None
+        n, pos = val.node, self.read_original("P", "vector")
+        self.stmt_line = n.line
+        if n.kind == "vmath" and n.params.get("op") in ("ADD", "SUBTRACT"):
+            a, b = n.inputs
+            if _same(a, pos):
+                return b if n.params["op"] == "ADD" else self.negate(b)
+            if _same(b, pos) and n.params["op"] == "ADD":
+                return a
+            return None
+        if n.kind != "combine":
+            return None
+        parts = []
+        for i, c in enumerate(n.inputs):
+            if _is_component(c, pos, i):
+                parts.append(Val("float", 0.0))
+            elif not c.is_const and c.node.kind == "math" and c.node.params.get("op") in ("ADD", "SUBTRACT"):
+                a, b = c.node.inputs
+                self.stmt_line = c.node.line
+                if _is_component(a, pos, i):
+                    parts.append(b if c.node.params["op"] == "ADD" else self.negate(b))
+                elif _is_component(b, pos, i) and c.node.params["op"] == "ADD":
+                    parts.append(a)
+                else:
+                    return None
+            else:
+                return None
+        self.stmt_line = n.line
+        return self.combine(parts)
+
+    def _and_all(self, conds):
+        sel = None
+        for c in conds:
+            if not c.is_const:
+                self.stmt_line = c.node.line or self.stmt_line
+            sel = c if sel is None else self.logic("and", sel, c)
+        return sel
+
+
+def _typed_name(text):
+    """`"v@vel"` -> ("vel", "vector"); `"P"` or `"@P"` -> ("P", None)."""
+    prefix, _, name = text.strip().rpartition("@")
+    return name.strip(), _PREFIX_TYPES.get(prefix.strip())
+
+
+def _same(a, b):
+    """The same node output (types may differ after an implicit conversion)."""
+    return not a.is_const and not b.is_const and a.node is b.node and a.out == b.out
+
+
+def _is_component(v, vec, i):
+    return not v.is_const and v.node.kind == "separate" and v.out == i and _same(v.node.inputs[0], vec)
+
+
+def _changes(name):
+    """Attribute names a write node changes, as `_reads` spells them."""
+    return {"P", "position"} if name in ("P", "position") else {name}
+
+
+# What each built-in input node reads from the geometry.
+_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"},
+                "spline_parameter": {"P", "position"}}
+
+
+def _reads(val):
+    """Attribute names `val` reads from the geometry it is evaluated on.
+    Library groups measure the incoming geometry, so only their inputs count."""
+    found, seen, stack = set(), set(), [val.node]
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        if "src" in n.params:  # evaluated on another input, not on this geometry
+            continue
+        if n.kind == "attr":
+            found.add(n.params["name"])
+        elif n.kind == "input":
+            found |= _INPUT_READS.get(n.params["name"], set())
+        stack.extend(v.node for v in n.inputs)
+    return found
+
+
+def _mark_groups(e):
+    """In the Group field, a name used as a whole condition (`top`, `@top`,
+    `not top`, `top and x`) is a group: a bool attribute. Inside a comparison or
+    arithmetic it keeps its usual type, so `@mask > 0.5` reads a float."""
+    if e.kind == "var" and e.name not in CONSTANTS:
+        return N("attr", e.line, name=e.name, type="bool")
+    if e.kind == "attr" and e.type is None and e.name not in BUILTINS and e.name not in KNOWN_TYPES:
+        return N("attr", e.line, name=e.name, type="bool")
+    if e.kind == "binop" and e.op in ("and", "or"):
+        return N("binop", e.line, op=e.op, a=_mark_groups(e.a), b=_mark_groups(e.b))
+    if e.kind == "unop" and e.op == "not":
+        return N("unop", e.line, op="not", a=_mark_groups(e.a))
+    return e
+
+
+def compile_source(src, domain="POINT", pending_line=None, known_params=(), group=""):
+    """`pending_line` (1-based) and `known_params`: see Compiler.
+
+    `group`: which elements the script writes (Houdini's group field): a pattern
+    like `0-9 top !bottom` or `* ^top` (parse_group), or an expression like
+    `@P.y > 0`. A bare name is a bool attribute.
+    It is read from the incoming geometry, before the script runs.
+    """
     c = Compiler(domain, pending_line, known_params)
+    selection, warnings = None, []
+    if group.strip():
+        types = dict(c.attr_types)
+        try:
+            c.bare_attributes, c.pending_line = True, None  # the Group is not a script line
+            selection = c.conv(c.eval(_mark_groups(parse_group(group))), "bool")
+        except BexError as e:
+            # Like Houdini: a group that doesn't make sense selects nothing, it doesn't
+            # break the node (the node shows a warning). Start over so nothing
+            # half-compiled from it remains.
+            c = Compiler(domain, pending_line, known_params)
+            selection = Val("bool", False)
+            warnings.append(f"group: {e.msg} (selects nothing)")
+        # Types the Group guessed (`top` is a bool) don't bind the script.
+        c.bare_attributes, c.pending_line, c.attr_types = False, pending_line, types
+        if selection.is_const and selection.const:
+            selection = None  # always true: every element
     for stmt in parse(src):
         c.exec(stmt)
     prog = c.program()
     prog.source = src.splitlines()
+    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings
+    c.plan_stores(prog, selection)
     return prog

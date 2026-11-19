@@ -7,7 +7,7 @@ ghost text after the cursor; each typed letter asks again, and Tab accepts it.
 
 import re
 
-from ..lang.compiler import BUILTINS, CHANNELS, FUNCTION_NAMES, KNOWN_TYPES
+from ..lang.compiler import BUILTINS, CHANNELS, COUNT_ATTRS, FUNCTION_NAMES, KNOWN_TYPES
 from .buffer import is_word_char
 from .highlight import CONSTANTS, KEYWORDS, TYPES, highlight
 
@@ -18,7 +18,7 @@ _SCRIPT_ATTR_RE = re.compile(r"[fivb]?@([A-Za-z_]\w*)")
 # Language names, in the order they are offered when the script itself has no match.
 _LANGUAGE = sorted(set(FUNCTION_NAMES) | set(CHANNELS) | KEYWORDS | TYPES | CONSTANTS,
                    key=lambda n: (len(n), n))
-_BUILTIN_ATTRS = list(BUILTINS) + [n for n in KNOWN_TYPES if n not in BUILTINS]
+_BUILTIN_ATTRS = list(BUILTINS) + list(COUNT_ATTRS) + [n for n in KNOWN_TYPES if n not in BUILTINS]
 
 
 def _script_words(lines, row, col):

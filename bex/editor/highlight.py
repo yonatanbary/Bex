@@ -6,7 +6,7 @@ BEX is line-based like Python (``#`` comments, no block comments), so lines are 
 
 import re
 
-from ..lang.compiler import CHANNELS, CONSTANTS as _CONSTANT_VALUES, FUNCTION_NAMES
+from ..lang.compiler import CHANNELS, RAMPS, CONSTANTS as _CONSTANT_VALUES, FUNCTION_NAMES
 
 KINDS = ("comment", "string", "number", "attr", "type", "keyword", "function",
          "channel", "constant", "operator", "punct", "ident", "text")
@@ -36,7 +36,7 @@ def _ident_kind(line, word, end):
         return "type"
     if word in KEYWORDS:
         return "keyword"
-    if word in CHANNELS:
+    if word in CHANNELS or word in RAMPS:
         return "channel"
     if word in CONSTANTS:
         return "constant"
@@ -63,6 +63,12 @@ def highlight_line(line):
             pos += 1
             continue
         kind, end = m.lastgroup, m.end()
+        if kind == "number" and m.group()[0] == "." and m.group()[1:].isdigit() and pos and \
+                (line[pos - 1].isalnum() or line[pos - 1] in "_)]"):
+            add(pos, pos + 1, "punct")  # @P.1 is a component, like @P.y
+            add(pos + 1, end, "ident")
+            pos = end
+            continue
         if kind == "ident":
             kind = _ident_kind(line, m.group(), end)
         add(pos, end, kind)

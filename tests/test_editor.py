@@ -207,12 +207,11 @@ def test_undo_redo():
     for ch in "bar":
         b.insert(ch)
     assert b.text == "foo bar"
-    assert b.undo() and b.text == "foo "
     assert b.undo() and b.text == "foo"
     assert b.undo() and b.text == ""
     assert not b.undo()
     assert b.redo() and b.text == "foo"
-    assert b.redo() and b.redo() and b.text == "foo bar" and b.cursor == (0, 7)
+    assert b.redo() and b.text == "foo bar" and b.cursor == (0, 7)
     assert not b.redo()
     b = TextBuffer()
     b.insert("a")
@@ -231,6 +230,35 @@ def test_undo_redo():
     while b.undo():
         n += 1
     assert n == 200
+
+
+def test_undo_groups():
+    b = TextBuffer()
+    for ch in "@P = 1":
+        b.insert(ch)
+    assert b.undo() and b.text == "@P"
+    assert b.undo() and b.text == ""
+    b = TextBuffer()
+    for ch in "x = sin(@P) * 2":
+        b.insert(ch)
+    b.newline()
+    b.insert("y")
+    assert b.undo() and b.text == "x = sin(@P) * 2\n"
+    assert b.undo() and b.text == "x = sin(@P) * 2"
+    assert b.undo() and b.text == "x = sin(@P)"
+    assert b.undo() and b.text == "x"
+    b = TextBuffer("ab\ncdef")
+    b.move_doc_end()
+    for _ in range(5):
+        b.backspace()
+    assert b.text == "ab"
+    assert b.undo() and b.text == "ab\n"      # the line join on its own
+    assert b.undo() and b.text == "ab\ncdef"  # the run of Backspaces in one step
+    b = TextBuffer("abc")
+    b.move_doc_end()
+    b.backspace()
+    b.insert("x")
+    assert b.undo() and b.text == "ab"
 
 
 def test_set_text():
@@ -259,9 +287,23 @@ def test_mouse():
     b.click(1, 1, select=True)
     assert b.anchor == (0, 0) and b.cursor == (1, 1)
     b.select_line(0)
-    assert b.selected_text() == "v@x = @P * 2.5;\n"
+    assert b.selected_text() == "v@x = @P * 2.5;" and b.cursor == (0, 15)
     b.select_line(1)
     assert b.selected_text() == "foo"
+
+
+def test_scrollbar_thumb():
+    from bex.editor.keys import thumb, thumb_first
+    assert thumb(10, 10, 0, 100) is None            # everything fits
+    assert thumb(100, 25, 0, 100) == (0, 25)
+    assert thumb(100, 25, 75, 100) == (75, 25)      # at the end
+    assert thumb(100, 25, 999, 100) == (75, 25)     # clamped
+    assert thumb(1000, 10, 0, 100, min_size=12) == (0, 12)
+    for first in (0, 10, 37, 75):
+        off, size = thumb(100, 25, first, 100)
+        assert thumb_first(off, size, 100, 25, 100) == first
+    assert thumb_first(-50, 25, 100, 25, 100) == 0
+    assert thumb_first(500, 25, 100, 25, 100) == 75
 
 
 def test_version_increments():
@@ -278,6 +320,12 @@ def test_version_increments():
 
 
 # -- highlight --------------------------------------------------------------
+def test_highlight_numeric_component():
+    spans = lambda l: [(l[a:b], k) for a, b, k in highlight_line(l)]  # noqa: E731
+    assert spans("@P.1")[1:] == [(".", "punct"), ("1", "ident")]  # same as @P.y
+    assert ("0.5", "number") in spans("x = 0.5") and (".5", "number") in spans("x = .5")
+
+
 def test_highlight_kinds():
     line = 'x: float = chf("amp") * sin (@P.x) + f@mask  # hi'
     k = kinds(line)
@@ -415,6 +463,43 @@ def test_view_follow_and_hit():
     v.scroll(100, line_count=20, rows=10)
     assert v.top == 10
 
+
+
+def test_signature_at():
+    from bex.editor.signature import signature_at
+
+    def at(text):  # "|" marks the cursor
+        lines = text.split("\n")
+        row = next(r for r, l in enumerate(lines) if "|" in l)
+        col = lines[row].index("|")
+        lines[row] = lines[row].replace("|", "")
+        sig = signature_at(lines, row, col)
+        return sig and (sig.name, sig.active, sig.row, sig.col)
+
+    assert at("x = fit(|") == ("fit", 0, 0, 4)
+    assert at("x = fit(@P.y, 0, |") == ("fit", 2, 0, 4)
+    assert at("x = fit(a, b|)") == ("fit", 1, 0, 4)
+    assert at("x = fit(a, b)|") is None                 # past the closing paren
+    assert at("x = fit|(") is None
+    assert at("x = fit(sin(a, b), |") == ("fit", 1, 0, 4)   # nested commas don't count
+    assert at("x = fit((a + b), [1, 2], |") == ("fit", 2, 0, 4)
+    assert at("x = fit((a|") == ("fit", 0, 0, 4)       # plain parens are looked through
+    assert at("x = fit(foo(|") is None                  # inside an unknown function
+    assert at("x = fit(sin(|") == ("sin", 0, 0, 8)      # the innermost call wins
+    assert at('x = fit(",(", |') == ("fit", 1, 0, 4)    # strings skipped
+    assert at("x = fit(a, # (,\n  b, |") == ("fit", 2, 0, 4)  # comments; over lines
+    assert at("@fit(|") is None and at("f@fit(|") is None
+    assert at("# fit(|") is None
+    sig = signature_at(["fit(a, "], 0, 7)
+    assert [r for _t, r in sig.parts()].count("active") == 1
+    assert "".join(t for t, _r in sig.parts()) == "fit(value, old_min, old_max, new_min, new_max)"
+
+
+def test_every_function_has_a_signature():
+    from bex.lang.compiler import FUNCTION_NAMES, SIGNATURES
+    assert set(SIGNATURES) == FUNCTION_NAMES, set(SIGNATURES) ^ FUNCTION_NAMES
+    for name, (params, summary) in SIGNATURES.items():
+        assert params and summary.endswith("."), name
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]

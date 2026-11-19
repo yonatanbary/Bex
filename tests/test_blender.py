@@ -45,6 +45,10 @@ def original_points(obj):
     return [tuple(v.co) for v in obj.data.vertices]
 
 
+def attr(mesh, name):
+    return [d.value for d in mesh.attributes[name].data]
+
+
 def close(a, b, eps=1e-4):
     return all(abs(x - y) < eps for x, y in zip(a, b))
 
@@ -52,7 +56,7 @@ def close(a, b, eps=1e-4):
 def test_position_and_channels():
     obj, node, text = make_setup('@P.z = sin(@P.x * chf("freq", 2.0)) * chf("amp", 0.5); @P.x += 1;')
     assert node.error == "", node.error
-    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "freq", "amp"], [s.name for s in node.inputs]
+    assert [s.name for s in node.inputs if s.enabled and s.name] == ["Geometry", "Input 2", "Input 3", "Input 4", "freq", "amp"], [s.name for s in node.inputs]
     mesh = evaluate(obj)
     for (x, y, z), v in zip(original_points(obj), mesh.vertices):
         assert close(v.co, (x + 1, y, math.sin(x * 2.0) * 0.5)), (tuple(v.co), x, y)
@@ -219,6 +223,42 @@ def test_new_node_gets_its_own_script():
     assert "chf(" in a.script.as_string()
     assert a.error == "", a.error
     assert any(n.bl_idname == "GeometryNodeSetPosition" for n in a.node_tree.nodes)
+    # Its script is hidden from Text pickers (leading dot) and has no fake user,
+    # so Blender drops it on save once no node uses it.
+    from bex import node as bex_node
+    assert a.script.name.startswith(".BEX Script") and not a.script.use_fake_user
+    assert a.draw_label() == "BEX Wrangle"
+    c = tree.nodes.new("GeometryNodeBexWrangle")
+    bex_node.BexWrangleNode.copy(c, a)  # what duplicating calls
+    assert c.script != a.script and c.script.name.startswith(".BEX Script") and not c.script.use_fake_user
+
+
+def test_presets():
+    import tempfile
+    from bex import presets
+
+    builtins = presets.builtin_presets()
+    assert {"Displace", "Ripple"} <= {p.stem for p in builtins}
+    tree = bpy.data.node_groups.new("Presets", "GeometryNodeTree")
+    node = tree.nodes.new("GeometryNodeBexWrangle")
+    for path in builtins:  # every built-in preset compiles
+        presets.load_into(node, path)
+        assert node.error == "" and node.is_up_to_date(), (path.stem, node.error)
+    # User presets go to their own folder (redirected here) and show in the menu list.
+    folder = Path(tempfile.mkdtemp())
+    real_user_dir = presets.user_dir
+    presets.user_dir = lambda create=False: folder
+    try:
+        node.script.from_string("@P.z = 7")
+        path = presets.save(' my/wave? ', node.script.as_string())
+        assert path == folder / "mywave.bex" and path.read_text() == "@P.z = 7"
+        assert [p.stem for p in presets.user_presets()] == ["mywave"]
+        presets.save("mywave", "@P.z = 8")  # same name replaces it
+        assert path.read_text() == "@P.z = 8" and len(presets.user_presets()) == 1
+        presets.load_into(node, path)
+        assert node.script.as_string() == "@P.z = 8" and node.is_up_to_date()
+    finally:
+        presets.user_dir = real_user_dir
 
 
 def test_pending_line_keeps_inputs_steady():
@@ -279,6 +319,611 @@ def test_code_editor_compiles_on_focus_loss():
     assert close(evaluate(obj).vertices[0].co, (2, -1, 1))
 
 
+def test_code_editor_esc_hides_signature_first():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1;")
+    ce._session = ce.Session(node)
+    op = types.SimpleNamespace()
+    for name in ("_key", "_after_change", "_end"):
+        setattr(op, name, getattr(ce.BEX_OT_code_edit, name).__get__(op))
+
+    def press(key, ch=""):
+        ev = types.SimpleNamespace(type=key, unicode=ch, ctrl=False, shift=False, alt=False, oskey=False)
+        return op._key(bpy.context, node, ev)
+
+    ce._session.buf.move_doc_end()
+    for ch in " h = fit(":
+        press(ch.upper() if ch.isalpha() else ch, ch)
+    assert ce._session.signature().name == "fit"
+    assert press("ESC") is None and ce._session is not None   # hides the help, keeps focus
+    assert ce._session.signature() is None
+    press("A", "a")
+    assert ce._session.signature() is None                    # stays hidden inside that call
+    press(")", ")")                                           # out of the call
+    assert ce._session.signature() is None
+    press("BACK_SPACE")                                       # back in: it shows again
+    assert ce._session.signature().name == "fit"
+    press("ESC")
+    assert press("ESC") == {"FINISHED"} and ce._session is None  # the second Esc leaves
+
+def test_code_editor_undo_survives_refocus():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1")
+    op = types.SimpleNamespace()
+    for name in ("_key", "_after_change", "_end"):
+        setattr(op, name, getattr(ce.BEX_OT_code_edit, name).__get__(op))
+    ctx = bpy.context
+
+    def press(key, ch="", **mods):
+        ev = types.SimpleNamespace(type=key, unicode=ch, ctrl=False, shift=False, alt=False, oskey=False)
+        for k, v in mods.items():
+            setattr(ev, k, v)
+        return op._key(ctx, node, ev)
+
+    undo = {"oskey": True} if ce.MAC else {"ctrl": True}
+    ce._session = ce.Session(node)
+    ce._session.buf.move_doc_end()
+    press("RET")
+    for ch in "@P = 1":
+        press(ch.upper() if ch.isalpha() else ch, ch)
+    press("ESC")
+    # Refocus: the history is still there, and undo is by word, not by character.
+    ce._session = ce.Session(node)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1\n@P", repr(text.as_string())
+    press("Z", **undo)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1"
+    press("Z", shift=True, **undo)
+    assert text.as_string() == "@P.z = 1\n"
+    press("ESC")
+    # A change from outside (Text Editor) becomes one more step.
+    text.from_string("@P.z = 2")
+    ce._session = ce.Session(node)
+    press("Z", **undo)
+    assert text.as_string() == "@P.z = 1\n"
+    press("ESC")
+    # Each script has its own history.
+    other = make_setup("@P.z = 5")[1]
+    ce._session = ce.Session(other)
+    assert not ce._session.buf.undo()
+    ce._session = None
+    # Loading a file forgets it.
+    ce.forget_buffers()
+    assert not ce.buffer_for(text).undo()
+
+
+def test_muted_wrangle_code_is_read_only():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1")
+    # No Node Editor in background: every wrangle shows its code in one box.
+    box_rect, shows_code = ce.box_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 300, 300, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None)
+        assert ce.wrangle_at(ctx, 10, 10)[0] == node
+        node.mute = True
+        assert ce.wrangle_at(ctx, 10, 10)[0] is None  # clicks reach the node instead
+    finally:
+        ce.box_rect, ce._shows_code = box_rect, shows_code
+    # Muted while being edited: the session ends on the next event.
+    ce._session = ce.Session(node)
+    op = types.SimpleNamespace(_end=lambda c, n, r: (setattr(ce, "_session", None), r)[1])
+    assert ce.BEX_OT_code_edit.modal(op, bpy.context, None) == {"FINISHED", "PASS_THROUGH"}
+    assert ce._session is None
+
+
+def test_code_box_scrolls():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("\n".join(f"@P.z = {i}" for i in range(40)))
+    def wheel(kind, **mods):
+        return types.SimpleNamespace(**{"type": kind, "ctrl": False, "oskey": False, "alt": False, "shift": False, **mods})
+    assert ce.visible_rows(40) == ce.MAX_ROWS < 40  # the box stops growing
+    view = ce.view_for(node)
+    assert ce.scroll_code(node, None, wheel("WHEELDOWNMOUSE")) and view.top == 3
+    for _ in range(20):
+        ce.scroll_code(node, None, wheel("WHEELDOWNMOUSE"))
+    assert view.top == 40 - ce.MAX_ROWS  # clamped at the last line
+    assert not ce.scroll_code(node, None, wheel("WHEELUPMOUSE", ctrl=True))  # Ctrl+wheel stays the editor's
+    # The scroll is kept when editing starts.
+    ce._session = ce.Session(node)
+    assert ce._session.view is view
+    ce._session = None
+    # Scrollbar arrows step one line / one character; a bar with nothing to scroll ignores presses.
+    text.from_string("\n".join(f"@P.z = {i}  # " + "x" * 80 for i in range(40)))
+    ce._session = ce.Session(node)
+    view.top = view.left = 0
+    rect = (0.0, 0.0, 300.0, 400.0, 1.0)
+    op = types.SimpleNamespace(_bar_drag=lambda *a: ce.BEX_OT_code_edit._bar_drag(op, *a))
+    def press(r):
+        event = types.SimpleNamespace(mouse_region_x=(r[0] + r[2]) / 2, mouse_region_y=(r[1] + r[3]) / 2)
+        return ce.BEX_OT_code_edit._bar_press(op, node, rect, event)
+    bars = ce.scrollbars(node, rect, ce._session.buf.lines, view)
+    assert bars["v"].thumb and bars["h"].thumb
+    assert bars["v"].area[0] >= ce.code_rect(rect)[2] and bars["h"].area[3] <= ce.code_rect(rect)[1]  # outside the box
+    assert press(bars["v"].plus) and view.top == 1
+    assert press(bars["v"].minus) and press(bars["v"].minus) and view.top == 0  # stops at the top
+    assert press(bars["h"].plus) and press(bars["h"].plus) and view.left == 2
+    assert press(bars["h"].minus) and view.left == 1
+    # Held down, an arrow repeats after a short delay, faster the longer it is held.
+    view.top = 0
+    assert press(bars["v"].plus) and view.top == 1 and ce._session.repeat is not None
+    def hold(seconds):
+        ce._session.repeat[2] -= seconds  # pretend it was pressed earlier
+        ce._session.repeat[3] -= seconds
+        r = bars["v"].plus
+        ce.BEX_OT_code_edit._repeat(op, node, rect, types.SimpleNamespace(
+            mouse_region_x=(r[0] + r[2]) / 2, mouse_region_y=(r[1] + r[3]) / 2))
+    hold(0.2)
+    assert view.top == 1  # not yet
+    hold(0.4)
+    assert view.top > 2
+    ce._session.repeat = None
+    ce._session.bar = None
+    text.from_string("@P.z = 1")
+    ce._session.pull(node)
+    view.top = view.left = 0
+    bars = ce.scrollbars(node, rect, ce._session.buf.lines, view)
+    assert bars["v"].thumb is None and bars["h"].thumb is None
+    assert press(bars["v"].plus) and view.top == 0 and press(bars["h"].plus) and view.left == 0
+    assert ce._session.bar is None  # nothing grabbed
+    ce._session = None
+    # A short script has nothing to scroll: the wheel goes to the Node Editor.
+    short = make_setup("@P.z = 1")[1]
+    assert not ce.scroll_code(short, None, wheel("WHEELDOWNMOUSE"))
+
+
+def test_channels_are_properties():
+    obj, node, text = make_setup('@P.z = chf("amp", 0.5)')
+    sock = node.inputs["amp"]
+    assert sock.hide  # a property on the node, not an input socket
+    sock.default_value = 2.0
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 2))
+    # A link (made before, or after Ctrl+H) keeps the socket visible and drives the value...
+    tree = node.id_data
+    value = tree.nodes.new("ShaderNodeValue")
+    value.outputs[0].default_value = 3.0
+    link = tree.links.new(value.outputs[0], sock)
+    node.update()
+    assert not sock.hide and close(evaluate(obj).vertices[0].co, (-1, -1, 3))
+    # ...and unlinking makes it a property again.
+    tree.links.remove(link)
+    node.update()
+    assert sock.hide
+    # Recompiling keeps it hidden, and a new channel starts hidden.
+    text.from_string('@P.z = chf("amp", 0.5) + chf("lift", 1)')
+    node.sync()
+    assert node.inputs["amp"].hide and node.inputs["lift"].hide
+
+
+def test_chramp():
+    from bex import builder, ramp_widget
+    obj, node, text = make_setup('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    assert node.error == "" and node.ramps() == ["lift"]
+    ramp = node.bex_ramps["lift"]
+    def zs():
+        return [v.co.z for v in evaluate(obj).vertices[:5]]
+    # A new ramp is a straight 0-1 line: x = -1..1 gives z = 0..1.
+    assert close(zs(), [0, 0.25, 0.5, 0.75, 1])
+    # Editing a key updates the curve straight away (no recompile).
+    ramp.keys[0].value = 0.3
+    ramp.keys[1].value = 0.3
+    assert close(zs(), [0.3] * 5)
+    # A recompile keeps the shape: it lives on the node.
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5) + chf("up", 1)')
+    node.sync()
+    assert close(zs(), [1.3] * 5)
+    # Presets, and Constant steps reach the node graph.
+    ramp.preset = "Steps"
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    node.sync()
+    assert close(zs(), [0, 1 / 3, 2 / 3, 1, 1], 2e-2)
+    # Read at two positions (like Houdini): one Float Curve, shared through a closure.
+    ramp.preset = "Hill"
+    text.from_string('f@a = chramp("lift", @P.x * 0.5 + 0.5)\nf@b = chramp("lift", @P.y * 0.5 + 0.5)')
+    node.sync()
+    assert node.error == ""
+    assert sum(1 for n in node.node_tree.nodes if n.bl_idname == "ShaderNodeFloatCurve") == 1
+    from bex import ramp as R
+    keys = ramp_widget.keys_of(ramp)
+    mesh = evaluate(obj)
+    for v, a, b in zip(mesh.vertices, attr(mesh, "a"), attr(mesh, "b")):
+        assert abs(a - R.evaluate(keys, v.co.x * 0.5 + 0.5)) < 2e-2
+        assert abs(b - R.evaluate(keys, v.co.y * 0.5 + 0.5)) < 2e-2
+    # Gone from the script: the ramp is remembered, so bringing it back keeps its shape.
+    text.from_string("@P.z = 2")
+    node.sync()
+    assert node.ramps() == [] and node.bex_ramps.get("lift") is not None
+    assert builder.ramp_node(node.node_tree, "lift") is None
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    node.sync()
+    assert close(zs(), [R.evaluate(keys, x) for x in (0, 0.25, 0.5, 0.75, 1)], 2e-2)
+
+
+def test_ramp_actions():
+    from bex import ramp_widget
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    # The header's interpolation menu shows the selected point's mode and sets every point's.
+    assert ramp.interpolation == ramp.keys[0].interpolation
+    ramp.interpolation = "CONSTANT"
+    assert [k.interpolation for k in ramp.keys] == ["CONSTANT", "CONSTANT"]
+    assert abs(evaluate(obj).vertices[1].co.z) < 1e-4  # held at the first point's value
+    ramp.interpolation = "MONOTONE_CUBIC"
+    # The header's square button opens a menu whose entries run the same operator with a mode.
+    bpy.ops.bex.ramp_interpolation(tree=node.id_data.name, node=node.name, ramp="r", mode="LINEAR")
+    assert [k.interpolation for k in ramp.keys] == ["LINEAR", "LINEAR"]
+    with bpy.context.temp_override(node=node):
+        bpy.ops.bex.ramp_action(ramp="r", action="INVERT")
+        assert [round(v, 4) for _, v, _ in ramp_widget.keys_of(ramp)] == [1.0, 0.0]
+        bpy.ops.bex.ramp_action(ramp="r", action="ADD")
+        assert len(ramp.keys) == 3 and ramp.selected == 2
+        assert ramp.keys[2].position == pytest_approx(0.5) and ramp.keys[2].value == pytest_approx(0.5)
+        bpy.ops.bex.ramp_action(ramp="r", action="DELETE")
+        assert len(ramp.keys) == 2
+    ramp.point = 2
+    assert ramp.selected == 1
+    ramp.point = 9
+    assert ramp.selected == 1  # clamped to the last point
+    # Values may go past 0-1 (typed in the field); the curve isn't clipped.
+    ramp_widget.set_keys(node, ramp, [(0.0, -1.0, "LINEAR"), (1.0, 2.0, "LINEAR")])
+    zs = sorted(v.co.z for v in evaluate(obj).vertices)
+    assert zs[0] == pytest_approx(-1.0) and zs[-1] == pytest_approx(2.0), zs
+
+
+def test_ramp_mouse_editing():
+    import types
+    from bex import code_editor as ce, ramp_widget as rw
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    ramp.expanded = True
+    # No Node Editor in background: put the code box at a known place.
+    box_rect, node_top, node_rect, shows_code = ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce.node_rect = lambda n, r: (-10, -50, 210, 600)
+    ce.node_top = lambda n, r: (600.0, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
+                                    window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
+                                    area=None)
+        graph, markers = rw.ramp_rects(node, None)[0]["r"]
+        assert rw._to_px(graph, 0, 0) == (graph[0], graph[1])  # 0, 0 is the graph's corner
+        assert rw._to_px(graph, 1, 1) == (graph[2], graph[3])
+        def at(x, y):
+            return rw._to_px(graph, x, y)
+        def event(x, y, ctrl=False, shift=False):
+            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, shift=shift,
+                                         type="LEFTMOUSE", value="PRESS")
+
+        def move(x, y):
+            op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=x, mouse_region_y=y))
+
+        def release():
+            op.modal(ctx, types.SimpleNamespace(type="LEFTMOUSE", value="RELEASE", mouse_region_x=0, mouse_region_y=0))
+        op = types.SimpleNamespace()
+        for name in ("invoke", "modal", "_target"):
+            setattr(op, name, getattr(rw.BEX_OT_ramp_edit, name).__get__(op))
+        # A press on empty graph space adds a point there and drags it.
+        assert op.invoke(ctx, event(*at(0.5, 0.9))) == {"RUNNING_MODAL"}
+        assert len(ramp.keys) == 3 and ramp.selected == 2
+        op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=at(0.4, 0.2)[0],
+                                            mouse_region_y=at(0.4, 0.2)[1]))
+        assert ramp.keys[2].position == pytest_approx(0.4) and ramp.keys[2].value == pytest_approx(0.2)
+        assert close(evaluate(obj).vertices[1].co, (-0.5, -1, rw.R.evaluate(rw.keys_of(ramp), 0.25)), 2e-2)
+        # The lower half of a dot at value 0 hangs over the marker row: it still grabs the dot.
+        ramp.keys[2].value = 0.0
+        cx, cy = at(0.4, 0.0)
+        assert op.invoke(ctx, event(cx, cy - 2)) == {"RUNNING_MODAL"} and not op.only_x
+        ramp.keys[2].value = 0.2
+        # A press on a marker drags only the position.
+        mx = at(0.4, 0)[0]
+        assert op.invoke(ctx, event(mx, (markers[1] + markers[3]) / 2)) == {"RUNNING_MODAL"} and op.only_x
+        # Ctrl+click on a point deletes it.
+        assert op.invoke(ctx, event(*at(0.4, 0.2), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 2
+        # Shift-click selects the range from the active point, in position order.
+        rw.set_keys(node, ramp, [(0.0, 0.0, "LINEAR"), (0.6, 0.5, "LINEAR"), (0.3, 0.4, "LINEAR"), (1.0, 1.0, "LINEAR")])
+        assert op.invoke(ctx, event(*at(0.0, 0.0))) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0]
+        assert op.invoke(ctx, event(*at(0.6, 0.5), shift=True)) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0, 1, 2] and ramp.selected == 0  # 0.0, 0.3 and 0.6
+        # A press on a selected point drags the whole selection, stopping at the edges.
+        assert op.invoke(ctx, event(*at(0.3, 0.4))) == {"RUNNING_MODAL"}
+        move(*at(0.2, 0.6))
+        release()
+        assert [round(k.position, 3) for k in ramp.keys] == [0.0, 0.6, 0.3, 1.0]  # point 0 can't go left
+        assert [round(k.value, 3) for k in ramp.keys] == [0.2, 0.7, 0.6, 1.0]
+        # A click on one point of the selection without moving selects it alone.
+        assert op.invoke(ctx, event(*at(0.3, 0.6))) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [2]
+        # Delete / X over the graph delete the selected points, and never pass on to the node.
+        assert op.invoke(ctx, event(*at(0.3, 0.6))) == {"RUNNING_MODAL"}
+        release()
+        assert op.invoke(ctx, event(*at(1.0, 1.0), shift=True)) == {"RUNNING_MODAL"}
+        release()
+        delete = types.SimpleNamespace()
+        delete.invoke = rw.BEX_OT_ramp_delete.invoke.__get__(delete)
+        assert delete.invoke(ctx, event(-500, -500)) == {"FINISHED"}  # wherever the mouse is
+        assert [round(k.position, 3) for k in ramp.keys] == [0.0]
+        assert node.name in node.id_data.nodes
+        # With nothing selected, Delete passes through to Blender.
+        assert rw.selected_indices(ramp) == []
+        assert delete.invoke(ctx, event(*at(0.5, 0.5))) == {"PASS_THROUGH"} and len(ramp.keys) == 1
+        # A click anywhere else clears the selection (and passes through).
+        last = at(ramp.keys[0].position, ramp.keys[0].value)
+        assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0]
+        # On the node (its delete button, point fields) the selection stays.
+        assert op.invoke(ctx, event(100, 50)) == {"PASS_THROUGH"} and rw.selected_indices(ramp) == [0]
+        assert op.invoke(ctx, event(-500, -500)) == {"PASS_THROUGH"} and rw.selected_indices(ramp) == []
+        # The last point can't be deleted.
+        assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
+        release()
+        assert delete.invoke(ctx, event(0, 0)) == {"FINISHED"} and len(ramp.keys) == 1
+    finally:
+        ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code = box_rect, node_top, node_rect, shows_code
+
+
+def test_ramp_bezier():
+    import types
+    from bex import code_editor as ce, ramp_widget as rw
+    R = rw.R
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    ramp.expanded = True
+    # Switching to Bezier adds two handles per stretch and keeps the shape.
+    rw.set_keys(node, ramp, [(0.0, 0.0, "MONOTONE_CUBIC"), (0.4, 0.8, "MONOTONE_CUBIC"), (1.0, 0.3, "MONOTONE_CUBIC")])
+    before = [R.evaluate(rw.keys_of(ramp), x) for x in (0.1, 0.3, 0.6, 0.9)]
+    ramp.interpolation = "BEZIER"
+    assert len(ramp.keys) == 7 and R.is_bezier(rw.keys_of(ramp))
+    assert all(abs(a - R.evaluate(rw.keys_of(ramp), x)) < 2e-3 for a, x in zip(before, (0.1, 0.3, 0.6, 0.9)))
+    for v in evaluate(obj).vertices:  # the geometry follows the Bezier curve
+        assert v.co.z == pytest_approx(R.evaluate(rw.keys_of(ramp), v.co.x * 0.5 + 0.5), 1e-2), (v.co.x, v.co.z)
+    # The point fields: an anchor carries its handles; Interpolation can't split the ramp.
+    ramp.selected = 3
+    handles = [(ramp.keys[i].position, ramp.keys[i].value) for i in (2, 4)]
+    ramp.point_value = 0.9
+    assert ramp.keys[3].value == pytest_approx(0.9)
+    assert [round(ramp.keys[i].value - v, 4) for i, (_p, v) in zip((2, 4), handles)] == [0.1, 0.1]
+    ramp.point_interpolation = "LINEAR"
+    assert R.is_bezier(rw.keys_of(ramp))
+    # Back to another mode keeps the anchors.
+    ramp.interpolation = "LINEAR"
+    assert len(ramp.keys) == 3 and [k.interpolation for k in ramp.keys] == ["LINEAR"] * 3
+    # Picking Bezier for one point switches the whole ramp.
+    ramp.point_interpolation = "BEZIER"
+    assert len(ramp.keys) == 7 and R.is_bezier(rw.keys_of(ramp))
+    # A preset replaces the keys, Bezier or not.
+    ramp.preset = "Round"
+    assert R.is_bezier(rw.keys_of(ramp)) and len(ramp.keys) == 4
+
+    box_rect, node_top, node_rect, shows_code = ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce.node_rect = lambda n, r: (-10, -50, 210, 600)
+    ce.node_top = lambda n, r: (600.0, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
+                                    window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
+                                    area=None)
+        graph, markers = rw.ramp_rects(node, None)[0]["r"]
+        def at(x, y):
+            return rw._to_px(graph, x, y)
+        def event(x, y, ctrl=False, shift=False):
+            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, shift=shift,
+                                         type="LEFTMOUSE", value="PRESS")
+        def move(x, y):
+            op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=x, mouse_region_y=y))
+        def release():
+            op.modal(ctx, types.SimpleNamespace(type="LEFTMOUSE", value="RELEASE", mouse_region_x=0, mouse_region_y=0))
+        op = types.SimpleNamespace()
+        for name in ("invoke", "modal", "_target"):
+            setattr(op, name, getattr(rw.BEX_OT_ramp_edit, name).__get__(op))
+        rw.set_keys(node, ramp, [(0.0, 0.0, "BEZIER"), (0.3, 0.0, "BEZIER"), (0.7, 1.0, "BEZIER"), (1.0, 1.0, "BEZIER")])
+        rw.deselect(ramp)
+        # A press on empty space splits the curve: a new anchor (and two handles) there.
+        shape = [R.evaluate(rw.keys_of(ramp), x) for x in (0.2, 0.8)]
+        assert op.invoke(ctx, event(*at(0.5, 0.5))) == {"RUNNING_MODAL"}
+        release()
+        assert len(ramp.keys) == 7 and ramp.selected == 3 and rw.selected_indices(ramp) == [3]
+        assert ramp.keys[3].position == pytest_approx(0.5, 1e-2)
+        assert all(abs(a - R.evaluate(rw.keys_of(ramp), x)) < 2e-2 for a, x in zip(shape, (0.2, 0.8)))
+        # Dragging an anchor moves its handles with it.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(start[3][0], start[3][1]))) == {"RUNNING_MODAL"}
+        move(*at(start[3][0] + 0.1, start[3][1] - 0.1))
+        release()
+        for i in (2, 3, 4):
+            assert ramp.keys[i].position == pytest_approx(start[i][0] + 0.1, 2e-2), i
+            assert ramp.keys[i].value == pytest_approx(start[i][1] - 0.1, 2e-2), i
+        assert ramp.keys[1].position == pytest_approx(start[1][0])  # other anchors' handles stay
+        # Dragging a handle swings the anchor's other handle into line (aligned handles),
+        # keeping that one's length; the anchor stays.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(*start[4]))) == {"RUNNING_MODAL"} and ramp.selected == 4
+        move(*at(start[4][0], start[4][1] + 0.2))
+        release()
+        assert ramp.keys[4].value == pytest_approx(start[4][1] + 0.2, 2e-2)
+        assert ramp.keys[3].value == pytest_approx(start[3][1])
+        a, h, o = ([ramp.keys[i].position, ramp.keys[i].value] for i in (3, 4, 2))
+        cross = (h[0] - a[0]) * (o[1] - a[1]) - (h[1] - a[1]) * (o[0] - a[0])
+        dot = (h[0] - a[0]) * (o[0] - a[0]) + (h[1] - a[1]) * (o[1] - a[1])
+        assert abs(cross) < 1e-4 and dot < 0, (cross, dot)  # on one line, opposite sides
+        length = math.hypot(start[2][0] - start[3][0], start[2][1] - start[3][1])
+        assert math.hypot(o[0] - a[0], o[1] - a[1]) == pytest_approx(length, 1e-3)
+        # A handle can't cross its anchor: dragged past it, it stops straight up / down.
+        start = [(k.position, k.value) for k in ramp.keys]
+        assert op.invoke(ctx, event(*at(*start[4]))) == {"RUNNING_MODAL"}
+        move(*at(start[3][0] - 0.2, start[4][1]))
+        release()
+        assert ramp.keys[4].position == pytest_approx(ramp.keys[3].position, 1e-6)
+        assert ramp.keys[2].position == pytest_approx(ramp.keys[3].position, 1e-6)  # its partner, in line
+        assert (ramp.keys[4].value - ramp.keys[3].value) * (ramp.keys[2].value - ramp.keys[3].value) < 0
+        # Ctrl+click on a handle does nothing; on an anchor it goes with its handles.
+        assert op.invoke(ctx, event(*at(ramp.keys[4].position, ramp.keys[4].value), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 7
+        assert op.invoke(ctx, event(*at(ramp.keys[3].position, ramp.keys[3].value), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 4 and R.is_bezier(rw.keys_of(ramp))
+    finally:
+        ce.box_rect, ce.node_top, ce.node_rect, ce._shows_code = box_rect, node_top, node_rect, shows_code
+
+
+def test_group():
+    def attr(mesh, name):
+        return [d.value for d in mesh.attributes[name].data]
+
+    # Several writes: the group is measured once on the incoming geometry, so
+    # moving @P first does not change which points the later write picks.
+    obj, node, text = make_setup("@P.y = 5\nf@mark = 1")
+    node.group = "@P.y > 0"
+    mesh = evaluate(obj)
+    assert node.error == "", node.error
+    before = original_points(obj)
+    for (x, y, z), v, m in zip(before, mesh.vertices, attr(mesh, "mark")):
+        inside = y > 0
+        assert close(v.co, (x, 5 if inside else y, z)) and m == (1.0 if inside else 0.0), (x, y, m)
+    # Frames label the group's nodes.
+    assert any(n.bl_idname == "NodeFrame" and n.label == "Group: @P.y > 0" for n in node.node_tree.nodes)
+
+    # A bool attribute as the group, in all three spellings, written by an upstream wrangle.
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("@group_top = @P.x > 0.5")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("f@mark = 1")
+    expected = [1.0 if x > 0.5 else 0.0 for x, _y, _z in before]
+    for spelling in ("top", "b@top", "@group_top"):
+        node.group = spelling
+        assert node.error == "" and attr(evaluate(obj), "mark") == expected, spelling
+
+    # A group that doesn't make sense selects nothing, with a warning instead of an error.
+    node.group = "@P.4 > 0"
+    assert node.error == "" and node.warning.startswith("group:") and "selects nothing" in node.warning
+    assert attr(evaluate(obj), "mark") == [0.0] * len(before)
+    node.group = ""
+    assert node.error == "" and node.warning == "" and attr(evaluate(obj), "mark") == [1.0] * len(before)
+
+
+def test_group_with_float_attribute_and_constant_writes():
+    # A float attribute compared in the Group is read as a float.
+    obj, node, text = make_setup("f@mask = 0.3\n")
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("f@mask = 0.3\nb@top = 1")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("@P.z = 5")
+    node.group = "@mask > 0.5"
+    assert node.error == "" and node.warning == "", node.warning
+    assert all(abs(v.co.z) < 1e-6 for v in evaluate(obj).vertices)  # 0.3 is not > 0.5: nothing moves
+    # Only constant writes: the group is still measured before the first write.
+    text.from_string("b@top = False\nf@x = 5")
+    node.group = "top"
+    assert any(n.bl_idname == "GeometryNodeCaptureAttribute" for n in node.node_tree.nodes)
+    assert all(d.value == 5.0 for d in evaluate(obj).attributes["x"].data)
+
+
+def test_group_patterns():
+    obj, node, text = make_setup("f@mark = 1")
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")  # writes the group "top"
+    first.script.from_string("@group_top = @P.x > 0.5")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    pts = original_points(obj)
+    count = len(pts)
+    top = {i for i, (x, _y, _z) in enumerate(pts) if x > 0.5}
+    every = set(range(count))
+    cases = {
+        "*": every,
+        "3": {3},
+        "2-5": {2, 3, 4, 5},
+        "5-2": {2, 3, 4, 5},
+        "0-10:3": {0, 3, 6, 9},
+        "1 7 top": {1, 7} | top,
+        "!top": every - top,
+        "* ^top": every - top,
+        "0-9 ^top": set(range(10)) - top,
+        "^top": set(),
+        "@P.y>0 4": {i for i, (_x, y, _z) in enumerate(pts) if y > 0} | {4},
+        "@P.y > 0 and top": {i for i, (_x, y, _z) in enumerate(pts) if y > 0} & top,  # an expression
+    }
+    for pattern, chosen in cases.items():
+        node.group = pattern
+        assert node.error == "", (pattern, node.error)
+        marks = [d.value for d in evaluate(obj).attributes["mark"].data]
+        got = {i for i, m in enumerate(marks) if m == 1.0}
+        assert got == chosen, (pattern, sorted(got), sorted(chosen))
+
+
+def test_incoming_attributes():
+    from bex import upstream
+    upstream.CACHE_SECONDS = 0
+    obj, node, text = make_setup("@P.z = 0")
+    obj.data.attributes.new("weight", "FLOAT", "POINT")
+    tree = node.id_data
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("weight") == "float" and "position" not in got, got
+
+    # Store Named Attribute and an upstream wrangle add names; Remove takes one away.
+    store = tree.nodes.new("GeometryNodeStoreNamedAttribute")
+    store.data_type = "FLOAT_VECTOR"
+    store.inputs["Name"].default_value = "vel"
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("i@count = 3")
+    first.sync(force=True)
+    remove = tree.nodes.new("GeometryNodeRemoveAttribute")
+    remove.inputs["Name"].default_value = "weight"
+    tree.links.new(gin.outputs[0], store.inputs["Geometry"])
+    tree.links.new(store.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], remove.inputs["Geometry"])
+    tree.links.new(remove.outputs[0], node.inputs[0])
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("vel") == "vector" and got.get("count") == "int" and "weight" not in got, got
+
+    # Through a group node: the group's own Store Named Attribute, and its Group Input
+    # maps back to the outer link.
+    inner = bpy.data.node_groups.new("Inner", "GeometryNodeTree")
+    inner.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    inner.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    i_in, i_out = inner.nodes.new("NodeGroupInput"), inner.nodes.new("NodeGroupOutput")
+    i_store = inner.nodes.new("GeometryNodeStoreNamedAttribute")
+    i_store.inputs["Name"].default_value = "inside"
+    inner.links.new(i_in.outputs[0], i_store.inputs["Geometry"])
+    inner.links.new(i_store.outputs[0], i_out.inputs[0])
+    group = tree.nodes.new("GeometryNodeGroup")
+    group.node_tree = inner
+    tree.links.new(remove.outputs[0], group.inputs[0])
+    tree.links.new(group.outputs[0], node.inputs[0])
+    got = dict(upstream.incoming_attributes(node))
+    assert got.get("inside") == "float" and got.get("vel") == "vector" and "weight" not in got, got
+
+    from bex import code_editor
+    assert code_editor.info_lines(node)[0][0] == "input"
+
+
 def test_layout_has_no_overlaps():
     from bex import builder
 
@@ -310,6 +955,144 @@ def test_layout_has_no_overlaps():
     # Links flow left to right.
     for link in tree.links:
         assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
+
+
+def test_write_plan():
+    def kinds(node):
+        return [n.bl_idname for n in node.node_tree.nodes]
+
+    def attr(mesh, name):
+        return [d.value for d in mesh.attributes[name].data]
+
+    obj, node, text = make_setup("f@m = @P.x")
+    points = original_points(obj)
+    # A conditional write keeps the old values where the condition is false.
+    text.from_string("f@m = @P.x\nif @P.y > 0:\n    f@m = 7")
+    node.sync()
+    assert node.error == "", node.error
+    assert attr(evaluate(obj), "m") == [pytest_approx(7.0 if y > 0 else x) for x, y, z in points]
+    # Upstream value on another domain: an earlier wrangle writes m per face.
+    tree = node.id_data
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.domain = "FACE"
+    first.script.from_string("f@m = 3")
+    first.sync(force=True)
+    gin = next(n for n in tree.nodes if n.bl_idname == "NodeGroupInput")
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("if @P.y > 0:\n    f@m = 7")
+    node.sync()
+    mesh = evaluate(obj)
+    assert mesh.attributes["m"].domain == "POINT"
+    assert attr(mesh, "m") == [pytest_approx(7.0 if y > 0 else 3.0) for x, y, z in points]
+    tree.links.new(gin.outputs[0], node.inputs[0])
+    tree.nodes.remove(first)
+    # @P += x is one Set Position with Offset; under an if it uses Selection.
+    text.from_string("if @P.x > 0:\n    @P.z += 2")
+    node.sync()
+    setpos = next(n for n in node.node_tree.nodes if n.bl_idname == "GeometryNodeSetPosition")
+    assert "GeometryNodeSwitch" not in kinds(node) and not setpos.inputs["Position"].is_linked
+    assert tuple(setpos.inputs["Offset"].default_value) == (0, 0, 2) and setpos.inputs["Selection"].is_linked
+    mesh = evaluate(obj)
+    for v, (x, y, z) in zip(mesh.vertices, points):
+        assert close(v.co, (x, y, z + (2 if x > 0 else 0))), (tuple(v.co), x)
+    # Independent writes: no Capture. A value read before its attribute changed: captured.
+    text.from_string("f@a = @P.x\n@P.z = 1\nf@b = @P.y")
+    node.sync()
+    assert "GeometryNodeCaptureAttribute" not in kinds(node)
+    mesh = evaluate(obj)
+    assert attr(mesh, "a") == [pytest_approx(x) for x, y, z in points]
+    assert attr(mesh, "b") == [pytest_approx(y) for x, y, z in points]
+    # A value read before its attribute changed is captured: @a comes from an earlier wrangle.
+    first = tree.nodes.new("GeometryNodeBexWrangle")
+    first.script.from_string("f@a = @P.x")
+    first.sync(force=True)
+    tree.links.new(gin.outputs[0], first.inputs[0])
+    tree.links.new(first.outputs[0], node.inputs[0])
+    text.from_string("t = @a\nf@a = 5\nf@c = t")
+    node.sync()
+    assert "GeometryNodeCaptureAttribute" in kinds(node)
+    mesh = evaluate(obj)
+    assert attr(mesh, "c") == [pytest_approx(x) for x, y, z in points] and set(attr(mesh, "a")) == {5.0}
+
+def test_other_inputs():
+    obj, node, text = make_setup("f@m = 1")
+    points = original_points(obj)
+    # Input 1 (the socket "Input 2"): the same grid, moved up by 3 and with an attribute.
+    other = bpy.data.objects.new("Other", obj.data.copy())
+    bpy.context.collection.objects.link(other)
+    other.location.z = 3
+    for i, v in enumerate(other.data.vertices):
+        v.co.z = i * 0.5
+    other.data.attributes.new("w", "FLOAT", "POINT").data.foreach_set("value", [i * 2.0 for i in range(len(points))])
+    text.from_string('@P.z = point(1, "P", @ptnum).z\nf@w = @opinput1_w\ni@n = npoints(1)\n'
+                     'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
+    node.sync()
+    assert node.error == "", node.error
+    geometry_inputs = ["Geometry", "Input 2", "Input 3", "Input 4"]
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
+    tree = node.id_data
+    info = tree.nodes.new("GeometryNodeObjectInfo")
+    info.inputs["Object"].default_value = other
+    tree.links.new(info.outputs["Geometry"], node.inputs["Input 2"])
+    mesh = evaluate(obj)
+    count = len(points)
+    for i, v in enumerate(mesh.vertices):
+        assert abs(v.co.z - i * 0.5) < 1e-4  # Object Info is in local space (Original)
+    assert [d.value for d in mesh.attributes["w"].data] == [i * 2.0 for i in range(count)]
+    assert {d.value for d in mesh.attributes["n"].data} == {count}
+    assert {d.value for d in mesh.attributes["near"].data} == {count - 1}  # the highest point
+    assert all(close(d.vector, (1, 1, (count - 1) * 0.5)) for d in mesh.attributes["top"].data)
+    # The four inputs are always there, like a wrangle's, and keep their links.
+    text.from_string('f@m = chf("amount", 1)')
+    node.sync()
+    assert [s.name for s in node.inputs if s.type == "GEOMETRY"] == geometry_inputs
+    assert node.inputs[1].name == "Input 2" and node.inputs[1].is_linked and node.inputs[4].name == "amount"
+
+
+def test_curve_builtins():
+    # A 5-point line (Curve Line → Resample) through the wrangle, then to a mesh to read it back.
+    obj, node, text = make_setup("f@u = @curveu\nf@l = @curvelength")
+    tree = node.id_data
+    line, res, to_mesh = (tree.nodes.new(i) for i in (
+        "GeometryNodeCurvePrimitiveLine", "GeometryNodeResampleCurve", "GeometryNodeCurveToMesh"))
+    line.inputs["End"].default_value = (2, 0, 0)
+    res.inputs["Count"].default_value = 5
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(line.outputs[0], res.inputs[0])
+    tree.links.new(res.outputs[0], node.inputs[0])
+    tree.links.new(node.outputs[0], to_mesh.inputs[0])
+    tree.links.new(to_mesh.outputs[0], out.inputs[0])
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert [d.value for d in mesh.attributes["u"].data] == [pytest_approx(v) for v in (0, 0.25, 0.5, 0.75, 1)]
+    assert [d.value for d in mesh.attributes["l"].data] == [pytest_approx(v) for v in (0, 0.5, 1, 1.5, 2)]
+    # Two curves: @curvenum is the curve of each point, @ptnum counts all points.
+    join = tree.nodes.new("GeometryNodeJoinGeometry")
+    res2 = tree.nodes.new("GeometryNodeResampleCurve")
+    res2.inputs["Count"].default_value = 5
+    tree.links.new(line.outputs[0], res2.inputs[0])
+    tree.links.new(res.outputs[0], join.inputs[0])
+    tree.links.new(res2.outputs[0], join.inputs[0])
+    tree.links.new(join.outputs[0], node.inputs[0])
+    text.from_string("i@c = @curvenum\ni@p = @ptnum")
+    node.sync()
+    mesh = evaluate(obj)
+    assert sorted(d.value for d in mesh.attributes["c"].data) == [0] * 5 + [1] * 5
+    assert sorted(d.value for d in mesh.attributes["p"].data) == list(range(10))
+
+
+class pytest_approx(float):
+    """A float equal to anything within `tol` (default 1e-4)."""
+    def __new__(cls, value, tol=1e-4):
+        obj = super().__new__(cls, value)
+        obj.tol = tol
+        return obj
+
+    def __eq__(self, other):
+        return abs(self - other) < self.tol
+
+    __hash__ = float.__hash__
 
 
 failed = 0

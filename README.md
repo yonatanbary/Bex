@@ -6,7 +6,7 @@ A **BEX Wrangle** node holds a script. The addon compiles the script into
 ordinary geometry nodes inside the node, and recompiles whenever the text changes.
 
 ```python
-amp = chf("amplitude", 0.2)              # adds an "amplitude" input to the node
+amp = chf("amplitude", 0.2)              # adds an "amplitude" property to the node
 @P += @N * sin(@P.x * 4 + @Time) * amp   # move points
 if @P.z > 0:
     f@mask = fit(@P.z, 0, 1, 0, 1)       # write an attribute
@@ -28,13 +28,41 @@ string or bracket pair under the mouse; double-click past the end of a line (or 
 While you type, the best completion shows as grey text after the cursor; **Tab** accepts it.
 The strip under the code lists the attributes the script reads and writes.
 **Esc**, **Ctrl+Enter** or a click outside finishes. The pencil icon opens the script in the Text Editor instead.
+The code box shows up to 16 lines; longer scripts scroll (mouse wheel or trackpad over the code, no click needed).
+**Tab** on a selected wrangle goes inside to show the nodes it compiled to.
+While editing, Cmd/Ctrl+Z undoes word by word, and each script remembers its history when you
+click back in. Outside the editor, Blender's Ctrl+Z undoes a whole editing session as one step.
 
 The code is evaluated when the editor loses focus. The outline shows the state: blue while
 you edit, green once evaluated, red on an error (the last working nodes are kept).
-Each `chf("name")` becomes a field above the code (and a socket you can link into).
+Each `chf("name")` becomes a property above the code (not an input socket).
 Remove a channel and bring it back, and it keeps the value you set.
 
-Scripts are Text datablocks. If one is linked to a file on disk (Text → Open, e.g.
+**Presets** (the menu above the code): built-in scripts, plus your own. **Save as Preset…**
+stores the current code as a `.bex` file in BEX's user folder, shared by every project;
+picking a preset replaces the node's code (Ctrl+Z undoes it).
+
+**Group** limits which elements the script changes; the rest keep their incoming values.
+It accepts Houdini-style patterns or any BEX expression, and empty means all:
+
+| Group | Elements |
+|---|---|
+| `top` (also `@top`, `b@top`, `@group_top`) | where the bool attribute `top` is true |
+| `3`, `2-5`, `0-10:3` | by element number: one, a range, every 3rd |
+| `top 0-9` | union of the space-separated parts |
+| `!top` | everything not in `top` |
+| `* ^top` | `^` removes from what came before (here: all but `top`) |
+| `*` | everything |
+| `@P.y>0 top` | an expression without spaces, mixed in |
+| `@P.y > 0 and not top` | any BEX expression |
+
+A Group that doesn't make sense selects nothing; the node keeps working and shows why in orange.
+The Group is measured on the geometry that entered the node, so every write in the script
+sees the same elements. Houdini's group type isn't needed: Blender converts attributes from
+other domains to the **Run Over** domain automatically.
+
+Scripts are Text datablocks; a wrangle's own script is hidden (`.BEX Script`) and Blender drops it
+once no node uses it. If a script is linked to a file on disk (Text → Open, e.g.
 `examples/ripple.bex`), saving that file from any editor updates the nodes. Scripts
 open in Blender's Text Editor or linked to a file are checked once a second; everything
 else updates by event, with no polling.
@@ -45,18 +73,24 @@ else updates by event, with no polling.
 |---|---|
 | Syntax | Python: indented blocks after `:`, `#` comments, one statement per line (`;` also separates). No declarations: `x = 1` creates a variable, its type follows the value; `x: int = 2.7` converts |
 | Types | `float` `int` `vector` `bool`, `True` `False` |
-| Attributes | `@name` (float by default), `f@` `i@` `v@` `b@` to set the type |
-| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@index`) `@id` `@Time` `@Frame` |
-| Node inputs | `chf("name", default)` `chi` `chv` `chb` |
-| Vectors | `(x, y, z)` or `[x, y, z]`, `vector(x, y, z)`, `.x .y .z` (`.r .g .b`), `v[0]` … `v[-1]` |
+| Attributes | `@name` (float by default), `f@` `i@` `v@` `b@` to set the type. `@group_name` is the bool attribute `name`, as in Houdini |
+| Built-ins | `@P` `@N` `@ptnum` (`@elemnum` `@primnum` `@index`) `@id` `@Time` `@Frame`, `@numpt` `@numprim` `@numvtx` (element counts) |
+| Node properties | `chf("name", default)` `chi` `chv` `chb` |
+| Vectors | `(x, y, z)` or `[x, y, z]`, `vector(x, y, z)`, `.x .y .z` (`.r .g .b`, `.0 .1 .2`), `v[0]` … `v[-1]` |
 | Operators | `+ - * / // % **` (`/` always divides exactly, `//` floors), comparisons (chains like `0 < x <= 1`), `and or not`, `a if cond else b`, `+= -= *= /= //= %= **=` |
 | Control flow | `if / elif / else` (becomes a per-element Switch), `for i in range(n)` and `while` (unrolled; the range / condition must be known at compile time), `pass` |
 | Math | `sin cos tan asin acos atan atan2 sinh cosh tanh sqrt pow exp log log10 abs floor ceil round trunc frac sign mod min max clamp snap pingpong radians degrees` |
 | Mapping | `lerp/mix fit efit fit01 fit11 smoothstep/smooth smootherstep wrap(x, lo, hi)`. `fit` and `wrap` also take vectors (per component) |
-| Bounding box | `getbbox_min() getbbox_max() getbbox_size() getbbox_center() relbbox(p)` (0–1 inside the box). Of the geometry entering the node; `getbbox_min(0)` also works, as in VEX |
+| Bounding box | `getbbox_min() getbbox_max() getbbox_size() getbbox_center() relbbox(p)` (0–1 inside the box). Of the geometry entering the node; `getbbox_max(1)` measures input 1 |
+| Other inputs | `point(1, "P", i)` `prim(1, "f@area", i)` `vertex(…)`: an attribute of element `i` on an input (type from the prefix in the name, else float; `P`/`N` are vectors). `@opinput1_name`: the same element number on input 1. `npoints(1)` `nprims(1)` `nvertices(1)`, `nearpoint(1, pos)` |
 | Vector | `length distance dot cross normalize` |
 | Random | `noise(p)` `vnoise(p)` `rand(seed)` `vrand(seed)` |
 | Constants | `PI` / `pi`, `TAU` / `tau` |
+
+Inputs work like a Houdini wrangle's: the node has four geometry inputs, **Geometry** (input 0)
+and **Input 2**–**Input 4**. Sockets count from 1, like Houdini's input labels, while scripts count from 0
+as in VEX: `point(1, …)` reads **Input 2**. Only Geometry flows through to the output; the others are
+read with the functions above. Input 0 always means the geometry as it entered the node.
 
 Functions that take several nodes (the bounding box ones) build a node group, such as
 **BEX Relative Bounding Box**, instead of loose nodes. These are ordinary node groups:
@@ -84,3 +118,4 @@ python3 tests/test_editor.py
 - `bex/editor/`: the on-node editor's text model, highlighter and key mapping (pure Python)
 - `bex/code_editor.py`: draws the editor on the node and handles typing
 - `bex/node.py`: the Wrangle node, operators, update events
+- `bex/presets.py`, `bex/builtin_presets/`: the Presets menu and the built-in scripts
