@@ -57,8 +57,8 @@ MIN_DIGITS = 2          # the column is never narrower than this many digits
 
 # The info strip under the code (attributes read / written). It sits inside the
 # reserved block, so it needs no layout measuring of its own.
-INFO_FONT = 9.0
-INFO_LINE_H = 12.0
+INFO_FONT = 10.5
+INFO_LINE_H = 14.0
 INFO_LINES = 3         # input, reads, writes
 ERROR_MAX_LINES = 4     # a long error wraps onto at most this many lines
 INFO_GAP = 4.0
@@ -120,6 +120,7 @@ MAC = sys.platform == "darwin"
 _session = None          # the Session being edited, if any
 _draw_handle = None
 _highlight_cache = {}    # text -> highlighted spans
+_ratio = None            # monospace character width / font size, measured once (_char_ratio)
 _popup = None            # signature help to draw over everything, set by _draw_node
 _buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
 _views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
@@ -211,8 +212,7 @@ def box_height(line_count, scale=1.0):
 
 def _wrap(node, text):
     """`text` wrapped to the code box width (in the strip's font)."""
-    blf.size(FONT_ID, INFO_FONT)
-    char_w = blf.dimensions(FONT_ID, "M" * 10)[0] / 10 or INFO_FONT * 0.6
+    char_w = INFO_FONT * _char_ratio()
     width = max(10, int((node.width - 2 * SIDE - 2 * PAD) / char_w))
     lines = textwrap.wrap(text, width) or [text]
     if len(lines) > ERROR_MAX_LINES:
@@ -247,26 +247,30 @@ def _ui_scale():
     return bpy.context.preferences.system.ui_scale
 
 
-def _zoom(region):
+def _view_map(region):
+    """(ox, oy, zoom): region = (view - o) * zoom, in floats. `view_to_region` only
+    gives whole pixels, which makes the box jump against its node while zooming."""
     v2d = region.view2d
-    return v2d.view_to_region(1000, 0, clip=False)[0] - v2d.view_to_region(0, 0, clip=False)[0]
+    ax, ay = v2d.region_to_view(0, 0)
+    bx, _by = v2d.region_to_view(1000, 0)
+    return ax, ay, 1000.0 / ((bx - ax) or 1.0)
 
 
 def box_rect(node, region):
     """(x0, y0, x1, y1, px) of the code box in region pixels; px = pixels per unit.
     The info strip is the `info_height(node)` just below y0."""
     s = _ui_scale()
-    px = _zoom(region) / 1000.0 * s
+    ox, oy, zoom = _view_map(region)
+    px = zoom * s
     loc = node.location_absolute
     inputs = sum(1 for sock in node.inputs if sock.enabled and not sock.hide)
-    left_v, top_v = loc.x * s, loc.y * s
-    bottom_v = top_v - node.dimensions.y
-    v2d = region.view2d
-    x0, y_bottom_node = v2d.view_to_region(left_v, bottom_v, clip=False)
-    x1 = v2d.view_to_region(left_v + node.width * s, 0, clip=False)[0]
+    x0 = (loc.x * s - ox) * zoom
+    x1 = x0 + node.width * px
+    y_bottom_node = (loc.y * s - node.dimensions.y - oy) * zoom
     y0 = y_bottom_node + (BOTTOM_PAD + inputs * SOCKET_ROW + info_height(node)) * px
     y1 = y0 + box_height(len(node.script.lines), node.code_scale) * px
-    return x0 + SIDE * px, y0, x1 - SIDE * px, y1, px
+    # Whole pixels: an edge between two pixels changes thickness as the zoom moves it.
+    return round(x0 + SIDE * px), round(y0), round(x1 - SIDE * px), round(y1), px
 
 
 def wrangle_at(context, x, y):
@@ -286,7 +290,7 @@ def code_rect(rect):
     """The code box inside the editor rect from `box_rect`: the scrollbars take a
     column on the right and a row at the bottom."""
     x0, y0, x1, y1, px = rect
-    bar = (BAR_SIZE + BAR_GAP) * px
+    bar = round((BAR_SIZE + BAR_GAP) * px)
     return x0, y0 + bar, x1 - bar, y1, px
 
 
@@ -365,9 +369,35 @@ def _shows_code(node):
             and node.show_options and not node.hide and node.dimensions.y > 0)
 
 
+def _char_ratio():
+    """The monospace font's character width per unit of font size."""
+    global _ratio
+    if _ratio is None:
+        blf.size(FONT_ID, 500)
+        _ratio = blf.dimensions(FONT_ID, "M" * 10)[0] / 5000 or 0.6
+    return _ratio
+
+
 def _metrics(px, scale):
-    blf.size(FONT_ID, FONT_SIZE * scale * px)
-    return LINE_H * scale * px, blf.dimensions(FONT_ID, "M" * 10)[0] / 10
+    """(line height, character width) in pixels; also sets the font size. The width
+    is the exact one, growing smoothly with the zoom: blf itself advances a whole
+    number of pixels per character, which jumps (5, 6, 7 px…) while zooming."""
+    size = FONT_SIZE * scale * px
+    blf.size(FONT_ID, size)
+    return LINE_H * scale * px, size * _char_ratio()
+
+
+def _text(x, y, text, char_w, step):
+    """Draw monospace `text` with each character at its exact column. blf advances
+    `step` (whole) pixels per character, so the text is drawn in runs short enough
+    to stay within half a pixel of `char_w` per character."""
+    drift = abs(char_w - step)
+    n = len(text) if drift * len(text) <= 0.5 else max(1, int(0.5 / drift))
+    for i in range(0, len(text), n):
+        run = text[i:i + n]
+        if not run.isspace():
+            blf.position(FONT_ID, x + i * char_w, y, 0)
+            blf.draw(FONT_ID, run)
 
 
 def gutter_width(line_count, char_w):
@@ -525,7 +555,7 @@ def _draw_node(node, region, vx, vy):
 
     def outline():  # drawn last, over the line numbers and scrollbars
         if edge:
-            w = max(1.0, px)
+            w = max(1, round(px))
             gpu.state.scissor_test_set(False)
             for r in ((x0, y0, x1, y0 + w), (x0, y1 - w, x1, y1), (x0, y0, x0 + w, y1), (x1 - w, y0, x1, y1)):
                 _rect(*r, edge)
@@ -535,6 +565,7 @@ def _draw_node(node, region, vx, vy):
         return
     _draw_info(node, region, ox0, info_y0, ox1, oy0, px, vx, vy)
     line_h, char_w = _metrics(px, scale)
+    step = blf.dimensions(FONT_ID, "M" * 10)[0] / 10  # what blf advances per character
     pad = PAD * px
     left, top = text_left(x0, len(lines), char_w, px), y1 - pad
     rows = visible_rows(len(lines))
@@ -574,28 +605,26 @@ def _draw_node(node, region, vx, vy):
             pieces = _split_spans(pieces, ghost_col)
             shift = len(ghost)
             blf.color(FONT_ID, *PALETTE["ghost"])
-            blf.position(FONT_ID, col_x(ghost_col), y, 0)
-            blf.draw(FONT_ID, ghost)
+            _text(col_x(ghost_col), y, ghost, char_w, step)
         for start, end, kind in pieces:
             # Text after the cursor moves right to make room for the ghost text.
             offset = shift if shift and start >= ghost_col else 0
             if end + offset <= view.left or start + offset >= view.left + cols + 1:
                 continue
             blf.color(FONT_ID, *PALETTE[_COLOR_OF.get(kind, "text")])
-            blf.position(FONT_ID, col_x(start + offset), y, 0)
-            blf.draw(FONT_ID, line[start:end])
+            _text(col_x(start + offset), y, line[start:end], char_w, step)
     gpu.state.blend_set("ALPHA")  # blf text drawing turns blending off
     if editing:
         row, col = _session.buf.cursor
         if first <= row < last:
             y_top = top - (row - first) * line_h
-            w = max(1.0, 1.5 * px)
-            _rect(col_x(col), y_top - line_h, col_x(col) + w, y_top, PALETTE["cursor"])
+            cx, w = round(col_x(col)), max(1, round(1.5 * px))
+            _rect(cx, y_top - line_h, cx + w, y_top, PALETTE["cursor"])
             sig = _session.signature()
             if sig:
                 _popup = (sig, max(left, col_x(sig.col)), y_top - line_h, y_top, font_px, px)
     # Line numbers, painted last so code scrolled sideways slides under them.
-    gutter_r = x0 + gutter_width(len(lines), char_w)
+    gutter_r = round(x0 + gutter_width(len(lines), char_w))
     _rect(x0, y0, gutter_r, y1, PALETTE["gutter"])
     current = _session.buf.cursor[0] if editing else -1
     if first <= current < last:
@@ -606,8 +635,7 @@ def _draw_node(node, region, vx, vy):
         number = str(row + 1)
         y = top - (row - first + 1) * line_h + descent
         blf.color(FONT_ID, *PALETTE["line_number_current" if row == current else "line_number"])
-        blf.position(FONT_ID, gutter_r - GUTTER_PAD * char_w - blf.dimensions(FONT_ID, number)[0], y, 0)
-        blf.draw(FONT_ID, number)
+        _text(gutter_r - (GUTTER_PAD + len(number)) * char_w, y, number, char_w, step)
     _draw_bars(node, region, outer, lines, view, editing)
     outline()
 
@@ -716,47 +744,42 @@ def _attr_label(name, type):
     return _TYPE_PREFIX.get(type, "") + "@" + name
 
 
-def _fit(text, width):
-    """`text` cut short with "…" so it is at most `width` wide (current blf size)."""
-    if blf.dimensions(FONT_ID, text)[0] <= width:
+def _fit(text, cols):
+    """`text` cut short with "…" so it is at most `cols` characters."""
+    if len(text) <= cols:
         return text
-    while text and blf.dimensions(FONT_ID, text + "…")[0] > width:
-        text = text[:-1]
-    return text + "…" if text else ""
+    return text[:max(0, cols - 1)] + "…" if cols > 0 else ""
 
 
 def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
     if not _clip(region, vx, vy, x0, y0, x1, y1):
         return
-    blf.size(FONT_ID, INFO_FONT * px)
-    label_w = blf.dimensions(FONT_ID, "writes  ")[0]
+    size = INFO_FONT * px
+    blf.size(FONT_ID, size)
+    char_w = size * _char_ratio()  # exact columns, like the code (see _text)
+    step = blf.dimensions(FONT_ID, "M" * 10)[0] / 10
+    left, right = x0 + PAD * px, x1 - PAD * px
+    label_w = len("writes  ") * char_w
     line_h = INFO_LINE_H * px
-    y = y1 - INFO_GAP * px - line_h + (line_h - INFO_FONT * px) * 0.5 + 0.2 * INFO_FONT * px
+    y = y1 - INFO_GAP * px - line_h + (line_h - size) * 0.5 + 0.2 * size
     for line, kind in note_lines(node):
         blf.color(FONT_ID, *PALETTE[kind][:3], 1.0)
-        blf.size(FONT_ID, INFO_FONT * px)
-        blf.position(FONT_ID, x0 + PAD * px, y, 0)
-        blf.draw(FONT_ID, line)
+        _text(left, y, line, char_w, step)
         y -= line_h
-    blf.size(FONT_ID, INFO_FONT * px)
     status = ""
     if is_editing(node):  # where the cursor is, right-aligned on the first line
         row, col = _session.buf.cursor
         status = f"Line {row + 1}, Col {col + 1}"
-        status_w = blf.dimensions(FONT_ID, status)[0]
         blf.color(FONT_ID, *PALETTE["dim"])
-        blf.position(FONT_ID, x1 - PAD * px - status_w, y, 0)
-        blf.draw(FONT_ID, status)
+        _text(right - len(status) * char_w, y, status, char_w, step)
     for label, value in info_lines(node):
         blf.color(FONT_ID, *PALETTE["comment"])
-        blf.position(FONT_ID, x0 + PAD * px, y, 0)
-        blf.draw(FONT_ID, label)
+        _text(left, y, label, char_w, step)
         if status:  # leave room for it
-            value = _fit(value, x1 - x0 - 2 * PAD * px - label_w - status_w - 2 * INFO_FONT * px)
+            value = _fit(value, int((right - left - label_w) / char_w) - len(status) - 2)
             status = ""
         blf.color(FONT_ID, *PALETTE["dim"])
-        blf.position(FONT_ID, x0 + PAD * px + label_w, y, 0)
-        blf.draw(FONT_ID, value)
+        _text(left + label_w, y, value, char_w, step)
         y -= line_h
     gpu.state.scissor_test_set(False)
 
