@@ -56,7 +56,9 @@ Units are node-editor units at zoom 1, before UI scale.
 | `BOTTOM_PAD` | 7 | `code_editor.py` | the node's padding below its last socket |
 | `SIDE` | 10.5 | `code_editor.py` | the node body's side inset |
 | `BODY_TOP` | 16.7 Blender px | `ramp_widget.py` | gap between the output socket row and the first field (same at UI scale 1.0 and 1.1, Retina) |
-| `TOGGLES_W` | 40 | `ramp_widget.py` | the button column left of a ramp graph (two 20-unit icon buttons) |
+| `TOGGLES_W` | 40 | `ramp_widget.py` | the 2x2 button grid left of a ramp graph (20-unit icon buttons) |
+| `LABEL_X` / `LABEL_BASE` | 0.8 / 13.8 Blender px | `ramp_widget.py` | where Blender's layout puts a label's text in its row (x from the body's edge, baseline from the row's bottom); the ramp name is drawn by us at the same place |
+| `LABEL_POINTS` | 11 | `ramp_widget.py` | Blender's UI text size |
 | `NODE_PAD` | 16 | `node.py` | the node's inner margins, left + right (an estimate; only shifts the label column by a few pixels) |
 
 - **Ramp graphs are counted down from the node's top** in Blender pixels
@@ -78,6 +80,8 @@ Units are node-editor units at zoom 1, before UI scale.
 |---|---|---|
 | No way to read widget positions | measured sizes (above) | `code_editor.box_rect`, `ramp_widget.ramp_rects` |
 | `layout.split` only splits by fraction | the fraction is computed from `node.width` for a fixed label column | `node._field` |
+| No vertical double-arrow / small fold icons built in | our own icons as previews (`icon_value`); their pixels must be **premultiplied** alpha, or transparent parts draw white | `ramp_icons.raster` |
+| No font weight from Python (`layout.label`, `blf`) | the ramp's name is drawn by us, smeared sideways for a bold look | `ramp_widget._draw_label` |
 | `path_from_id()` can't make paths into a custom node's properties | the owner of a ramp key is found by pointer | `ramp_widget._owner` |
 | Tab only enters built-in group nodes | `bex.edit_nodes` pushes the path itself, bound to Tab | `node.py` |
 | No event for typing in the Text Editor or files changing on disk | a 1 s timer, only for texts open in an editor or linked to a file | `node._watch` |

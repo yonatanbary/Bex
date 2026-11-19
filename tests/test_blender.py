@@ -553,6 +553,15 @@ def test_ramp_actions():
     from bex import ramp_widget
     obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
     ramp = node.bex_ramps["r"]
+    # The header's interpolation menu shows the selected point's mode and sets every point's.
+    assert ramp.interpolation == ramp.keys[0].interpolation
+    ramp.interpolation = "CONSTANT"
+    assert [k.interpolation for k in ramp.keys] == ["CONSTANT", "CONSTANT"]
+    assert abs(evaluate(obj).vertices[1].co.z) < 1e-4  # held at the first point's value
+    ramp.interpolation = "MONOTONE_CUBIC"
+    # The header's square button opens a menu whose entries run the same operator with a mode.
+    bpy.ops.bex.ramp_interpolation(tree=node.id_data.name, node=node.name, ramp="r", mode="LINEAR")
+    assert [k.interpolation for k in ramp.keys] == ["LINEAR", "LINEAR"]
     with bpy.context.temp_override(node=node):
         bpy.ops.bex.ramp_action(ramp="r", action="INVERT")
         assert [round(v, 4) for _, v, _ in ramp_widget.keys_of(ramp)] == [1.0, 0.0]
@@ -582,13 +591,20 @@ def test_ramp_mouse_editing():
         ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
                                     window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
                                     area=None)
-        (graph, markers), px = rw.ramp_rects(node, None)[0]["r"], 1.0
+        graph, markers, _label = rw.ramp_rects(node, None)[0]["r"]
         assert rw._to_px(graph, 0, 0) == (graph[0], graph[1])  # 0, 0 is the graph's corner
         assert rw._to_px(graph, 1, 1) == (graph[2], graph[3])
         def at(x, y):
             return rw._to_px(graph, x, y)
-        def event(x, y, ctrl=False):
-            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, type="LEFTMOUSE", value="PRESS")
+        def event(x, y, ctrl=False, shift=False):
+            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, shift=shift,
+                                         type="LEFTMOUSE", value="PRESS")
+
+        def move(x, y):
+            op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=x, mouse_region_y=y))
+
+        def release():
+            op.modal(ctx, types.SimpleNamespace(type="LEFTMOUSE", value="RELEASE", mouse_region_x=0, mouse_region_y=0))
         op = types.SimpleNamespace()
         for name in ("invoke", "modal", "_target"):
             setattr(op, name, getattr(rw.BEX_OT_ramp_edit, name).__get__(op))
@@ -610,6 +626,47 @@ def test_ramp_mouse_editing():
         # Ctrl+click on a point deletes it.
         assert op.invoke(ctx, event(*at(0.4, 0.2), ctrl=True)) == {"FINISHED"}
         assert len(ramp.keys) == 2
+        # Shift-click selects the range from the active point, in position order.
+        rw.set_keys(node, ramp, [(0.0, 0.0, "LINEAR"), (0.6, 0.5, "LINEAR"), (0.3, 0.4, "LINEAR"), (1.0, 1.0, "LINEAR")])
+        assert op.invoke(ctx, event(*at(0.0, 0.0))) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0]
+        assert op.invoke(ctx, event(*at(0.6, 0.5), shift=True)) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0, 1, 2] and ramp.selected == 0  # 0.0, 0.3 and 0.6
+        # A press on a selected point drags the whole selection, stopping at the edges.
+        assert op.invoke(ctx, event(*at(0.3, 0.4))) == {"RUNNING_MODAL"}
+        move(*at(0.2, 0.6))
+        release()
+        assert [round(k.position, 3) for k in ramp.keys] == [0.0, 0.6, 0.3, 1.0]  # point 0 can't go left
+        assert [round(k.value, 3) for k in ramp.keys] == [0.2, 0.7, 0.6, 1.0]
+        # A click on one point of the selection without moving selects it alone.
+        assert op.invoke(ctx, event(*at(0.3, 0.6))) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [2]
+        # Delete / X over the graph delete the selected points, and never pass on to the node.
+        assert op.invoke(ctx, event(*at(0.3, 0.6))) == {"RUNNING_MODAL"}
+        release()
+        assert op.invoke(ctx, event(*at(1.0, 1.0), shift=True)) == {"RUNNING_MODAL"}
+        release()
+        delete = types.SimpleNamespace()
+        delete.invoke = rw.BEX_OT_ramp_delete.invoke.__get__(delete)
+        assert delete.invoke(ctx, event(-500, -500)) == {"FINISHED"}  # wherever the mouse is
+        assert [round(k.position, 3) for k in ramp.keys] == [0.0]
+        assert node.name in node.id_data.nodes
+        # With nothing selected, Delete passes through to Blender.
+        assert rw.selected_indices(ramp) == []
+        assert delete.invoke(ctx, event(*at(0.5, 0.5))) == {"PASS_THROUGH"} and len(ramp.keys) == 1
+        # A click anywhere else clears the selection (and passes through).
+        last = at(ramp.keys[0].position, ramp.keys[0].value)
+        assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
+        release()
+        assert rw.selected_indices(ramp) == [0]
+        assert op.invoke(ctx, event(-500, -500)) == {"PASS_THROUGH"} and rw.selected_indices(ramp) == []
+        # The last point can't be deleted.
+        assert op.invoke(ctx, event(*last)) == {"RUNNING_MODAL"}
+        release()
+        assert delete.invoke(ctx, event(0, 0)) == {"FINISHED"} and len(ramp.keys) == 1
     finally:
         ce.box_rect, ce.node_top, ce._shows_code = box_rect, node_top, shows_code
 

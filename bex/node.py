@@ -13,7 +13,7 @@ from . import builder, code_editor, library, presets, ramp_widget
 from .lang import BexError, compile_source
 
 # Bump when the generated node layout changes, so existing nodes recompile.
-COMPILER_VERSION = 11
+COMPILER_VERSION = 12
 WATCH_INTERVAL = 1.0   # Text Editor / file check, only while a script is open or on disk
 TYPING_IDLE = 2.0      # Text Editor: a line counts as finished after this pause
 SAVED_LIMIT = 64       # remembered values of removed inputs, per node
@@ -523,7 +523,12 @@ def register():
         km = kc.keymaps.new(name="Node Editor", space_type="NODE_EDITOR")
         _keymaps.append((km, km.keymap_items.new(BEX_OT_edit_nodes.bl_idname, "TAB", "PRESS")))
         # A press on a ramp graph drags its points; elsewhere it passes through.
-        _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_edit.bl_idname, "LEFTMOUSE", "PRESS")))
+        # any=True: Shift-click (range) and Ctrl+click (delete) must reach it too.
+        _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_edit.bl_idname, "LEFTMOUSE", "PRESS",
+                                                 any=True)))
+        # Delete / X delete the selected ramp points, never the node (they pass through when none are).
+        for key in ("DEL", "X"):
+            _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_delete.bl_idname, key, "PRESS")))
         # A click on a wrangle's code starts the editor; elsewhere it passes through.
         _keymaps.append((km, km.keymap_items.new(code_editor.BEX_OT_code_edit.bl_idname, "LEFTMOUSE", "PRESS")))
         # Wheel / trackpad over a wrangle's code scrolls it; elsewhere it passes through.

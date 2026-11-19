@@ -28,37 +28,42 @@ def _sorted(keys):
     return sorted(((float(p), float(v), i) for p, v, i in keys), key=lambda k: k[0])
 
 
-def _tangents(keys, monotone):
-    """Slopes at each key for the cubic stretches: Catmull-Rom (finite
-    differences) or monotone (Fritsch-Carlson, so no overshoot)."""
+def _catmull_rom(keys):
+    """Uniform Catmull-Rom tangents, per stretch of parameter (not per unit of
+    position): half the difference of the neighbours' values, an end key standing
+    in for its missing neighbour. Like Houdini, two keys make a soft S whose ends
+    run at half the straight line's slope."""
+    v = [k[1] for k in keys]
+    n = len(v)
+    return [(v[min(k + 1, n - 1)] - v[max(k - 1, 0)]) / 2 for k in range(n)]
+
+
+def _tangents(keys):
+    """Slopes (per unit of position) at each key for Monotone Cubic: Fritsch-Carlson,
+    so no overshoot. The first and last keys are flat, like Houdini: two keys make
+    an S, not a straight line."""
     n = len(keys)
     secant = []
     for a, b in zip(keys, keys[1:]):
         h = b[0] - a[0]
         secant.append((b[1] - a[1]) / h if h > 1e-9 else 0.0)
     m = [0.0] * n
-    for k in range(n):
-        if k == 0:
-            m[k] = secant[0]
-        elif k == n - 1:
-            m[k] = secant[-1]
-        else:
-            h = keys[k + 1][0] - keys[k - 1][0]
-            m[k] = (keys[k + 1][1] - keys[k - 1][1]) / h if h > 1e-9 else 0.0
-    if monotone:
-        for k in range(n - 1):
-            d = secant[k]
-            if abs(d) < 1e-12:
-                m[k] = m[k + 1] = 0.0
-                continue
-            for j in (k, k + 1):
-                if m[j] * d <= 0:
-                    m[j] = 0.0
-            a, b = m[k] / d, m[k + 1] / d
-            s = a * a + b * b
-            if s > 9.0:
-                t = 3.0 / math.sqrt(s)
-                m[k], m[k + 1] = t * a * d, t * b * d
+    for k in range(1, n - 1):
+        h = keys[k + 1][0] - keys[k - 1][0]
+        m[k] = (keys[k + 1][1] - keys[k - 1][1]) / h if h > 1e-9 else 0.0
+    for k in range(n - 1):
+        d = secant[k]
+        if abs(d) < 1e-12:
+            m[k] = m[k + 1] = 0.0
+            continue
+        for j in (k, k + 1):
+            if m[j] * d <= 0:
+                m[j] = 0.0
+        a, b = m[k] / d, m[k + 1] / d
+        s = a * a + b * b
+        if s > 9.0:
+            t = 3.0 / math.sqrt(s)
+            m[k], m[k + 1] = t * a * d, t * b * d
     return m
 
 
@@ -70,14 +75,21 @@ def _hermite(p0, v0, m0, p1, v1, m1, x):
             + (-2 * t3 + 3 * t2) * v1 + (t3 - t2) * h * m1)
 
 
-def _bspline(keys, k, t):
-    """Point on the uniform cubic B-spline stretch from key k to k+1 (the end
-    keys are repeated, so the curve starts and ends near them)."""
-    n = len(keys)
-    pts = [keys[max(0, min(n - 1, j))] for j in (k - 1, k, k + 1, k + 2)]
-    t2, t3 = t * t, t * t * t
-    w = ((1 - t) ** 3 / 6, (3 * t3 - 6 * t2 + 4) / 6, (-3 * t3 + 3 * t2 + 3 * t + 1) / 6, t3 / 6)
-    return (sum(wi * p[0] for wi, p in zip(w, pts)), sum(wi * p[1] for wi, p in zip(w, pts)))
+def _bspline_curve(keys):
+    """Houdini's B-spline: one uniform cubic B-spline with every key as a control
+    point (so it is pulled towards the keys, not through them) and the end keys
+    tripled, so it starts and ends exactly on them. (x, y) samples, x rising."""
+    cps = [keys[0]] * 2 + list(keys) + [keys[-1]] * 2
+    per = max(8, SAMPLES // (len(cps) - 3))
+    out = []
+    for s in range(len(cps) - 3):
+        quad = cps[s:s + 4]
+        for j in range(0 if s == 0 else 1, per + 1):
+            t = j / per
+            t2, t3 = t * t, t * t * t
+            w = ((1 - t) ** 3 / 6, (3 * t3 - 6 * t2 + 4) / 6, (-3 * t3 + 3 * t2 + 3 * t + 1) / 6, t3 / 6)
+            out.append((sum(wi * c[0] for wi, c in zip(w, quad)), sum(wi * c[1] for wi, c in zip(w, quad))))
+    return out
 
 
 def polyline(keys):
@@ -89,32 +101,32 @@ def polyline(keys):
     if len(keys) == 1:
         return [(0.0, keys[0][1]), (1.0, keys[0][1])]
     cubic = {i for _, _, i in keys}
-    tangents = {
-        "CATMULL_ROM": _tangents(keys, False) if "CATMULL_ROM" in cubic else None,
-        "MONOTONE_CUBIC": _tangents(keys, True) if "MONOTONE_CUBIC" in cubic else None,
-    }
+    monotone = _tangents(keys) if "MONOTONE_CUBIC" in cubic else None
+    bspline = _bspline_curve(keys) if "BSPLINE" in cubic else None
+    catmull = _catmull_rom(keys) if "CATMULL_ROM" in cubic else None
     pts = [(0.0, keys[0][1])] if keys[0][0] > 0 else []
     for k in range(len(keys) - 1):
         (p0, v0, interp), (p1, v1, _) = keys[k], keys[k + 1]
         h = p1 - p0
-        pts.append((p0, v0))
+        if interp != "BSPLINE":  # a B-spline stretch doesn't pass through its key
+            pts.append((p0, v0))
         if h <= 1e-9:
             continue
         if interp == "CONSTANT":
             pts.append((max(p0, p1 - STEP), v0))
-        elif interp in tangents:
-            m = tangents[interp]
+        elif interp in ("CATMULL_ROM", "MONOTONE_CUBIC"):
+            if interp == "CATMULL_ROM":
+                m0, m1 = catmull[k] / h, catmull[k + 1] / h  # per stretch -> per unit of position
+            else:
+                m0, m1 = monotone[k], monotone[k + 1]
             n = max(2, int(SAMPLES * h))
-            pts += [(p0 + h * j / n, _hermite(p0, v0, m[k], p1, v1, m[k + 1], p0 + h * j / n)) for j in range(1, n)]
-        elif interp == "BSPLINE":
-            n = max(2, int(SAMPLES * h))
-            for j in range(0, n + 1):
-                x, y = _bspline(keys, k, j / n)
-                pts.append((min(max(x, p0), p1), y))
+            pts += [(p0 + h * j / n, _hermite(p0, v0, m0, p1, v1, m1, p0 + h * j / n)) for j in range(1, n)]
+        elif interp == "BSPLINE":  # the part of the whole curve over this stretch
+            pts += [(x, y) for x, y in bspline if p0 <= x <= p1]
     pts.append((keys[-1][0], keys[-1][1]))
     if keys[-1][0] < 1:
         pts.append((1.0, keys[-1][1]))
-    # Keep x rising (a B-spline stretch can start a hair before its key).
+    # Keep x rising.
     out = []
     for x, y in pts:
         x = min(max(x, 0.0), 1.0)
@@ -181,8 +193,8 @@ PRESETS = {
     "Linear": ((0.0, 0.0, "LINEAR"), (1.0, 1.0, "LINEAR")),
     "Round": _sampled(lambda x: 1 - math.sqrt(max(0.0, 1 - x * x)), (0.0, 0.5, 0.8, 0.95, 1.0)),
     "Sharp": _sampled(lambda x: math.sqrt(max(0.0, 1 - (1 - x) ** 2)), (0.0, 0.05, 0.2, 0.5, 1.0)),
-    "Smooth": _sampled(lambda x: x * x * (3 - 2 * x), (0.0, 0.15, 0.5, 0.85, 1.0)),
+    "Smooth": ((0.0, 0.0, "MONOTONE_CUBIC"), (1.0, 1.0, "MONOTONE_CUBIC")),  # flat ends make the S
     "Steps": ((0.0, 0.0, "CONSTANT"), (0.25, 1 / 3, "CONSTANT"), (0.5, 2 / 3, "CONSTANT"), (0.75, 1.0, "CONSTANT")),
     "Valley": ((0.0, 1.0, "MONOTONE_CUBIC"), (0.5, 0.0, "MONOTONE_CUBIC"), (1.0, 1.0, "MONOTONE_CUBIC")),
 }
-DEFAULT_KEYS = ((0.0, 0.0, DEFAULT_INTERPOLATION), (1.0, 1.0, DEFAULT_INTERPOLATION))
+DEFAULT_KEYS = PRESETS["Linear"]  # a new ramp is a straight line, like Houdini's

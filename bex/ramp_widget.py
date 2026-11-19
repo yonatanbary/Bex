@@ -9,28 +9,37 @@ whenever a key changes, so dragging updates the result live.
 
 import math
 
+import blf
 import bpy
 import gpu
 from gpu_extras.batch import batch_for_shader
 
 from . import builder, code_editor as ce
 from . import ramp as R
+from . import ramp_icons
 
 # -- sizes (node-editor units at zoom 1, before UI scale) -----------------------
 GRAPH_H = 110.0      # the graph, unfolded
-STRIP_H = 26.0       # folded: a strip, still editable by dragging
+STRIP_H = 34.0       # folded: a strip, still editable by dragging
 MARKER_H = 16.0      # the row of position markers under the graph
 MARKER_GAP = 4.0     # between the graph's bottom edge and a marker's tip
 KEY_R = 4.0          # key dot radius
 HIT_R = 8.0          # how close a press must be to grab a key or marker
 MARKER_W = 5.0       # half width of a marker
-TOGGLES_W = 40.0     # the column left of the graph: the point-fields and fold buttons
+TOGGLES_W = 40.0     # the 2x2 button grid left of the graph (add / delete, point fields / fold)
 TOGGLES_GAP = 4.0    # between that column and the graph
 # Where the graph goes is counted down from the node's top edge, in Blender pixels
 # rounded the way Blender rounds them (see `_row_sizes`), so nothing below a graph
 # (its point fields, the code box) can move it. Python can't read widget positions.
 BODY_TOP = 16.7      # Blender px: the gap between the output socket row and the first field (measured, 5.2)
 RAMP_LIMIT = 16      # remembered ramps no longer in the script, per node
+GRID = 4             # grid divisions, the same both ways: cells are square only when the graph is
+# The ramp's name is drawn by us, in bold: Blender's layout and blf can't set a font
+# weight from Python. Measured against Blender's own labels (5.2).
+LABEL_POINTS = 11.0  # Blender's UI text size (points)
+LABEL_X = 0.8        # Blender px from the body's left edge to the text
+LABEL_BASE = 13.8    # Blender px from the row's bottom to the text baseline
+LABEL_BOLD = 1.4     # faux bold: the text is smeared this far to the right (Blender px)
 
 PALETTE = {
     "back": (0.20, 0.20, 0.205, 1.0),
@@ -41,6 +50,7 @@ PALETTE = {
     "key_edge": (0.10, 0.10, 0.10, 1.0),
     "selected": (0.98, 0.76, 0.20, 1.0),
     "marker": (0.75, 0.75, 0.75, 1.0),
+    "label": (0.94, 0.94, 0.94, 1.0),
 }
 
 _quiet = False     # set while many keys change at once; one curve write at the end
@@ -74,6 +84,7 @@ class BexRampKey(bpy.types.PropertyGroup):
     interpolation: bpy.props.EnumProperty(name="Interpolation", items=R.INTERPOLATIONS, default=R.DEFAULT_INTERPOLATION,
                                           update=_key_changed, options=set(),
                                           description="How the ramp runs from this point to the next")
+    select: bpy.props.BoolProperty(options=set())  # part of a Shift-click range
 
 
 def _preset_items(_self, _context):
@@ -97,7 +108,34 @@ def _get_point(self):
 
 
 def _set_point(self, number):
-    self.selected = max(0, min(len(self.keys) - 1, number - 1))
+    if self.keys:
+        select_only(self, max(0, min(len(self.keys) - 1, number - 1)))
+
+
+_INTERP_ITEMS = []  # kept alive: Blender doesn't copy a dynamic enum's strings
+
+
+def _interp_items(_self, _context):
+    if not _INTERP_ITEMS:
+        _INTERP_ITEMS.extend((mode, label, desc + " (every point)", ramp_icons.icon("INTERP_" + mode), i)
+                             for i, (mode, label, desc) in enumerate(R.INTERPOLATIONS))
+    return _INTERP_ITEMS
+
+
+_INTERP_IDS = [mode for mode, _l, _d in R.INTERPOLATIONS]
+
+
+def _get_interp(self):
+    """The selected point's interpolation (when every point shares one, that one)."""
+    if not self.keys:
+        return _INTERP_IDS.index(R.DEFAULT_INTERPOLATION)
+    return _INTERP_IDS.index(self.keys[min(self.selected, len(self.keys) - 1)].interpolation)
+
+
+def _set_interp(self, index):
+    node, _ = _owner(self)
+    if node is not None:
+        set_keys(node, self, [(p, v, _INTERP_IDS[index]) for p, v, _i in keys_of(self)])
 
 
 class BexRamp(bpy.types.PropertyGroup):
@@ -113,6 +151,9 @@ class BexRamp(bpy.types.PropertyGroup):
     preset_index: bpy.props.IntProperty(default=list(R.PRESETS).index("Linear"), options=set())
     preset: bpy.props.EnumProperty(name="Preset", items=_preset_items, get=_get_preset, set=_set_preset,
                                    options=set(), description="Replace the ramp with a preset shape")
+    interpolation: bpy.props.EnumProperty(name="Interpolation", items=_interp_items, get=_get_interp,
+                                          set=_set_interp, options=set(),
+                                          description="Set how the ramp runs between points, for every point")
 
 
 def ui_label(name):
@@ -125,7 +166,7 @@ def keys_of(ramp):
 
 
 def set_keys(node, ramp, keys):
-    """Replace a ramp's keys (one curve write)."""
+    """Replace a ramp's keys (one curve write). Nothing is selected afterwards."""
     global _quiet
     _quiet = True
     try:
@@ -133,10 +174,67 @@ def set_keys(node, ramp, keys):
         for p, v, interp in keys:
             k = ramp.keys.add()
             k.position, k.value, k.interpolation = p, v, interp
-        ramp.selected = min(ramp.selected, len(ramp.keys) - 1)
+        ramp.selected = min(ramp.selected, max(0, len(ramp.keys) - 1))
     finally:
         _quiet = False
     write_curve(node, ramp)
+
+
+# -- selection: the selected points (`key.select`, highlighted; Delete removes them)
+# and the active one (`ramp.selected`: shown in the point fields, the anchor of a
+# Shift-click range). A click anywhere else clears the selection, not the active point.
+def selected_indices(ramp):
+    return [i for i, k in enumerate(ramp.keys) if k.select]
+
+
+def deselect(ramp):
+    for k in ramp.keys:
+        if k.select:
+            k.select = False
+
+
+def deselect_tree(tree, keep=None):
+    """Clear every ramp's selection in `tree` but `keep`'s; True if any was selected."""
+    found = False
+    for node in tree.nodes:
+        for ramp in getattr(node, "bex_ramps", ()):
+            if ramp != keep and selected_indices(ramp):
+                deselect(ramp)
+                found = True
+    return found
+
+
+def select_only(ramp, index):
+    for i, k in enumerate(ramp.keys):
+        k.select = i == index
+    ramp.selected = index
+
+
+def select_range(ramp, index):
+    """Select every point from the active one to `index`, in position order (the
+    active point stays the anchor for the next Shift-click). With nothing selected
+    it starts a new range at `index`."""
+    if not selected_indices(ramp):
+        select_only(ramp, index)
+        return
+    order = sorted(range(len(ramp.keys)), key=lambda i: ramp.keys[i].position)
+    anchor = min(ramp.selected, len(ramp.keys) - 1)
+    a, b = sorted((order.index(anchor), order.index(index)))
+    for i, k in enumerate(ramp.keys):
+        k.select = i in order[a:b + 1]
+
+
+def delete_selected(node, ramp, doomed=None):
+    """Delete the selected points (or `doomed`); a ramp keeps at least one."""
+    doomed = selected_indices(ramp) if doomed is None else doomed
+    if len(doomed) >= len(ramp.keys):
+        doomed = [i for i in doomed if i != min(ramp.selected, len(ramp.keys) - 1)]
+    if not doomed:
+        return
+    survivor = next(i for i in range(len(ramp.keys)) if i not in doomed)
+    keys = [k for i, k in enumerate(keys_of(ramp)) if i not in doomed]
+    ramp.selected = survivor - sum(1 for i in doomed if i < survivor)
+    set_keys(node, ramp, keys)
 
 
 def ensure_ramps(node, names):
@@ -177,20 +275,33 @@ def draw_layout(layout, node, ramp, field):
     """The ramp's header row, the space the graph is drawn into, and the
     selected point's fields. `field(layout, node, label, width)` is node._field."""
     row = layout.row(align=True)
-    row.label(text=ui_label(ramp.name))
+    row.label(text="")  # the name is drawn in bold by draw_node
     tools = row.row(align=True)
     tools.alignment = "RIGHT"
-    tools.template_icon_view(ramp, "preset", show_labels=True, scale=1.0, scale_popup=4.0)
-    for action, icon in (("ADD", "ADD"), ("DELETE", "X"), ("REVERSE", "ARROW_LEFTRIGHT"), ("INVERT", "SORT_ASC")):
-        op = tools.operator("bex.ramp_action", text="", icon=icon)
+    tools.emboss = "PULLDOWN_MENU"  # one look for menus and buttons: no background until hovered
+    # Like Houdini: the interpolation menu (its icon is the current mode's shape),
+    # the two flips, then the presets.
+    # A menu button without text: square, no arrow; it opens below, left-aligned.
+    tools.context_pointer_set("bex_ramp", ramp)
+    tools.menu(NODE_MT_bex_ramp_interpolation.bl_idname, text="",
+               icon_value=ramp_icons.icon("INTERP_" + ramp.interpolation))
+    for action, icon in (("REVERSE", "FLIP_X"), ("INVERT", "FLIP_Y")):
+        op = tools.operator("bex.ramp_action", text="", icon_value=ramp_icons.icon(icon))
         op.ramp, op.action = ramp.name, action
-    # Like Houdini: the point-fields and fold buttons side by side in a column left
-    # of the graph, under the label. The split is by fraction, so it comes from the
-    # width the code box also spans.
+    tools.template_icon_view(ramp, "preset", show_labels=True, scale=1.0, scale_popup=4.0)
+    # Left of the graph, under the label: a 2x2 grid of buttons, add / delete over
+    # the point-fields and fold toggles. The split is by fraction, so it comes from
+    # the width the code box also spans.
     body = layout.split(factor=min(0.5, TOGGLES_W / max(1.0, node.width - 2 * ce.SIDE)))
-    toggles = body.row(align=True)
+    grid = body.column(align=True)
+    edit = grid.row(align=True)
+    for action, icon in (("ADD", "ADD"), ("DELETE", "X")):
+        op = edit.operator("bex.ramp_action", text="", icon=icon)
+        op.ramp, op.action = ramp.name, action
+    toggles = grid.row(align=True)
+    toggles.emboss = "PULLDOWN_MENU"  # no background until hovered (their icons show the state)
     toggles.prop(ramp, "show_point", text="", icon="DISCLOSURE_TRI_DOWN" if ramp.show_point else "DISCLOSURE_TRI_RIGHT")
-    toggles.prop(ramp, "expanded", text="", icon="FULLSCREEN_EXIT" if ramp.expanded else "FULLSCREEN_ENTER")
+    toggles.prop(ramp, "expanded", text="", icon_value=ramp_icons.icon("FOLD" if ramp.expanded else "UNFOLD"))
     space = body.column()
     space.scale_y = graph_height(ramp) / ce.UNIT_Y
     space.label(text="")
@@ -214,7 +325,7 @@ def _row_sizes():
 
 
 def ramp_rects(node, region):
-    """{name: (graph rect, marker rect)} in region pixels, each (x0, y0, x1, y1);
+    """{name: (graph rect, marker rect, label baseline (x, y))} in region pixels, rects (x0, y0, x1, y1);
     and px. Counted down from the node's top, following `draw_buttons`: header and
     output socket, Group, Run Over, the ch*() column (aligned: no gaps), then each
     ramp's label row, graph row and point fields."""
@@ -229,12 +340,13 @@ def ramp_rects(node, region):
         y += chans * row + gap
     rects = {}
     for ramp in shown_ramps(node):
+        label = (x0 + LABEL_X * zoom, top - (y + row - LABEL_BASE) * zoom)  # x0: the body's left edge
         y += row + gap  # the label row
         h = graph_height(ramp) * unit
         graph_top = top - y * zoom
         markers = (gx0, graph_top - h * zoom, x1, graph_top - (h - MARKER_H * unit) * zoom)
-        rects[ramp.name] = ((gx0, markers[3], x1, graph_top), markers)
-        y += max(row, h) + gap + (4 * (row + gap) if ramp.show_point else 0)
+        rects[ramp.name] = ((gx0, markers[3], x1, graph_top), markers, label)
+        y += max(2 * row, h) + gap + (4 * (row + gap) if ramp.show_point else 0)
     return rects, px
 
 
@@ -275,32 +387,46 @@ def _dot(x, y, r, color, segments=12):
     _tris([p for a, b in zip(ring, ring[1:]) for p in ((x, y), a, b)], color)
 
 
+def _draw_label(region, text, at, px):
+    """The ramp's name at baseline `at`, in the UI font, drawn twice for a bold look."""
+    x, y = at
+    size = LABEL_POINTS * px
+    if not (-size < y < region.height + size and x < region.width):
+        return
+    blf.size(0, size)
+    blf.color(0, *ce._ink(PALETTE["label"]))
+    bold = LABEL_BOLD * px / (ce._ui_scale() or 1.0)  # px / ui_scale = zoom
+    for dx in (0.0, bold / 2, bold):
+        blf.position(0, x + dx, y, 0)
+        blf.draw(0, text)
+
+
 def draw_node(node, region, vx, vy):
     """Paint every ramp graph of a wrangle (called from code_editor's draw handler)."""
     if not node.bex_ramps:
         return
     rects, px = ramp_rects(node, region)
     for ramp in shown_ramps(node):
-        graph, markers = rects[ramp.name]
+        graph, markers, label = rects[ramp.name]
+        _draw_label(region, ui_label(ramp.name), label, px)
         if graph[2] < 0 or graph[0] > region.width or markers[1] > region.height or graph[3] < 0:
             continue
         gpu.state.blend_set("ALPHA")
         ce._rect(*graph, PALETTE["back"])
         if not ce._clip(region, vx, vy, *graph):
             continue
-        if ramp.expanded:
-            for i in range(1, 10):
-                gx = graph[0] + (graph[2] - graph[0]) * i / 10
+        if ramp.expanded:  # the 0-1 square divided the same both ways, so it squashes with the graph
+            for i in range(1, GRID):
+                gx = graph[0] + (graph[2] - graph[0]) * i / GRID
+                gy = graph[1] + (graph[3] - graph[1]) * i / GRID
                 ce._rect(round(gx), graph[1], round(gx) + 1, graph[3], PALETTE["grid"])
-            for i in range(1, 4):
-                gy = graph[1] + (graph[3] - graph[1]) * i / 4
                 ce._rect(graph[0], round(gy), graph[2], round(gy) + 1, PALETTE["grid"])
         keys = keys_of(ramp)
         pts = [_to_px(graph, x, y) for x, y in R.polyline(keys)]  # spans x = 0..1
         _tris([p for a, b in zip(pts, pts[1:]) for p in (a, b, (a[0], graph[1]), b, (b[0], graph[1]), (a[0], graph[1]))],
               PALETTE["fill"])
         _line(region, pts, PALETTE["line"], max(1.0, 1.2 * px))
-        sel = min(ramp.selected, len(keys) - 1)
+        picked = [k.select for k in ramp.keys]
         # Dots may hang over the graph's edges (a key at 0 or 1).
         gpu.state.scissor_test_set(False)
         r = (KEY_R + 1) * px
@@ -309,7 +435,7 @@ def draw_node(node, region, vx, vy):
         for i, (x, y, _interp) in enumerate(keys):
             cx, cy = _to_px(graph, x, y)
             _dot(cx, cy, (KEY_R + 1) * px, PALETTE["key_edge"])
-            _dot(cx, cy, KEY_R * px, PALETTE["selected" if i == sel else "key"])
+            _dot(cx, cy, KEY_R * px, PALETTE["selected" if picked[i] else "key"])
         # Position markers under the graph.
         gpu.state.scissor_test_set(False)
         w = MARKER_W * px
@@ -318,15 +444,13 @@ def draw_node(node, region, vx, vy):
                 cx = _to_px(graph, x, 0)[0]
                 top, bottom = markers[3] - MARKER_GAP * px, markers[1] + 1 * px
                 mid = top - w
-                color = PALETTE["selected" if i == sel else "marker"]
+                color = PALETTE["selected" if picked[i] else "marker"]
                 _tris([(cx, top), (cx - w, mid), (cx + w, mid)], color)
                 ce._rect(cx - w, bottom, cx + w, mid, color)
         gpu.state.scissor_test_set(False)
 
 
 # -- presets thumbnails --------------------------------------------------------
-THUMB = 64
-
 
 def _preset_icons():
     """{preset name: icon id}: thumbnails drawn from the same ramp maths."""
@@ -339,15 +463,9 @@ def _preset_icons():
         pv = _previews.get(name)
         if pv is None:
             pv = _previews.new(name)
-            line = R.polyline(keys)
-            heights = [R.evaluate(keys, (i + 0.5) / THUMB, line) for i in range(THUMB)]
-            pixels = []
-            for row in range(THUMB):
-                level = (row + 0.5) / THUMB
-                for col in range(THUMB):
-                    pixels += (0.66, 0.66, 0.66, 1.0) if level <= heights[col] else (0.14, 0.14, 0.14, 1.0)
-            pv.image_size = (THUMB, THUMB)
-            pv.image_pixels_float = pixels
+            size = ramp_icons.THUMB
+            pv.image_size = (size, size)
+            pv.image_pixels_float = ramp_icons.thumbnail(keys, size)
         icons[name] = pv.icon_id
     return icons
 
@@ -363,7 +481,7 @@ def ramp_at(context, x, y):
             continue
         rects, px = ramp_rects(node, context.region)
         for ramp in shown_ramps(node):
-            graph, markers = rects[ramp.name]
+            graph, markers, _label = rects[ramp.name]
             reach = HIT_R * px  # end keys hang over the edges
             if graph[0] - reach <= x <= graph[2] + reach and markers[1] <= y <= graph[3] + reach:
                 return node, ramp, graph, markers, px
@@ -377,7 +495,8 @@ def _segment_interpolation(keys, x):
 
 
 class BEX_OT_ramp_edit(bpy.types.Operator):
-    """Drag a ramp's points; click empty space to add one, Ctrl+click a point to delete it"""
+    """Drag a ramp's points (Shift-click selects a range, which drags as one); click
+    empty space to add a point, Ctrl+click a point to delete it"""
 
     bl_idname = "bex.ramp_edit"
     bl_label = "Edit BEX Ramp"
@@ -391,9 +510,13 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
     def invoke(self, context, event):
         x, y = event.mouse_region_x, event.mouse_region_y
         hit = ramp_at(context, x, y)
-        if hit is None:
+        tree = getattr(context.space_data, "edit_tree", None)
+        if hit is None:  # a click anywhere else clears the points' selection
+            if tree is not None and deselect_tree(tree):
+                ce._redraw(context)
             return {"PASS_THROUGH"}
         node, ramp, graph, markers, px = hit
+        deselect_tree(node.id_data, keep=ramp)
         self.tree, self.node, self.ramp = node.id_data.name, node.name, ramp.name
         keys = keys_of(ramp)
         # A dot under the press wins, even where it hangs over the marker row
@@ -413,13 +536,13 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
                 if d <= best:
                     grab, best = i, d
         if grab is not None and event.ctrl:
-            if len(ramp.keys) > 1:
-                ramp.keys.remove(grab)
-                ramp.selected = min(ramp.selected, len(ramp.keys) - 1)
-                write_curve(node, ramp)
+            select_only(ramp, grab)
+            delete_selected(node, ramp)
             return {"FINISHED"}
         if grab is None:
             if on_markers:
+                deselect(ramp)
+                ce._redraw(context)
                 return {"FINISHED"}
             nx, ny = _from_px(graph, x, y)
             nx, ny = min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0)
@@ -427,9 +550,19 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
             k.interpolation = _segment_interpolation(keys, nx)
             k.position, k.value = nx, ny
             grab = len(ramp.keys) - 1
-        ramp.selected = grab
+            select_only(ramp, grab)
+        elif event.shift:
+            select_range(ramp, grab)
+        elif not ramp.keys[grab].select or len(selected_indices(ramp)) < 2:
+            select_only(ramp, grab)
+        # else: a press on a point of the selection drags them all; a click without
+        # moving selects that point alone (on release).
         self.index, self.only_x = grab, on_markers
+        self.collapse = not event.shift
         self.graph = graph
+        self.press = _from_px(graph, x, y)
+        self.start = {i: (ramp.keys[i].position, ramp.keys[i].value) for i in selected_indices(ramp)}
+        self.moved = False
         context.window_manager.modal_handler_add(self)
         ce._redraw(context)
         return {"RUNNING_MODAL"}
@@ -446,12 +579,26 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
             return {"CANCELLED"}
         if event.type in ("MOUSEMOVE", "INBETWEEN_MOUSEMOVE"):
             nx, ny = _from_px(self.graph, event.mouse_region_x, event.mouse_region_y)
-            key = ramp.keys[self.index]
-            key.position = min(max(nx, 0.0), 1.0)
-            if not self.only_x:
-                key.value = min(max(ny, 0.0), 1.0)
+            dx, dy = nx - self.press[0], 0.0 if self.only_x else ny - self.press[1]
+            # The selection moves as one: the move stops where its first point hits an edge.
+            ps, vs = [p for p, _v in self.start.values()], [v for _p, v in self.start.values()]
+            dx = min(max(dx, -min(ps)), 1.0 - max(ps))
+            dy = min(max(dy, -min(vs)), 1.0 - max(vs))
+            global _quiet
+            _quiet = True
+            try:
+                for i, (p, v) in self.start.items():
+                    if i < len(ramp.keys):
+                        ramp.keys[i].position, ramp.keys[i].value = p + dx, v + dy
+            finally:
+                _quiet = False
+            write_curve(node, ramp)
+            self.moved = True
             return {"RUNNING_MODAL"}
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            if not self.moved and self.collapse:
+                select_only(ramp, self.index)
+                ce._redraw(context)
             return {"FINISHED"}
         if event.type in ("ESC", "RIGHTMOUSE"):
             return {"FINISHED"}
@@ -459,9 +606,77 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
 
 
 ACTIONS = (("ADD", "Add", "Add a point between the selected one and the next"),
-           ("DELETE", "Delete", "Delete the selected point"),
+           ("DELETE", "Delete", "Delete the selected points"),
            ("REVERSE", "Reverse", "Flip the ramp left to right"),
            ("INVERT", "Invert", "Flip the ramp upside down"))
+
+
+class BEX_OT_ramp_delete(bpy.types.Operator):
+    """Delete the selected ramp points. Delete / X do this whenever points are
+    selected (wherever the mouse is), and never touch the node then"""
+
+    bl_idname = "bex.ramp_delete"
+    bl_label = "Delete Ramp Points"
+    bl_options = {"INTERNAL", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        space = context.space_data
+        return space is not None and space.type == "NODE_EDITOR"
+
+    def invoke(self, context, _event):
+        tree = getattr(context.space_data, "edit_tree", None)
+        targets = [(node, ramp) for node in (tree.nodes if tree else ())
+                   for ramp in getattr(node, "bex_ramps", ()) if selected_indices(ramp)]
+        if not targets:
+            return {"PASS_THROUGH"}  # no points selected: the key does what it always does
+        for node, ramp in targets:
+            delete_selected(node, ramp)
+        ce._redraw(context)
+        return {"FINISHED"}
+
+
+class BEX_OT_ramp_interpolation(bpy.types.Operator):
+    """Set how the ramp runs between points, for every point"""
+
+    bl_idname = "bex.ramp_interpolation"
+    bl_label = "Interpolation"
+    bl_options = {"INTERNAL", "UNDO"}
+
+    tree: bpy.props.StringProperty()
+    node: bpy.props.StringProperty()
+    ramp: bpy.props.StringProperty()
+    mode: bpy.props.EnumProperty(items=[(m, label, desc) for m, label, desc in R.INTERPOLATIONS])
+
+    @classmethod
+    def description(cls, _context, props):
+        return next(f"{label}: {desc}" for m, label, desc in R.INTERPOLATIONS if m == props.mode)
+
+    def execute(self, _context):
+        tree = bpy.data.node_groups.get(self.tree)
+        node = tree.nodes.get(self.node) if tree else None
+        ramp = node.bex_ramps.get(self.ramp) if node else None
+        if ramp is None:
+            return {"CANCELLED"}
+        ramp.interpolation = self.mode
+        return {"FINISHED"}
+
+
+class NODE_MT_bex_ramp_interpolation(bpy.types.Menu):
+    """The header's interpolation menu (the ramp comes from the layout's context)."""
+
+    bl_idname = "NODE_MT_bex_ramp_interpolation"
+    bl_label = "Interpolation"
+
+    def draw(self, context):
+        ramp = getattr(context, "bex_ramp", None)
+        node = getattr(context, "node", None)
+        if ramp is None or node is None:
+            return
+        for mode, label, _desc in R.INTERPOLATIONS:
+            op = self.layout.operator(BEX_OT_ramp_interpolation.bl_idname, text=label,
+                                      icon_value=ramp_icons.icon("INTERP_" + mode), depress=mode == ramp.interpolation)
+            op.tree, op.node, op.ramp, op.mode = node.id_data.name, node.name, ramp.name, mode
 
 
 class BEX_OT_ramp_action(bpy.types.Operator):
@@ -495,20 +710,24 @@ class BEX_OT_ramp_action(bpy.types.Operator):
             x = (x0 + x1) / 2
             keys.append((x, R.evaluate(keys, x), keys[sel][2]))
             set_keys(node, ramp, keys)
-            ramp.selected = len(keys) - 1
+            select_only(ramp, len(keys) - 1)
         elif self.action == "DELETE":
-            if len(keys) > 1:
-                del keys[sel]
-                set_keys(node, ramp, keys)
+            delete_selected(node, ramp, selected_indices(ramp) or [sel])
         else:
             new = R.reverse(keys) if self.action == "REVERSE" else R.invert(keys)
             selected_pos = keys[sel][0] if self.action == "INVERT" else 1.0 - keys[sel][0]
+            had_selection = bool(selected_indices(ramp))
             set_keys(node, ramp, new)
-            ramp.selected = min(range(len(new)), key=lambda i: abs(new[i][0] - selected_pos))
+            active = min(range(len(new)), key=lambda i: abs(new[i][0] - selected_pos))
+            if had_selection:
+                select_only(ramp, active)
+            else:
+                ramp.selected = active
         return {"FINISHED"}
 
 
-classes = (BexRampKey, BexRamp, BEX_OT_ramp_edit, BEX_OT_ramp_action)
+classes = (BexRampKey, BexRamp, BEX_OT_ramp_edit, BEX_OT_ramp_delete, BEX_OT_ramp_interpolation, NODE_MT_bex_ramp_interpolation,
+           BEX_OT_ramp_action)
 
 
 def register():
@@ -518,6 +737,8 @@ def register():
 
 def unregister():
     global _previews
+    ramp_icons.unregister()
+    _INTERP_ITEMS.clear()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
     if _previews is not None:
