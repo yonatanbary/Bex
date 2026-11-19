@@ -26,8 +26,8 @@ from .editor.buffer import TextBuffer, is_word_char
 from .editor.complete import suggest
 from .editor.highlight import highlight
 from .editor.signature import signature_at
-from .builder import RAMP_PREFIX
 from .upstream import incoming_attributes
+from . import ramp_widget
 from .lang.compiler import BUILTINS
 from .editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, View, handle_key, thumb, thumb_first
 
@@ -127,7 +127,6 @@ _fade = 1.0              # alpha multiplier while drawing a node (MUTED_ALPHA wh
 _popup = None            # signature help to draw over everything, set by _draw_node
 _buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
 _views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
-_ramp_shapes = {}        # (tree name, node name) -> the points of its chramp() curves, see check_ramps
 
 
 def view_for(node):
@@ -201,37 +200,6 @@ def forget_buffers():
     """Drop every script's history and every box's scroll (a new file was loaded)."""
     _buffers.clear()
     _views.clear()
-    _ramp_shapes.clear()
-
-
-# -- live ramps ----------------------------------------------------------------
-def check_ramps(node):
-    """Re-evaluate while a chramp() curve is being dragged. Blender's curve widget
-    moves the points as the mouse moves but sends its update only on release; the
-    Node Editor redraws on every move, so the draw handler calls this and a changed
-    shape tags the wrangle's group. Returns True when it did."""
-    tree = node.node_tree
-    if tree is None:
-        return False
-    shape = tuple(
-        tuple((p.location[0], p.location[1], p.handle_type) for c in n.mapping.curves for p in c.points)
-        for n in tree.nodes if n.bl_idname == "ShaderNodeFloatCurve" and n.name.startswith(RAMP_PREFIX))
-    key = (node.id_data.name, node.name)
-    old = _ramp_shapes.get(key)
-    _ramp_shapes[key] = shape
-    if old is None or old == shape:
-        return False
-    name = tree.name
-    # Not from inside drawing: a timer runs right after it, even during the drag.
-    bpy.app.timers.register(lambda: _retag(name), first_interval=0.0)
-    return True
-
-
-def _retag(tree_name):
-    tree = bpy.data.node_groups.get(tree_name)
-    if tree is not None:
-        tree.update_tag()
-    return None
 
 
 # -- geometry ------------------------------------------------------------------
@@ -543,9 +511,9 @@ def _draw():
     try:
         for node in tree.nodes:
             if _shows_code(node):
-                check_ramps(node)
                 _fade = MUTED_ALPHA if node.mute else 1.0
                 _draw_node(node, context.region, vx, vy)
+                ramp_widget.draw_node(node, context.region, vx, vy)
         _fade = 1.0
         if _popup:  # after every node, so no other code box covers it
             gpu.state.scissor_test_set(False)

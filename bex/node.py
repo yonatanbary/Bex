@@ -9,7 +9,7 @@ import traceback
 import bpy
 from bpy.app.handlers import persistent
 
-from . import builder, code_editor, library, presets
+from . import builder, code_editor, library, presets, ramp_widget
 from .lang import BexError, compile_source
 
 # Bump when the generated node layout changes, so existing nodes recompile.
@@ -84,6 +84,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
     bl_description = "Write VEX-style code that is compiled into geometry nodes"
     bl_width_default = 420  # room for ~45 columns of code
 
+    bex_ramps: bpy.props.CollectionProperty(type=ramp_widget.BexRamp)  # chramp() keys, by name
     script: bpy.props.PointerProperty(type=bpy.types.Text, name="Script", description="BEX code for this node", update=_on_change)
     domain: bpy.props.EnumProperty(items=DOMAINS, name="Run Over", default="POINT", update=_on_change)
     group: bpy.props.StringProperty(
@@ -180,18 +181,17 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
                     row.label(text=sock.name, icon="LINKED")
                 else:
                     row.prop(sock, "default_value", text=sock.name)
-        for name in ramps:  # Blender's own curve editor, on the node inside
-            layout.label(text=name)
-            layout.template_curve_mapping(builder.ramp_node(self.node_tree, name), "mapping")
+        for name in ramps:
+            ramp_widget.draw_layout(layout, self, self.bex_ramps[name], _field)
         return bool(chans or ramps)
 
     def ramps(self):
-        """The chramp() names of the last good compile that have a ramp node."""
+        """The chramp() names of the last good compile (each has a BexRamp)."""
         try:
             names = json.loads(self.info).get("ramps", []) if self.info else []
         except ValueError:
             names = []
-        return [n for n in names if builder.ramp_node(self.node_tree, n) is not None]
+        return [n for n in names if self.bex_ramps.get(n) is not None]
 
     def _key(self, src):
         digest = hashlib.md5(f"{self.group}\0{src}".encode()).hexdigest()
@@ -215,7 +215,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             return
         name = self.script.name if self.script else "(no script)"
         try:
-            known = [s.name for s in self.channels()] + self.ramps()
+            known = [s.name for s in self.channels()] + [r.name for r in self.bex_ramps]
             program = compile_source(src, self.domain, pending_line, known, group=self.group)
             if program.pending:
                 key += "|pending"
@@ -225,7 +225,9 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             if not self.node_tree:
                 self.node_tree = bpy.data.node_groups.new(TREE_PREFIX + "Wrangle", "GeometryNodeTree")
             saved = self._save_values()
-            count, created = builder.build(self.node_tree, program, self.domain, keep_stale=bool(program.pending))
+            ramp_widget.ensure_ramps(self, program.ramps)
+            count, created = builder.build(self.node_tree, program, self.domain, keep_stale=bool(program.pending),
+                                           ramps=ramp_widget.polylines(self, program.ramps))
         except BexError as e:
             # Keep the last working nodes so the scene does not break while typing.
             self.compiled_key = key
@@ -507,6 +509,7 @@ _HANDLERS = (
 
 
 def register():
+    ramp_widget.register()  # first: the node's bex_ramps property uses its BexRamp
     for cls in classes:
         bpy.utils.register_class(cls)
     code_editor.register()
@@ -519,6 +522,8 @@ def register():
     if kc:
         km = kc.keymaps.new(name="Node Editor", space_type="NODE_EDITOR")
         _keymaps.append((km, km.keymap_items.new(BEX_OT_edit_nodes.bl_idname, "TAB", "PRESS")))
+        # A press on a ramp graph drags its points; elsewhere it passes through.
+        _keymaps.append((km, km.keymap_items.new(ramp_widget.BEX_OT_ramp_edit.bl_idname, "LEFTMOUSE", "PRESS")))
         # A click on a wrangle's code starts the editor; elsewhere it passes through.
         _keymaps.append((km, km.keymap_items.new(code_editor.BEX_OT_code_edit.bl_idname, "LEFTMOUSE", "PRESS")))
         # Wheel / trackpad over a wrangle's code scrolls it; elsewhere it passes through.
@@ -546,3 +551,4 @@ def unregister():
     code_editor.unregister()
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
+    ramp_widget.unregister()

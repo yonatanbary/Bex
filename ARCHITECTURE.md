@@ -49,6 +49,7 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
 | `bex/node.py` | The node class, channel properties, operators, Add-menu entry, update events |
 | `bex/presets.py` | The **Presets** menu: built-in and user `.bex` scripts, Save as Preset |
 | `bex/builtin_presets/` | Built-in preset scripts (Displace, Height Gradient, Noise Displace, Ripple) |
+| `BLENDER_VERSIONS.md` | Everything tied to a Blender version's behaviour (engine limits, measured sizes, API workarounds): re-check on a Blender upgrade |
 | `examples/ripple.bex` | Example script (linked-to-a-file workflow) |
 | `tests/test_lang.py` | Compiler tests, plain `python3` |
 | `tests/test_editor.py` | Editor core tests (buffer, highlighter, completion, signatures, keys), plain `python3` |
@@ -63,7 +64,7 @@ script text ──lexer──▶ tokens ──parser──▶ AST ──compiler
   - `num` is `int` unless the text has `.`, `e` or `E`.
   - `.1` written right after a name (not a keyword), attribute, `)` or `]` is component access: an `op` `.` then an int (`_is_component`), so `@P.1` is `@P[1]` while `x = .5` stays a number.
 - `tokenize(src)`: Python-style. One regex (`_TOKEN_RE`) for tokens; `#` comments; `newline` ends each logical line; `indent` / `dedent` from the leading whitespace (tab = 4); blank and comment-only lines are skipped; line breaks inside `(` `[` (and after a `\`) are ignored; an unclosed bracket is an error at its line. C/VEX tokens (`&& || ! ? { } ++`) raise a `_HINTS` message naming the Python form.
-- TODO in `lexer.py`: `s@` string attributes. Blender 5.2's Store Named Attribute refuses STRING; per-element text needs Blender 5.3.
+- TODO in `lexer.py`: `s@` string attributes. Geometry nodes can't hold text per element in Blender 5.2 or 5.3 (see `BLENDER_VERSIONS.md`).
 
 ## `bex/lang/parser.py`
 

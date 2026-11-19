@@ -19,13 +19,30 @@ INPUT_NODES = {
     "vertex_of_corner": "GeometryNodeVertexOfCorner",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
-RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node holding that ramp's shape
+RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node evaluating that ramp
 
 
 def ramp_node(tree, name):
-    """The Float Curve node that holds chramp(`name`)'s shape, or None."""
+    """The Float Curve node that evaluates chramp(`name`), or None."""
     n = tree.nodes.get(RAMP_PREFIX + name) if tree else None
     return n if n is not None and n.bl_idname == "ShaderNodeFloatCurve" else None
+
+
+def set_curve(node, points):
+    """Make a Float Curve the straight pieces through `points` [(x, y)], x rising
+    (a ramp sampled by ramp.polyline)."""
+    mapping = node.mapping
+    mapping.use_clip = False
+    mapping.extend = "HORIZONTAL"
+    curve = mapping.curves[0]
+    while len(curve.points) > max(2, len(points)):
+        curve.points.remove(curve.points[-1])
+    while len(curve.points) < len(points):
+        curve.points.new(1.0, 0.0)
+    for p, (x, y) in zip(curve.points, points):
+        p.location = (x, y)
+        p.handle_type = "VECTOR"
+    mapping.update()
 
 
 def _enabled(sockets, name):
@@ -101,28 +118,21 @@ def sync_interface(tree, program, keep_stale=False):
     return created
 
 
-def build(tree, program, domain, keep_stale=False):
-    """Rebuild `tree` from scratch for `program`.
+def build(tree, program, domain, keep_stale=False, ramps=None):
+    """Rebuild `tree` from scratch for `program`. `ramps`: {chramp() name: polyline}.
 
     Returns (node count, [(name, default)] of inputs that were newly added).
     """
     created = sync_interface(tree, program, keep_stale)
     nodes, links = tree.nodes, tree.links
-    # Everything goes except the ramps still in use: their nodes hold the curves
-    # drawn on the wrangle, so they survive the rebuild (unused ones too while a
-    # line is pending, like the inputs).
-    keep = {RAMP_PREFIX + r for r in program.ramps}
-    for n in list(nodes):
-        ramp = n.bl_idname == "ShaderNodeFloatCurve" and n.name.startswith(RAMP_PREFIX)
-        if not (ramp and (keep_stale or n.name in keep)):
-            nodes.remove(n)
+    nodes.clear()
     group_in = nodes.new("NodeGroupInput")
     group_out = nodes.new("NodeGroupOutput")
     group_out.is_active_output = True
     idents = {(i.in_out, i.name): i.identifier for i in tree.interface.items_tree if i.item_type == "SOCKET"}
     built = {}  # IRNode -> [output sockets]
     # Node name -> source line it belongs to. None is the geometry chain along the top.
-    line_of = {n.name: None for n in nodes}  # the kept ramps, until they are used
+    line_of = {group_in.name: None, group_out.name: None}
     line_stack = [None]  # source line of the expression being built
 
     def new(idname):
@@ -282,9 +292,10 @@ def build(tree, program, domain, keep_stale=False):
         if kind == "ramp":
             name = p["name"]
             curve = ramp_node(tree, name)
-            if curve is None:  # a new ramp starts as Blender's default: a straight 0-1 line
+            if curve is None:
                 curve = nodes.new("ShaderNodeFloatCurve")
                 curve.name = curve.label = RAMP_PREFIX + name
+                set_curve(curve, (ramps or {}).get(name, [(0.0, 0.0), (1.0, 1.0)]))
             if name not in program.shared_ramps:
                 line_of[curve.name] = line_stack[-1]
                 connect(ins[0], curve.inputs["Value"])

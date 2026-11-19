@@ -37,8 +37,8 @@ _TOKEN_RE = re.compile(
 
 _KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "and", "or", "not", "return"})
 _PREFIX_TYPES = {"f": "float", "i": "int", "v": "vector", "b": "bool"}
-# TODO: s@ string attributes. Blender 5.2 lists STRING for Store / Named Attribute but
-# refuses it; per-element text needs Blender 5.3 (gate it on bpy.app.version).
+# TODO: s@ string attributes. Blender 5.2 and 5.3 list STRING for Store / Named Attribute
+# but refuse it, so geometry nodes can't hold text per element yet. See BLENDER_VERSIONS.md.
 
 # C/VEX habits -> what to write instead.
 _HINTS = {

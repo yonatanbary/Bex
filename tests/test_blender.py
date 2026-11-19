@@ -505,52 +505,106 @@ def test_channels_are_properties():
     assert node.inputs["amp"].hide and node.inputs["lift"].hide
 
 
-def test_chramp_keeps_its_shape():
-    from bex import builder
+def test_chramp():
+    from bex import builder, ramp_widget
     obj, node, text = make_setup('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
     assert node.error == "" and node.ramps() == ["lift"]
-    ramp = builder.ramp_node(node.node_tree, "lift")
+    ramp = node.bex_ramps["lift"]
+    def zs():
+        return [v.co.z for v in evaluate(obj).vertices[:5]]
     # A new ramp is a straight 0-1 line: x = -1..1 gives z = 0..1.
-    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [0, 0.25, 0.5, 0.75, 1])
-    # Shape it: flat at 0.3.
-    curve = ramp.mapping.curves[0]
-    curve.points[0].location = (0, 0.3)
-    curve.points[1].location = (1, 0.3)
-    ramp.mapping.update()
-    node.node_tree.update_tag()
-    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [0.3] * 5)
-    # A recompile keeps the ramp node, and with it the shape.
+    assert close(zs(), [0, 0.25, 0.5, 0.75, 1])
+    # Editing a key updates the curve straight away (no recompile).
+    ramp.keys[0].value = 0.3
+    ramp.keys[1].value = 0.3
+    assert close(zs(), [0.3] * 5)
+    # A recompile keeps the shape: it lives on the node.
     text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5) + chf("up", 1)')
     node.sync()
-    assert builder.ramp_node(node.node_tree, "lift") == ramp
-    assert close([v.co.z for v in evaluate(obj).vertices[:5]], [1.3] * 5)
-    # A duplicated wrangle copies its node group (BexWrangleNode.copy), so it
-    # gets its own ramp with the same shape.
-    dup = node.node_tree.copy()
-    assert builder.ramp_node(dup, "lift") != ramp
-    assert builder.ramp_node(dup, "lift").mapping.curves[0].points[0].location[1] == pytest_approx(0.3)
-    bpy.data.node_groups.remove(dup)
-    # Read at two positions (like Houdini): still one ramp node, so one shape.
+    assert close(zs(), [1.3] * 5)
+    # Presets, and Constant steps reach the node graph.
+    ramp.preset = "Steps"
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    node.sync()
+    assert close(zs(), [0, 1 / 3, 2 / 3, 1, 1], 2e-2)
+    # Read at two positions (like Houdini): one Float Curve, shared through a closure.
+    ramp.preset = "Hill"
     text.from_string('f@a = chramp("lift", @P.x * 0.5 + 0.5)\nf@b = chramp("lift", @P.y * 0.5 + 0.5)')
     node.sync()
-    assert node.error == "" and builder.ramp_node(node.node_tree, "lift") == ramp
-    curve.points.new(0.5, 1.0)  # a peak in the middle: 0.3 at the ends, 1 at 0.5
-    ramp.mapping.update()
-    node.node_tree.update_tag()
+    assert node.error == ""
+    assert sum(1 for n in node.node_tree.nodes if n.bl_idname == "ShaderNodeFloatCurve") == 1
+    from bex import ramp as R
+    keys = ramp_widget.keys_of(ramp)
     mesh = evaluate(obj)
     for v, a, b in zip(mesh.vertices, attr(mesh, "a"), attr(mesh, "b")):
-        assert abs(a - ramp.mapping.evaluate(curve, v.co.x * 0.5 + 0.5)) < 1e-3
-        assert abs(b - ramp.mapping.evaluate(curve, v.co.y * 0.5 + 0.5)) < 1e-3
-    # Dragging a point re-evaluates live: the draw handler sees the new shape.
-    from bex import code_editor as ce
-    ce.check_ramps(node)  # the first look only remembers the shape
-    assert not ce.check_ramps(node)
-    curve.points[0].location = (0, 0.6)
-    assert ce.check_ramps(node) and not ce.check_ramps(node)
-    # Removed from the script: the ramp node goes.
+        assert abs(a - R.evaluate(keys, v.co.x * 0.5 + 0.5)) < 2e-2
+        assert abs(b - R.evaluate(keys, v.co.y * 0.5 + 0.5)) < 2e-2
+    # Gone from the script: the ramp is remembered, so bringing it back keeps its shape.
     text.from_string("@P.z = 2")
     node.sync()
-    assert builder.ramp_node(node.node_tree, "lift") is None and node.ramps() == []
+    assert node.ramps() == [] and node.bex_ramps.get("lift") is not None
+    assert builder.ramp_node(node.node_tree, "lift") is None
+    text.from_string('@P.z = chramp("lift", @P.x * 0.5 + 0.5)')
+    node.sync()
+    assert close(zs(), [R.evaluate(keys, x) for x in (0, 0.25, 0.5, 0.75, 1)], 2e-2)
+
+
+def test_ramp_actions():
+    from bex import ramp_widget
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    with bpy.context.temp_override(node=node):
+        bpy.ops.bex.ramp_action(ramp="r", action="INVERT")
+        assert [round(v, 4) for _, v, _ in ramp_widget.keys_of(ramp)] == [1.0, 0.0]
+        bpy.ops.bex.ramp_action(ramp="r", action="ADD")
+        assert len(ramp.keys) == 3 and ramp.selected == 2
+        assert ramp.keys[2].position == pytest_approx(0.5) and ramp.keys[2].value == pytest_approx(0.5)
+        bpy.ops.bex.ramp_action(ramp="r", action="DELETE")
+        assert len(ramp.keys) == 2
+    ramp.point = 2
+    assert ramp.selected == 1
+    ramp.point = 9
+    assert ramp.selected == 1  # clamped to the last point
+
+
+def test_ramp_mouse_editing():
+    import types
+    from bex import code_editor as ce, ramp_widget as rw
+    obj, node, text = make_setup('@P.z = chramp("r", @P.x * 0.5 + 0.5)')
+    ramp = node.bex_ramps["r"]
+    ramp.expanded = True
+    # No Node Editor in background: put the code box at a known place.
+    box_rect, shows_code = ce.box_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 200, 100, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None,
+                                    window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
+                                    area=None)
+        (graph, markers), px = rw.ramp_rects(node, None)[0]["r"], 1.0
+        inner = rw._inner(graph, px)
+        def at(x, y):
+            return rw._to_px(inner, x, y)
+        def event(x, y, ctrl=False):
+            return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, type="LEFTMOUSE", value="PRESS")
+        op = types.SimpleNamespace()
+        for name in ("invoke", "modal", "_target"):
+            setattr(op, name, getattr(rw.BEX_OT_ramp_edit, name).__get__(op))
+        # A press on empty graph space adds a point there and drags it.
+        assert op.invoke(ctx, event(*at(0.5, 0.9))) == {"RUNNING_MODAL"}
+        assert len(ramp.keys) == 3 and ramp.selected == 2
+        op.modal(ctx, types.SimpleNamespace(type="MOUSEMOVE", value="NOTHING", mouse_region_x=at(0.4, 0.2)[0],
+                                            mouse_region_y=at(0.4, 0.2)[1]))
+        assert ramp.keys[2].position == pytest_approx(0.4) and ramp.keys[2].value == pytest_approx(0.2)
+        assert close(evaluate(obj).vertices[1].co, (-0.5, -1, rw.R.evaluate(rw.keys_of(ramp), 0.25)), 2e-2)
+        # A press on a marker drags only the position.
+        mx = at(0.4, 0)[0]
+        assert op.invoke(ctx, event(mx, (markers[1] + markers[3]) / 2)) == {"RUNNING_MODAL"} and op.only_x
+        # Ctrl+click on a point deletes it.
+        assert op.invoke(ctx, event(*at(0.4, 0.2), ctrl=True)) == {"FINISHED"}
+        assert len(ramp.keys) == 2
+    finally:
+        ce.box_rect, ce._shows_code = box_rect, shows_code
 
 
 def test_group():
