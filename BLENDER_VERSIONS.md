@@ -57,6 +57,7 @@ Units are node-editor units at zoom 1, before UI scale.
 | `SIDE` | 10.5 | `code_editor.py` | the node body's side inset |
 | `ROW_H` | 25 | `ramp_widget.py` | pitch of one row of buttons / fields in the node body |
 | `SEPARATOR_H` | 7 | `ramp_widget.py` | `separator(factor=0.5, type="LINE")` |
+| `TOGGLES_W` | 40 | `ramp_widget.py` | the button column left of a ramp graph (two 20-unit icon buttons) |
 | `NODE_PAD` | 16 | `node.py` | the node's inner margins, left + right (an estimate; only shifts the label column by a few pixels) |
 
 - **How to re-check:** run Blender without `-b`, take a screenshot

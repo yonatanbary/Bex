@@ -582,9 +582,10 @@ def test_ramp_mouse_editing():
                                     window_manager=types.SimpleNamespace(modal_handler_add=lambda op: None),
                                     area=None)
         (graph, markers), px = rw.ramp_rects(node, None)[0]["r"], 1.0
-        inner = rw._inner(graph, px)
+        assert rw._to_px(graph, 0, 0) == (graph[0], graph[1])  # 0, 0 is the graph's corner
+        assert rw._to_px(graph, 1, 1) == (graph[2], graph[3])
         def at(x, y):
-            return rw._to_px(inner, x, y)
+            return rw._to_px(graph, x, y)
         def event(x, y, ctrl=False):
             return types.SimpleNamespace(mouse_region_x=x, mouse_region_y=y, ctrl=ctrl, type="LEFTMOUSE", value="PRESS")
         op = types.SimpleNamespace()
@@ -597,6 +598,11 @@ def test_ramp_mouse_editing():
                                             mouse_region_y=at(0.4, 0.2)[1]))
         assert ramp.keys[2].position == pytest_approx(0.4) and ramp.keys[2].value == pytest_approx(0.2)
         assert close(evaluate(obj).vertices[1].co, (-0.5, -1, rw.R.evaluate(rw.keys_of(ramp), 0.25)), 2e-2)
+        # The lower half of a dot at value 0 hangs over the marker row: it still grabs the dot.
+        ramp.keys[2].value = 0.0
+        cx, cy = at(0.4, 0.0)
+        assert op.invoke(ctx, event(cx, cy - 2)) == {"RUNNING_MODAL"} and not op.only_x
+        ramp.keys[2].value = 0.2
         # A press on a marker drags only the position.
         mx = at(0.4, 0)[0]
         assert op.invoke(ctx, event(mx, (markers[1] + markers[3]) / 2)) == {"RUNNING_MODAL"} and op.only_x

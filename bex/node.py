@@ -178,9 +178,9 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
                 row = col.row(align=True)
                 if sock.is_linked:
                     row.active = False
-                    row.label(text=sock.name, icon="LINKED")
+                    row.label(text=ramp_widget.ui_label(sock.name), icon="LINKED")
                 else:
-                    row.prop(sock, "default_value", text=sock.name)
+                    row.prop(sock, "default_value", text=ramp_widget.ui_label(sock.name))
         for name in ramps:
             ramp_widget.draw_layout(layout, self, self.bex_ramps[name], _field)
         return bool(chans or ramps)

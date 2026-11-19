@@ -17,10 +17,13 @@ from . import ramp as R
 # -- sizes (node-editor units at zoom 1, before UI scale) -----------------------
 GRAPH_H = 110.0      # the graph, unfolded
 STRIP_H = 26.0       # folded: a strip, still editable by dragging
-MARKER_H = 13.0      # the row of position markers under the graph
+MARKER_H = 16.0      # the row of position markers under the graph
+MARKER_GAP = 4.0     # between the graph's bottom edge and a marker's tip
 KEY_R = 4.0          # key dot radius
 HIT_R = 8.0          # how close a press must be to grab a key or marker
 MARKER_W = 5.0       # half width of a marker
+TOGGLES_W = 40.0     # the column left of the graph: the point-fields and fold buttons
+TOGGLES_GAP = 4.0    # between that column and the graph
 # What sits between the code box and the last ramp, and each ramp's rows. The
 # layout cannot be measured from Python, so these were measured from screenshots
 # of Blender 5.2 (like code_editor's SOCKET_ROW).
@@ -111,6 +114,11 @@ class BexRamp(bpy.types.PropertyGroup):
                                    options=set(), description="Replace the ramp with a preset shape")
 
 
+def ui_label(name):
+    """How a script name is shown on the node: first letter upper case, like Houdini."""
+    return name[:1].upper() + name[1:]
+
+
 def keys_of(ramp):
     return [(k.position, k.value, k.interpolation) for k in ramp.keys]
 
@@ -173,16 +181,21 @@ def draw_layout(layout, node, ramp, field):
     """The ramp's header row, the space the graph is drawn into, and the
     selected point's fields. `field(layout, node, label, width)` is node._field."""
     row = layout.row(align=True)
-    row.prop(ramp, "show_point", text="", emboss=False, icon="DISCLOSURE_TRI_DOWN" if ramp.show_point else "DISCLOSURE_TRI_RIGHT")
-    row.label(text=ramp.name)
+    row.label(text=ui_label(ramp.name))
     tools = row.row(align=True)
     tools.alignment = "RIGHT"
     tools.template_icon_view(ramp, "preset", show_labels=True, scale=1.0, scale_popup=4.0)
     for action, icon in (("ADD", "ADD"), ("DELETE", "X"), ("REVERSE", "ARROW_LEFTRIGHT"), ("INVERT", "SORT_ASC")):
         op = tools.operator("bex.ramp_action", text="", icon=icon)
         op.ramp, op.action = ramp.name, action
-    tools.prop(ramp, "expanded", text="", icon="FULLSCREEN_EXIT" if ramp.expanded else "FULLSCREEN_ENTER")
-    space = layout.column()
+    # Like Houdini: the point-fields and fold buttons side by side in a column left
+    # of the graph, under the label. The split is by fraction, so it comes from the
+    # width the code box also spans.
+    body = layout.split(factor=min(0.5, TOGGLES_W / max(1.0, node.width - 2 * ce.SIDE)))
+    toggles = body.row(align=True)
+    toggles.prop(ramp, "show_point", text="", icon="DISCLOSURE_TRI_DOWN" if ramp.show_point else "DISCLOSURE_TRI_RIGHT")
+    toggles.prop(ramp, "expanded", text="", icon="FULLSCREEN_EXIT" if ramp.expanded else "FULLSCREEN_ENTER")
+    space = body.column()
     space.scale_y = graph_height(ramp) / ce.UNIT_Y
     space.label(text="")
     if ramp.show_point and ramp.keys:
@@ -198,12 +211,13 @@ def ramp_rects(node, region):
     and px. Found upwards from the code box: the Presets row and the separator,
     then the ramps from the last one up."""
     x0, _y0, x1, y1, px = ce.box_rect(node, region)
+    gx0 = x0 + (TOGGLES_W + TOGGLES_GAP) * px  # right of the toggle buttons
     y = y1 + (ROW_H + SEPARATOR_H) * px
     rects = {}
     for ramp in reversed(shown_ramps(node)):
         y += (4 * ROW_H if ramp.show_point else 0) * px
-        markers = (x0, y, x1, y + MARKER_H * px)
-        graph = (x0, markers[3], x1, y + graph_height(ramp) * px)
+        markers = (gx0, y, x1, y + MARKER_H * px)
+        graph = (gx0, markers[3], x1, y + graph_height(ramp) * px)
         rects[ramp.name] = (graph, markers)
         y += (graph_height(ramp) + ROW_H) * px
     return rects, px
@@ -214,20 +228,15 @@ def shown_ramps(node):
 
 
 # -- drawing -------------------------------------------------------------------
-def _inner(graph, px):
-    """The graph's 0-1 area: inset so the end keys' dots fit."""
-    x0, y0, x1, y1 = graph
-    inset = (KEY_R + 2) * px
-    return x0 + inset, y0 + inset, x1 - inset, y1 - inset
+# The graph rect is exactly the 0-1 square, like Houdini: position 0 / value 0 is
+# its bottom-left corner. Dots and markers at the ends hang over its edges.
+def _to_px(graph, x, y):
+    return graph[0] + x * (graph[2] - graph[0]), graph[1] + y * (graph[3] - graph[1])
 
 
-def _to_px(inner, x, y):
-    return inner[0] + x * (inner[2] - inner[0]), inner[1] + y * (inner[3] - inner[1])
-
-
-def _from_px(inner, mx, my):
-    w, h = max(1.0, inner[2] - inner[0]), max(1.0, inner[3] - inner[1])
-    return (mx - inner[0]) / w, (my - inner[1]) / h
+def _from_px(graph, mx, my):
+    w, h = max(1.0, graph[2] - graph[0]), max(1.0, graph[3] - graph[1])
+    return (mx - graph[0]) / w, (my - graph[1]) / h
 
 
 def _tris(points, color):
@@ -262,33 +271,37 @@ def draw_node(node, region, vx, vy):
             continue
         gpu.state.blend_set("ALPHA")
         ce._rect(*graph, PALETTE["back"])
-        inner = _inner(graph, px)
         if not ce._clip(region, vx, vy, *graph):
             continue
         if ramp.expanded:
             for i in range(1, 10):
-                gx = inner[0] + (inner[2] - inner[0]) * i / 10
+                gx = graph[0] + (graph[2] - graph[0]) * i / 10
                 ce._rect(round(gx), graph[1], round(gx) + 1, graph[3], PALETTE["grid"])
             for i in range(1, 4):
-                gy = inner[1] + (inner[3] - inner[1]) * i / 4
+                gy = graph[1] + (graph[3] - graph[1]) * i / 4
                 ce._rect(graph[0], round(gy), graph[2], round(gy) + 1, PALETTE["grid"])
         keys = keys_of(ramp)
-        pts = [_to_px(inner, x, y) for x, y in R.polyline(keys)]
-        pts = [(graph[0], pts[0][1])] + pts + [(graph[2], pts[-1][1])]
+        pts = [_to_px(graph, x, y) for x, y in R.polyline(keys)]  # spans x = 0..1
         _tris([p for a, b in zip(pts, pts[1:]) for p in (a, b, (a[0], graph[1]), b, (b[0], graph[1]), (a[0], graph[1]))],
               PALETTE["fill"])
         _line(region, pts, PALETTE["line"], max(1.0, 1.2 * px))
         sel = min(ramp.selected, len(keys) - 1)
+        # Dots may hang over the graph's edges (a key at 0 or 1).
+        gpu.state.scissor_test_set(False)
+        r = (KEY_R + 1) * px
+        if not ce._clip(region, vx, vy, graph[0] - r, graph[1] - r, graph[2] + r, graph[3] + r):
+            continue
         for i, (x, y, _interp) in enumerate(keys):
-            cx, cy = _to_px(inner, x, y)
+            cx, cy = _to_px(graph, x, y)
             _dot(cx, cy, (KEY_R + 1) * px, PALETTE["key_edge"])
             _dot(cx, cy, KEY_R * px, PALETTE["selected" if i == sel else "key"])
         # Position markers under the graph.
         gpu.state.scissor_test_set(False)
-        if ce._clip(region, vx, vy, markers[0], markers[1], markers[2], markers[3]):
+        w = MARKER_W * px
+        if ce._clip(region, vx, vy, markers[0] - w, markers[1], markers[2] + w, markers[3]):
             for i, (x, _y, _interp) in enumerate(keys):
-                cx = _to_px(inner, x, 0)[0]
-                w, top, bottom = MARKER_W * px, markers[3] - 1 * px, markers[1] + 1 * px
+                cx = _to_px(graph, x, 0)[0]
+                top, bottom = markers[3] - MARKER_GAP * px, markers[1] + 1 * px
                 mid = top - w
                 color = PALETTE["selected" if i == sel else "marker"]
                 _tris([(cx, top), (cx - w, mid), (cx + w, mid)], color)
@@ -336,7 +349,8 @@ def ramp_at(context, x, y):
         rects, px = ramp_rects(node, context.region)
         for ramp in shown_ramps(node):
             graph, markers = rects[ramp.name]
-            if graph[0] <= x <= graph[2] and markers[1] <= y <= graph[3]:
+            reach = HIT_R * px  # end keys hang over the edges
+            if graph[0] - reach <= x <= graph[2] + reach and markers[1] <= y <= graph[3] + reach:
                 return node, ramp, graph, markers, px
     return None
 
@@ -366,15 +380,23 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
             return {"PASS_THROUGH"}
         node, ramp, graph, markers, px = hit
         self.tree, self.node, self.ramp = node.id_data.name, node.name, ramp.name
-        inner = _inner(graph, px)
         keys = keys_of(ramp)
+        # A dot under the press wins, even where it hangs over the marker row
+        # (a key at value 0); otherwise a press in the marker row takes the
+        # nearest marker and drags only the position.
         grab, best = None, HIT_R * px
-        on_markers = y < markers[3]
         for i, (kx, ky, _interp) in enumerate(keys):
-            cx, cy = _to_px(inner, kx, ky)
-            d = abs(x - cx) if on_markers else ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
+            cx, cy = _to_px(graph, kx, ky)
+            d = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
             if d <= best:
                 grab, best = i, d
+        on_markers = grab is None and y < markers[3]
+        if on_markers:
+            best = HIT_R * px
+            for i, (kx, _ky, _interp) in enumerate(keys):
+                d = abs(x - _to_px(graph, kx, 0)[0])
+                if d <= best:
+                    grab, best = i, d
         if grab is not None and event.ctrl:
             if len(ramp.keys) > 1:
                 ramp.keys.remove(grab)
@@ -384,7 +406,7 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         if grab is None:
             if on_markers:
                 return {"FINISHED"}
-            nx, ny = _from_px(inner, x, y)
+            nx, ny = _from_px(graph, x, y)
             nx, ny = min(max(nx, 0.0), 1.0), min(max(ny, 0.0), 1.0)
             k = ramp.keys.add()
             k.interpolation = _segment_interpolation(keys, nx)
@@ -392,7 +414,7 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
             grab = len(ramp.keys) - 1
         ramp.selected = grab
         self.index, self.only_x = grab, on_markers
-        self.inner = inner
+        self.graph = graph
         context.window_manager.modal_handler_add(self)
         ce._redraw(context)
         return {"RUNNING_MODAL"}
@@ -408,7 +430,7 @@ class BEX_OT_ramp_edit(bpy.types.Operator):
         if ramp is None or self.index >= len(ramp.keys):
             return {"CANCELLED"}
         if event.type in ("MOUSEMOVE", "INBETWEEN_MOUSEMOVE"):
-            nx, ny = _from_px(self.inner, event.mouse_region_x, event.mouse_region_y)
+            nx, ny = _from_px(self.graph, event.mouse_region_x, event.mouse_region_y)
             key = ramp.keys[self.index]
             key.position = min(max(nx, 0.0), 1.0)
             if not self.only_x:
