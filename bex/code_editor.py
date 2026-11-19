@@ -96,6 +96,7 @@ PALETTE = {
     "sig_active": (1.0, 1.0, 1.0, 1.0),
     "sig_summary": (0.62, 0.62, 0.64, 1.0),
 }
+MUTED_ALPHA = 0.5       # a muted wrangle's code is drawn see-through, like the node
 SIG_PAD = 6.0           # signature popup: inner padding
 SIG_GAP = 2.0           # between the cursor line and the popup
 SIG_MARGIN = 8.0        # kept free between the popup and the region edge
@@ -121,6 +122,7 @@ _session = None          # the Session being edited, if any
 _draw_handle = None
 _highlight_cache = {}    # text -> highlighted spans
 _ratio = None            # monospace character width / font size, measured once (_char_ratio)
+_fade = 1.0              # alpha multiplier while drawing a node (MUTED_ALPHA when muted)
 _popup = None            # signature help to draw over everything, set by _draw_node
 _buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
 _views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
@@ -279,7 +281,7 @@ def wrangle_at(context, x, y):
     if tree is None:
         return None, None
     for node in reversed(tree.nodes[:]):
-        if _shows_code(node):
+        if _shows_code(node) and not node.mute:  # a muted wrangle's code is read-only
             rect = box_rect(node, context.region)
             if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
                 return node, rect
@@ -345,7 +347,7 @@ def _chevron(region, r, direction, color, px):
     shader = gpu.shader.from_builtin("POLYLINE_UNIFORM_COLOR")
     shader.uniform_float("viewportSize", (region.width, region.height))
     shader.uniform_float("lineWidth", max(1.0, 1.2 * px))
-    shader.uniform_float("color", color)
+    shader.uniform_float("color", _ink(color))
     batch_for_shader(shader, "LINE_STRIP", {"pos": pts}).draw(shader)
 
 
@@ -476,8 +478,13 @@ def _rect(x0, y0, x1, y1, color):
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     batch = batch_for_shader(shader, "TRIS", {"pos": [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]},
                              indices=[(0, 1, 2), (0, 2, 3)])
-    shader.uniform_float("color", color)
+    shader.uniform_float("color", _ink(color))
     batch.draw(shader)
+
+
+def _ink(color):
+    """`color` with the current node's fade applied to its alpha."""
+    return (*color[:3], color[3] * _fade) if _fade != 1.0 else color
 
 
 def _spans(lines):
@@ -495,7 +502,7 @@ def _draw():
     tree = getattr(context.space_data, "edit_tree", None)
     if tree is None or tree.bl_idname != "GeometryNodeTree":
         return
-    global _popup
+    global _popup, _fade
     gpu.state.blend_set("ALPHA")
     old_scissor = gpu.state.scissor_get()
     vx, vy = gpu.state.viewport_get()[:2]
@@ -503,11 +510,14 @@ def _draw():
     try:
         for node in tree.nodes:
             if _shows_code(node):
+                _fade = MUTED_ALPHA if node.mute else 1.0
                 _draw_node(node, context.region, vx, vy)
+        _fade = 1.0
         if _popup:  # after every node, so no other code box covers it
             gpu.state.scissor_test_set(False)
             _draw_signature(context.region, _free_x(context.area, context.region), *_popup)
     finally:
+        _fade = 1.0
         gpu.state.scissor_set(*old_scissor)
         gpu.state.scissor_test_set(False)
         gpu.state.blend_set("NONE")
@@ -604,14 +614,14 @@ def _draw_node(node, region, vx, vy):
         if ghost and row == ghost_row:
             pieces = _split_spans(pieces, ghost_col)
             shift = len(ghost)
-            blf.color(FONT_ID, *PALETTE["ghost"])
+            blf.color(FONT_ID, *_ink(PALETTE["ghost"]))
             _text(col_x(ghost_col), y, ghost, char_w, step)
         for start, end, kind in pieces:
             # Text after the cursor moves right to make room for the ghost text.
             offset = shift if shift and start >= ghost_col else 0
             if end + offset <= view.left or start + offset >= view.left + cols + 1:
                 continue
-            blf.color(FONT_ID, *PALETTE[_COLOR_OF.get(kind, "text")])
+            blf.color(FONT_ID, *_ink(PALETTE[_COLOR_OF.get(kind, "text")]))
             _text(col_x(start + offset), y, line[start:end], char_w, step)
     gpu.state.blend_set("ALPHA")  # blf text drawing turns blending off
     if editing:
@@ -634,7 +644,7 @@ def _draw_node(node, region, vx, vy):
     for row in range(first, last):
         number = str(row + 1)
         y = top - (row - first + 1) * line_h + descent
-        blf.color(FONT_ID, *PALETTE["line_number_current" if row == current else "line_number"])
+        blf.color(FONT_ID, *_ink(PALETTE["line_number_current" if row == current else "line_number"]))
         _text(gutter_r - (GUTTER_PAD + len(number)) * char_w, y, number, char_w, step)
     _draw_bars(node, region, outer, lines, view, editing)
     outline()
@@ -763,22 +773,22 @@ def _draw_info(node, region, x0, y0, x1, y1, px, vx, vy):
     line_h = INFO_LINE_H * px
     y = y1 - INFO_GAP * px - line_h + (line_h - size) * 0.5 + 0.2 * size
     for line, kind in note_lines(node):
-        blf.color(FONT_ID, *PALETTE[kind][:3], 1.0)
+        blf.color(FONT_ID, *_ink((*PALETTE[kind][:3], 1.0)))
         _text(left, y, line, char_w, step)
         y -= line_h
     status = ""
     if is_editing(node):  # where the cursor is, right-aligned on the first line
         row, col = _session.buf.cursor
         status = f"Line {row + 1}, Col {col + 1}"
-        blf.color(FONT_ID, *PALETTE["dim"])
+        blf.color(FONT_ID, *_ink(PALETTE["dim"]))
         _text(right - len(status) * char_w, y, status, char_w, step)
     for label, value in info_lines(node):
-        blf.color(FONT_ID, *PALETTE["comment"])
+        blf.color(FONT_ID, *_ink(PALETTE["comment"]))
         _text(left, y, label, char_w, step)
         if status:  # leave room for it
             value = _fit(value, int((right - left - label_w) / char_w) - len(status) - 2)
             status = ""
-        blf.color(FONT_ID, *PALETTE["dim"])
+        blf.color(FONT_ID, *_ink(PALETTE["dim"]))
         _text(left + label_w, y, value, char_w, step)
         y -= line_h
     gpu.state.scissor_test_set(False)
@@ -840,6 +850,8 @@ class BEX_OT_code_edit(bpy.types.Operator):
         node = _session.node() if _session else None
         if node is None:
             return self._end(context, None, {"CANCELLED"})
+        if node.mute:  # muted from elsewhere (sidebar, script): stop editing
+            return self._end(context, node, {"FINISHED", "PASS_THROUGH"})
         _session.pull(node)
         result = self._event(context, node, event)
         self._sync_timer(context)

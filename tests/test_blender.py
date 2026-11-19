@@ -393,6 +393,29 @@ def test_code_editor_undo_survives_refocus():
     assert not ce.buffer_for(text).undo()
 
 
+def test_muted_wrangle_code_is_read_only():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1")
+    # No Node Editor in background: every wrangle shows its code in one box.
+    box_rect, shows_code = ce.box_rect, ce._shows_code
+    ce.box_rect = lambda n, r: (0, 0, 300, 300, 1.0)
+    ce._shows_code = lambda n: n.bl_idname == "GeometryNodeBexWrangle"
+    try:
+        ctx = types.SimpleNamespace(space_data=types.SimpleNamespace(edit_tree=node.id_data), region=None)
+        assert ce.wrangle_at(ctx, 10, 10)[0] == node
+        node.mute = True
+        assert ce.wrangle_at(ctx, 10, 10)[0] is None  # clicks reach the node instead
+    finally:
+        ce.box_rect, ce._shows_code = box_rect, shows_code
+    # Muted while being edited: the session ends on the next event.
+    ce._session = ce.Session(node)
+    op = types.SimpleNamespace(_end=lambda c, n, r: (setattr(ce, "_session", None), r)[1])
+    assert ce.BEX_OT_code_edit.modal(op, bpy.context, None) == {"FINISHED", "PASS_THROUGH"}
+    assert ce._session is None
+
+
 def test_code_box_scrolls():
     import types
     from bex import code_editor as ce
