@@ -205,7 +205,7 @@ def carried(ramp, indices):
     """The handles that move with `indices`: in a Bezier ramp, the handles of the
     anchors among them (not already in `indices`)."""
     n = len(ramp.keys)
-    if not n or ramp.keys[0].interpolation != "BEZIER" or not R.is_bezier(keys_of(ramp)):
+    if not n or not R.is_bezier(keys_of(ramp)):
         return []
     out = {h for i in indices if R.is_anchor(i, n) for h in R.handles_of(i, n)}
     return sorted(out - set(indices))
@@ -698,8 +698,9 @@ def _segment_interpolation(keys, x):
 
 
 class BEX_OT_ramp_edit(bpy.types.Operator):
-    """Drag a ramp's points (Shift-click selects a range, which drags as one); click
-    empty space to add a point, Ctrl+click a point to delete it"""
+    """Drag a ramp's points (Shift-click selects a range, which drags as one; a Bezier
+    anchor carries its handles); click empty space to add a point, Ctrl+click a point
+    to delete it"""
 
     bl_idname = "bex.ramp_edit"
     bl_label = "Edit BEX Ramp"
@@ -848,8 +849,8 @@ ACTIONS = (("ADD", "Add", "Add a point between the selected one and the next"),
 
 
 class BEX_OT_ramp_delete(bpy.types.Operator):
-    """Delete the selected ramp points. Delete / X do this whenever points are
-    selected (wherever the mouse is), and never touch the node then"""
+    """Delete the selected ramp points. Delete / Backspace / X do this whenever points
+    are selected (wherever the mouse is), and never touch the node then"""
 
     bl_idname = "bex.ramp_delete"
     bl_label = "Delete Ramp Points"
