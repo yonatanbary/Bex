@@ -204,6 +204,28 @@ def test_error_keeps_last_good_nodes():
     assert close(evaluate(obj).vertices[0].co, (-1, -1, 2))
 
 
+def test_hand_edits_inside_are_restored():
+    obj, node, text = make_setup("@P.z = 1;")
+    tree = node.node_tree
+    set_pos = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeSetPosition")
+    set_pos.mute = True
+    assert node.tree_edited()
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 0))
+    # The timer and undo leave edits made inside alone...
+    node.sync(restore=False)
+    assert set_pos.mute
+    # ...any other sync (e.g. leaving the code editor) rebuilds, even with the script unchanged.
+    node.sync()
+    assert not node.tree_edited()
+    assert not any(n.mute for n in tree.nodes)
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 1))
+    # So does a deleted link.
+    tree.links.remove(tree.links[0])
+    node.sync()
+    assert not node.tree_edited()
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 1))
+
+
 def test_sync_all_and_copy():
     from bex import node as bex_node
 

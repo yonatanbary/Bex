@@ -96,6 +96,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
     error: bpy.props.StringProperty()
     warning: bpy.props.StringProperty()  # shown under the code; the build still happened
     compiled_key: bpy.props.StringProperty()
+    built_print: bpy.props.StringProperty()  # tree_print() of the nodes as built
     # JSON {name: [socket type, value]} of input values, so an input that is
     # removed and comes back (undo, rename back) gets its value back.
     saved_values: bpy.props.StringProperty()
@@ -206,14 +207,23 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         key = self._key(src)
         return self.compiled_key == key
 
-    def sync(self, force=False, pending_line=None):
+    def tree_edited(self):
+        """True when someone changed the inner nodes by hand (muted, deleted, added
+        or relinked one) since the last build."""
+        return bool(self.node_tree and self.built_print and tree_print(self.node_tree) != self.built_print)
+
+    def sync(self, force=False, pending_line=None, restore=True):
         """Recompile if the script or settings changed since the last build.
 
         `pending_line` (1-based) is the line being typed: new ch*() names on it
         don't create inputs yet, and no input is removed meanwhile.
+        `restore`: also rebuild when the inner nodes were edited by hand. Off for
+        the timer and undo, so they never undo what someone is doing inside.
         """
         src = self.script.as_string() if self.script else ""
         key = self._key(src)
+        if restore and self.tree_edited():
+            force = True
         if pending_line is None and key == self.compiled_key and not force and self.node_tree:
             return
         name = self.script.name if self.script else "(no script)"
@@ -261,6 +271,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
                 sock.default_value = default
         self.hide_channel_sockets()
         self.node_tree.name = TREE_PREFIX + name
+        self.built_print = tree_print(self.node_tree)
         self.info = json.dumps({
             "reads": [[n, t] for n, t in program.reads],
             "writes": [[n, t] for n, t, _ in program.writes],
@@ -342,13 +353,22 @@ def wrangle_nodes():
                 yield node
 
 
-def sync_all(force=False):
+def sync_all(force=False, restore=True):
     """force=True rebuilds every wrangle, including ones with Auto Update off."""
     nodes = list(wrangle_nodes())
     for text in {n.script for n in nodes if n.script}:
         _reload_from_disk(text)
     for node in nodes:
-        node.sync(force)
+        node.sync(force, restore=restore)
+
+
+def tree_print(tree):
+    """A digest of a wrangle's inner nodes, their mute state and their links (not
+    positions or values), to notice hand edits made inside the group."""
+    parts = sorted(f"{n.name}|{n.bl_idname}|{n.mute}" for n in tree.nodes)
+    parts += sorted(f"{l.from_node.name}.{l.from_socket.identifier}>{l.to_node.name}.{l.to_socket.identifier}|{l.is_muted}"
+                    for l in tree.links)
+    return hashlib.md5("\n".join(parts).encode()).hexdigest()
 
 
 def _texts_in_editors():
@@ -381,7 +401,7 @@ def _watch():
             if last is None or last[0] != digest:
                 _text_changes[text.name] = last = (digest, now if last else 0.0)
             typing = text.name in shown and now - last[1] < TYPING_IDLE
-            node.sync(pending_line=text.current_line_index + 1 if typing else None)
+            node.sync(pending_line=text.current_line_index + 1 if typing else None, restore=False)
     except Exception:
         traceback.print_exc()
     return WATCH_INTERVAL
@@ -397,7 +417,7 @@ def _on_load(*_args):
 
 @persistent
 def _on_undo(*_args):
-    sync_all()
+    sync_all(restore=False)
 
 
 def _sync_after_register():
