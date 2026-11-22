@@ -645,7 +645,8 @@ SIGNATURES = {
     "setdetailattrib": (("geo", "name", "value"), "Not available: Blender has no detail attributes."),
     # Arrays
     "array": (("values...",), "An array of the values: array(1, 2, 3) is [1, 2, 3]."),
-    "append": (("array", "value"), "Adds value at the end of the array variable. Also a.append(value)."),
+    "append": (("array", "value"), "Adds value at the end of the array variable. Also a.append(value). "
+                                   "In a loop that isn't unrolled, an array keeps at most 32 values."),
     "push": (("array", "value"), "Same as append()."),
     "pop": (("array", "[index]"), "Takes the last value (or the one at index) out of the array variable."),
     "insert": (("array", "index", "value"), "Puts value into the array variable at index."),
@@ -1464,16 +1465,10 @@ class Compiler:
         items = [self.select(self.compare("==", a.length, Val("int", k)), v, x) for k, x in enumerate(items)]
         cap = len(items)
         if self.zone_depth and cap >= ARRAY_ZONE_CAP:  # a loop's array has a fixed number of slots
-            self._array_cap_warning()
             return self.make_arr(t, items, self.fn2("MINIMUM", min, self.arith("+", a.length, Val("int", 1)),
                                                     Val("int", cap)))
         items.append(self.select(self.compare("==", a.length, Val("int", cap)), v, self._neutral(t)))
         return self.make_arr(t, items, self.arith("+", a.length, Val("int", 1)))
-
-    def _array_cap_warning(self):
-        msg = f"line {self.line}: an array growing in a loop keeps at most {ARRAY_ZONE_CAP} values"
-        if msg not in self.warnings:
-            self.warnings.append(msg)
 
     def arr_find(self, a, v):
         """The first used slot equal to v, or -1."""
