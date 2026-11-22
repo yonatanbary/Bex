@@ -139,6 +139,17 @@ Units are node-editor units at zoom 1, before UI scale.
 | Rotations are always unit quaternions (Quaternion to Rotation normalizes; Rotation to Quaternion may give -q); attributes store W, X, Y, Z | BEX folds constants to unit length too, and maps Houdini's x, y, z, w onto W, X, Y, Z at the node | `compiler.combine`, `compiler.member` |
 | Rotate Rotation (Global) applies Rotation, then Rotate By; Multiply Matrices is A @ B (B applies first); Axes to Rotation and Transform Point use column vectors (checked in 5.2 by `test_rotations_and_matrices`) | VEX's order (`q1 * q2` = qmultiply, `v * m1 * m2`) is mapped onto them | `compiler.qmultiply`, `compiler.matmul` |
 | Multiply Matrices' two inputs are both named "Matrix" | IR `node` inputs can be given by socket number | `builder.build` (`node`) |
+| No node makes a face from a list of point numbers; Fill Curve flattens to XY and drops attributes | a "poly" is a closed curve of copies of its points, Curve to Mesh with Fill Caps on a one-point path (each profile becomes one cap), then Merge Points by point number joins the corners to the points they copy (checked in 5.2 by `test_geometry_functions`) | `builder.geometry_ops` |
+| Curve to Mesh's cap runs the profile backwards | that is Houdini's clockwise winding in Blender terms, so no Flip Faces | `builder.geometry_ops` |
+| Merge Points averages the attributes of the points it merges, and collapses faces that become duplicates (a new face identical to an old one disappears) | the corners are full copies of their points (identical values average to themselves) | `builder.geometry_ops` (`pick`) |
+| No "scatter" node: an element can't gather the values of other elements that name it | records and one marker per element are joined and sorted by Sort Elements, whose Group ID orders the groups and which is stable, so a marker comes first with its records after it; Accumulate Field / Field at Index / Field Min & Max then combine them (5.2) | `builder.gather` |
+| Duplicate Elements (Point) on a mesh gives loose vertices, ordered by point and then copy, with every attribute | `pick` copies points with it, then sorts them into record order | `builder.pick` |
+| A Join Geometry input lists its newest link first | links are made in reverse order | `builder.join` |
+| Each component numbers its points on its own (a mesh vertex and a curve point can both be point 3) | Houdini point numbers mean the mesh and point cloud points; curve points only when there are none | `builder.split_points` |
+| Set Mesh Normal (Free) has no Selection input | outside the Group, the old normal is written back | `compiler.plan_stores` |
+| An instance's transform is the `instance_transform` attribute (Float 4x4, Instance domain), and Store Named Attribute can write it | @P / @orient / @scale / @transform on instances are written as one instance_transform | `compiler._instance_transform` |
+| Gabor Texture has two inputs named "Orientation" (2D float, 3D vector) | given by socket number | `compiler.gabor` |
+| A Voronoi Texture's unused outputs (W, Radius…) are disabled, and some can't be found by name | the IR `node` lists them anyway, falling back to any socket with that name | `builder.build` (`node`) |
 | The Mac key labelled "delete" sends `BACK_SPACE`, not `DEL` | ramp point delete is bound to both | `node.register` |
 | The Float Curve widget updates only on mouse release | moot: our ramp widget writes the curve on every move | `ramp_widget.write_curve` |
 
