@@ -735,8 +735,8 @@ def test_rotations_and_matrices():
     assert w["x"].out == 1
     assert w["s"].node.kind == "mix" and w["s"].node.params["dtype"] == "quaternion" and w["l"] == w["s"]
     assert w["P"].node.params["idname"] == "FunctionNodeRotateVector"
-    w = writes("q = (@P.x, 0, 0, 1)\nf@y = q.y\nf@x = q.x")  # read back from the inputs, no node
-    assert w["y"].const == 0.0 and w["x"].node.kind == "separate"
+    w = writes("q = (@P.x, 0, 0, 1)\nf@y = q.y\nf@x = q.x")  # read back normalized, like a stored rotation
+    assert all(w[k].node.params["idname"] == "FunctionNodeRotationToQuaternion" for k in "xy")
     # matrices: v * m transforms, m1 * m2 applies m1 first
     w = writes("m = maketransform((1, 2, 3), quaternion(PI / 2, (0, 0, 1)), (2, 2, 2))\nv@a = (1, 0, 0) * m\n"
                "n = ident()\ntranslate(n, (0, 0, 5))\nscale(n, (2, 2, 2))\nv@b = (1, 1, 1) * n\n"
@@ -891,7 +891,7 @@ def test_geometry_functions():
     assert [(op.kind, op.records is not None) for op in prog.geo_ops] == [("addpoint", True), ("set", True)]
     fails('for j in range(chi("m")):\n    for i in range(chi("n")):\n        addpoint(0, @P)', "inside another loop")
     fails("addpoint(1, @P)", "first argument is the geometry")
-    fails("addvertex(0, 3, @ptnum)", "pass the number addprim() gave")
+    fails("addvertex(0, 3, @ptnum)", "made with addprim()")
     fails('setdetailattrib(0, "x", 1)', "no detail attributes")
     fails('setpointattrib(0, "x", 0, 1.0, "toggle")', "mode is one of")
     fails('setpointgroup(0, "g", 0, 1)\nsetpointattrib(0, "b@g", 0, True, "add")', "needs numbers")
@@ -914,6 +914,51 @@ def test_channel_ranges():
     fails('f@a = chf("amp", 1, min=5, max=1)', "larger than")
     fails('f@a = chf("amp", 1, low=0)', "no option 'low'")
     fails('f@a = chf("amp", 1, min=@P.x)', "constant number")
+
+
+def test_review_fixes():
+    # call arguments that assign are loop items
+    prog = compile_source('m = ident()\nfor i in range(chi("n", 3)):\n    translate(m, (0, 0, 1))\n@P *= m')
+    assert any(n.kind == "repeat_in" for n in _ir_nodes(prog))
+    prog = compile_source('v = (0, 0, 0)\nfor i in range(chi("n", 3)):\n    setcomp(v, v.x + 1, 0)\nv@a = v')
+    assert any(n.kind == "repeat_in" for n in _ir_nodes(prog))
+    # a quaternion / matrix returned early under a per-element if
+    w = writes("def f(x):\n    if x > 0:\n        return quaternion(x, (0, 1, 0))\n    return quaternion(0, (0, 1, 0))\n"
+               "p@o = f(@P.x)\ndef g(x):\n    if x > 0:\n        return ident()\n    return maketransform((x, 0, 0), "
+               "quaternion(0, (0, 0, 1)))\n4@m = g(@P.x)")
+    assert w["o"].type == "quaternion" and w["m"].type == "matrix"
+    # a geometry function in one branch of a ternary / and runs only there
+    prog = compile_source("x = addpoint(0, @P) if @P.x > 0 else -1\nb = @P.y > 0 and addpoint(0, @P) >= 0")
+    assert all(not op.mask.is_const for op in prog.geo_ops)
+    # a function making elements, called twice in a zone: inlined, two calls
+    prog = compile_source('def mk(h):\n    return addpoint(0, @P + (0, 0, h))\nfor i in range(chi("n", 3)):\n'
+                          '    a = mk(i + 1.0)\n    b = mk(i + 1.5)')
+    seen, stack = {}, [prog.geo_ops[0].records.node]
+    while stack:
+        n = stack.pop()
+        if id(n) not in seen:
+            seen[id(n)] = n
+            stack.extend(v.node for v in n.inputs if v.node is not None)
+            stack.extend(x for x in n.params.values() if hasattr(x, "kind"))
+    nodes = list(seen.values())
+    assert not any(n.kind in ("closure_out", "closure_in") for n in nodes)
+    assert sum(n.kind == "records" for n in nodes) == 2
+    fails("p@o = blur(p@orient)", "numbers and vectors")
+    fails('f@a = noise(@P, amp="x")', "amp= takes a number")
+    fails('m = ident()\nf@a = promote(m[0], "face")', "row of a matrix")
+    fails("m = ident()\ni = 1\nf@a = m[i][0]", "indexes have to be constant")
+    assert writes("b@a = 1 in (1,)")["a"].const is True
+    prog = compile_source('i@a = chi("n", 9, min=0.5, max=3.7)')
+    assert prog.limits == {"n": (1, 3)} and prog.params == [("n", "int", 3)]
+    w = writes("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
+    assert w["w"].node.params["idname"] == "FunctionNodeRotationToQuaternion"  # normalized, like a stored one
+    prog = compile_source("f@a = 1", group="pscale > 0.5")
+    assert ("radius", "float") in prog.reads and not any(n == "pscale" for n, _t in prog.reads)
+    prog = compile_source('pr = addprim(0, "polyline")\nif @P.x > 0:\n    pr = addprim(0, "polyline")\n'
+                          'addvertex(0, pr, @ptnum)')
+    assert prog.geo_ops[-1].info["ptype"] == "polyline"
+    w = writes('setpointattrib(0, "foo", 0, @P)\nv@b = @foo')
+    assert w["b"].node.params["dtype"] == "vector"
 
 
 if __name__ == "__main__":

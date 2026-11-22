@@ -160,7 +160,8 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         # Links changed: an input that was just unlinked goes back to being a property.
         self.hide_channel_sockets()
         # What reaches Input 2-4 types point(1, "name", i): recompile soon (not inside this callback).
-        if self.script and not self.is_up_to_date():
+        src = self.script.as_string() if self.script else ""
+        if self.script and self._key(src, fresh=True) != self.compiled_key:
             tree, name = self.id_data.name, self.name
             bpy.app.timers.register(lambda: _sync_later(tree, name), first_interval=0.0)
 
@@ -415,6 +416,9 @@ def _watch():
             if text.filepath:
                 _reload_from_disk(text)
             elif text.name not in shown:
+                # What reaches Input 2-4 changed type upstream (no event for that): recompile.
+                if node.input_types() and node._key(text.as_string(), fresh=True) != node.compiled_key.split("|pending")[0]:
+                    node.sync(restore=False)
                 continue
             digest = hashlib.md5(text.as_string().encode()).hexdigest()
             last = _text_changes.get(text.name)

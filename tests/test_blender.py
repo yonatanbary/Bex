@@ -1823,6 +1823,79 @@ def test_geometry_functions():
     assert [tuple(geo.curves.points[i].position) for i in range(4)] == [(-1, -1, z) for z in range(4)]
 
 
+def test_review_fixes():
+    from mathutils import Vector
+    orig = None
+
+    def run(src, domain="POINT"):
+        nonlocal orig
+        obj, node, text = make_setup(src, domain)
+        assert node.error == "", node.error
+        orig = original_points(obj)
+        return obj, node, text, evaluate(obj)
+
+    # 1. translate() / setcomp() / out arguments in a Repeat Zone loop
+    obj, node, text, mesh = run('m = ident()\nv = (0, 0, 0)\ns = 0\nf = 0.0\nfor i in range(chi("n", 3)):\n'
+                                '    translate(m, (0, 0, 1))\n    setcomp(v, v.x + 1, 0)\n    f += wnoise(@P + i, s)\n'
+                                '@P *= m\nv@vv = v\ni@s = s')
+    assert len(mesh.vertices) == 25
+    assert all(abs(v.co.z - 3) < 1e-5 for v in mesh.vertices) and all(close(c, (3, 0, 0)) for c in attr(mesh, "vv"))
+    # 2. a captured (swapped) value used by addpoint
+    obj, node, text = make_setup("f@m = 1")
+    obj.data.attributes.new("a", "FLOAT", "POINT").data.foreach_set("value", [float(i) for i in range(25)])
+    obj.data.attributes.new("b", "FLOAT", "POINT").data.foreach_set("value", [100.0 + i for i in range(25)])
+    text.from_string("t = f@a\nf@a = f@b + 5\nf@b = t\nif @ptnum < 3:\n    addpoint(0, (t, 0, 10))")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert [round(mesh.vertices[25 + k].co.x) for k in range(3)] == [0, 1, 2]
+    # 3. curve-only input: new points are one-point curves, numbered after the curve points
+    obj, node, text = make_setup('pt = addpoint(0, @P + (0, 0, 1))\nsetpointattrib(0, "h", pt, 7.0)\n'
+                                 'addprim(0, "polyline", @ptnum, pt)')
+    tree = node.id_data
+    line, res = tree.nodes.new("GeometryNodeCurvePrimitiveLine"), tree.nodes.new("GeometryNodeResampleCurve")
+    res.inputs["Count"].default_value = 3
+    tree.links.new(line.outputs[0], res.inputs[0])
+    tree.links.new(res.outputs[0], node.inputs[0])
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    c = geo.curves
+    assert len(c.curves) == 1 + 3 + 3 and len(c.points) == 3 + 3 + 6  # the line, 3 new points, 3 polylines
+    h = [d.value for d in c.attributes["h"].data]
+    assert h[:3] == [0, 0, 0] and h[3:6] == [7, 7, 7]
+    # ... and with polylines already on a mesh, new points are numbered after the mesh's
+    obj, node, text = make_setup('pt = addpoint(0, @P + (0, 0, 1))\naddprim(0, "polyline", @ptnum, pt)')
+    tree = node.id_data
+    second = tree.nodes.new("GeometryNodeBexWrangle")
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(node.outputs[0], second.inputs[0])
+    tree.links.new(second.outputs[0], out.inputs[0])
+    t2 = bpy.data.texts.new("second.bex")
+    t2.from_string('pt = addpoint(0, @P)\nsetpointattrib(0, "h", pt, 7.0)')
+    second.script = t2
+    second.sync()
+    assert second.error == "", second.error
+    mesh = evaluate(obj)
+    assert len(mesh.vertices) == 100 and attr(mesh, "h")[50:] == [7.0] * 50
+    # 4. a function making points, called twice in a Repeat Zone loop
+    obj, node, text, mesh = run('def mk(h):\n    return addpoint(0, @P + (0, 0, h))\n'
+                                'for i in range(chi("n", 3)):\n    a = mk(i + 1.0)\n    b = mk(i + 1.5)')
+    assert len(mesh.vertices) == 25 + 25 * 6
+    # 7. addpoint in one branch of a ternary
+    obj, node, text, mesh = run("x = addpoint(0, @P + (0, 0, 1)) if @P.x > 0 else -1")
+    assert len(mesh.vertices) == 25 + sum(1 for p in orig if p[0] > 0)
+    # 8. chi() with float limits
+    obj, node, text, mesh = run('i@n = chi("n", 1, min=0.5, max=3.5)')
+    item = next(i for i in node.node_tree.interface.items_tree if getattr(i, "name", "") == "n")
+    assert (item.min_value, item.max_value) == (1, 3)
+    # 11. a per-element quaternion's components are normalized
+    obj, node, text, mesh = run("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
+    assert all(abs(w - 1) < 1e-5 for w in attr(mesh, "w"))
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

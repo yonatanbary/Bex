@@ -832,6 +832,14 @@ class Compiler:
 
     def select(self, cond, a, b):
         """cond ? a : b"""
+        if a.type != b.type and (a.type in OPAQUE or b.type in OPAQUE):
+            # a function's return value starts as a placeholder False: where it is
+            # still that, nothing was returned and the value is never used
+            for x, y in ((a, b), (b, a)):
+                if y.is_const and y.type == "bool" and y.const is False and x.type in OPAQUE:
+                    filler = Val(x.type, (0.0, 0.0, 0.0, 1.0) if x.type == "quaternion" else _IDENTITY)
+                    a, b = (x, filler) if x is a else (filler, x)
+                    break
         t = a.type if RANK[a.type] >= RANK[b.type] else b.type
         a, b = self.conv(a, t), self.conv(b, t)
         if cond.is_const:
@@ -867,9 +875,7 @@ class Compiler:
         i %= n
         if v.is_const:
             return Val("float", v.const[i])
-        if v.type == "quaternion":  # Blender's order is w, x, y, z
-            if v.node.kind == "node" and v.node.params["idname"] == "FunctionNodeQuaternionToRotation":
-                return v.node.inputs[(i + 1) % 4]
+        if v.type == "quaternion":  # Blender's order is w, x, y, z; read back, so normalized like a stored one
             return self.gnode("float", "FunctionNodeRotationToQuaternion", ("W", "X", "Y", "Z"), (i + 1) % 4,
                               (v,), ("Rotation",))
         if v.node.kind == "combine":
@@ -1317,8 +1323,7 @@ class Compiler:
         """The number the element's record gets: the next free number, plus how
         many elements before it made one at this call site."""
         if kind not in self.geo_counts:
-            domain = {"point": "POINT", "poly": "FACE", "polyline": "CURVE", "vertex": "CORNER"}[kind]
-            self.geo_counts[kind] = self.count(0, domain)
+            self.geo_counts[kind] = self.geo_start(kind)
         made = self.conv(mask, "int")
         outs = AGGREGATE_OUTS["GeometryNodeAccumulateField"]
         acc = lambda out: self.gnode("int", "GeometryNodeAccumulateField", outs, out,  # noqa: E731
@@ -1327,6 +1332,13 @@ class Compiler:
         base = self.geo_counts[kind]
         self.geo_counts[kind] = self.arith("+", base, acc(2))
         return self.arith("+", base, acc(1))
+
+    def geo_start(self, kind):
+        """The first new number: point numbers mean the mesh and point cloud points
+        (curve points only when there are none), like the builder's split_points."""
+        if kind == "point":
+            return self.node("count", "int", (), input=0, domain="POINT", primary=True)
+        return self.count(0, {"poly": "FACE", "polyline": "CURVE", "vertex": "CORNER"}[kind])
 
     def geo_call(self, fn, args):
         usage = {
@@ -1387,8 +1399,12 @@ class Compiler:
             prim, pt = self.conv(self.eval(args[1]), "int"), self.conv(self.eval(args[2]), "int")
             self.line = line
             ptype = self._prim_kind(prim)
+            made = set(self.prim_kinds.values())
+            if ptype is None and len(made) == 1:  # the number went through an if or a loop: the one kind made
+                ptype = next(iter(made))
             if ptype is None:
-                raise self.err("addvertex() adds to a primitive this script made: pass the number addprim() gave")
+                raise self.err("addvertex() adds to a primitive this script made with addprim(); when the "
+                               "script makes both polys and polylines, pass addprim()'s number directly")
             self.add_geo_op(GeoOp("vertex", mask, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
                                   {"ptype": ptype}, line))
             return self.geo_number("vertex", mask)
@@ -1428,6 +1444,8 @@ class Compiler:
         if mode != "set" and type in ("bool",) + OPAQUE:
             raise self.err(f'mode "{mode}" needs numbers or vectors, not a {type}')
         value = self.conv(value, type)
+        if name not in BUILTINS:
+            self.attr_types.setdefault(name, type)  # a later @name reads it with this type
         domain = "POINT" if fn.startswith("setpoint") else self._prim_domain(target)
         if name == "P":
             if domain != "POINT":
@@ -1447,7 +1465,10 @@ class Compiler:
 
     def _prim_domain(self, prim):
         """A primitive number means a curve when running over curves or when addprim() made a polyline."""
-        return "CURVE" if self.domain == "CURVE" or self._prim_kind(prim) == "polyline" else "FACE"
+        kind = self._prim_kind(prim)
+        if kind is None and set(self.prim_kinds.values()) == {"polyline"}:
+            kind = "polyline"
+        return "CURVE" if self.domain == "CURVE" or kind == "polyline" else "FACE"
 
     # -- statistics and other elements -------------------------------------
     def aggregate(self, name, v, group):
@@ -1507,7 +1528,12 @@ class Compiler:
         return [p], ["Vector"], "3D"
 
     def _amp(self, v, kw):
-        return self.arith("*", v, kw["amp"]) if "amp" in kw else v
+        if "amp" not in kw:
+            return v
+        amp = kw["amp"]
+        if isinstance(amp, str) or amp.type not in ("int", "float", "vector"):
+            raise self.err("amp= takes a number (or a vector)")
+        return self.arith("*", v, amp)
 
     def noise_call(self, name, a, kw):
         """noise() and its family: one Noise Texture. octaves=N is Blender's Detail N - 1."""
@@ -1637,6 +1663,9 @@ class Compiler:
         if kw and args and args[0].kind == "str":
             label = args[0].value.strip()
             lo, hi = (kw[k].const if k in kw else None for k in ("min", "max"))
+            if type == "int":  # an int slider takes whole-number limits
+                lo = math.ceil(lo) if lo is not None else None
+                hi = math.floor(hi) if hi is not None else None
             if lo is not None and hi is not None and lo > hi:
                 raise self.err(f"{name}(): min= is larger than max=")
             self.limits[label] = (lo, hi)
@@ -1652,6 +1681,12 @@ class Compiler:
             default = self.conv(self.eval(args[1]), type)
             if not default.is_const:
                 raise self.err(f"the default value of {name}() must be a constant")
+        lo, hi = self.limits.get(label, (None, None)) if kw else (None, None)
+        if type in ("int", "float") and (lo is not None or hi is not None):  # keep the default in the range
+            c = default.const
+            c = max(c, lo) if lo is not None else c
+            c = min(c, hi) if hi is not None else c
+            default = Val(type, int(c) if type == "int" else float(c))
         if args[0].line == self.pending_line and label not in self.known_params and label not in self.params:
             if label not in self.pending:
                 self.pending.append(label)
@@ -1726,11 +1761,17 @@ class Compiler:
                 raise self.err('promote() takes a value and a domain in quotes: "point", "edge", "face", '
                                '"corner", "curve" or "instance"')
             v = self.eval(arg_nodes[0])
+            if v.type == "row":
+                self.conv(v, "float")  # explains m[i][j]
             return self.gnode(v.type, "GeometryNodeFieldOnDomain", ("Value",), 0, (v,), ("Value",),
                               props=(("domain", DOMAIN_NAMES[arg_nodes[1].value.lower()]),
                                      ("data_type", DATA_TYPES[v.type])), field=True)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
+        if name != "getcomp":
+            for x in a:
+                if x.type == "row":
+                    self.conv(x, "float")  # explains m[i][j]
 
         def want(*counts):
             if len(a) not in counts:
@@ -1947,7 +1988,9 @@ class Compiler:
             return self.aggregate("sumof", Val("int", 1), a[0] if a else None)
         if name == "blur":
             want(1, 2, 3)
-            v = a[0] if a[0].type in ("float", "int", "vector", "quaternion", "matrix") else self.conv(a[0], "int")
+            if a[0].type in OPAQUE or a[0].type == "row":
+                raise BexError(f"blur() works on numbers and vectors, not a {a[0].type}", line)
+            v = a[0] if a[0].type in ("float", "int", "vector") else self.conv(a[0], "int")
             its = self.conv(a[1], "int") if len(a) > 1 else Val("int", 1)
             weight = self.conv(a[2], "float") if len(a) > 2 else Val("float", 1.0)
             return self.gnode(v.type, "GeometryNodeBlurAttribute", ("Value",), 0, (v, its, weight),
@@ -2056,6 +2099,7 @@ class Compiler:
             c = CONSTANTS[name]
             return Val("int" if isinstance(c, int) else "float", c)
         if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
+            name = ALIASES.get(name, name)
             return self.read_attr(name, self.attr_type(name, None))
         if name in self.loop_only:
             raise self.err(f"'{name}' is only set inside the loop on line {self.loop_only[name]}; "
@@ -2242,6 +2286,8 @@ class Compiler:
         when it has to be inlined (it writes attributes or runs a chunked loop,
         which need the geometry)."""
         name, types, fields = key
+        if self._makes_geometry(d.body):  # its records need the geometry: inline every call
+            return None, None
         line = self.line
         saved = self._snapshot()
         zone_in = IRNode("closure_in", {"items": types, "fields": fields}, (), d.line)
@@ -2294,6 +2340,8 @@ class Compiler:
             return self.member(v, e.comp)
         if k == "index":
             v = self.eval(e.obj)
+            if v.type in ("matrix", "row"):
+                raise self.err("a matrix's indexes have to be constant numbers: m[3][0]")
             n = self.size(v)
             i = self.component_index(e, n)
             if i.is_const:
@@ -2315,7 +2363,8 @@ class Compiler:
             return self.not_(a)
         if k == "ternary":
             cond = self.conv(self.eval(e.cond), "bool")
-            a, b = self.eval(e.a), self.eval(e.b)
+            a = self._eval_where(e.a, cond)  # addpoint() in a branch only runs where it is picked
+            b = self._eval_where(e.b, self.not_(cond))
             self.line = e.line
             return self.select(cond, a, b)
         if k == "binop" and e.op in ("in", "not in"):
@@ -2326,6 +2375,12 @@ class Compiler:
             for item in items:
                 found = self.logic("or", found, self.compare("==", a, item))
             return self.not_(found) if e.op == "not in" else found
+        if k == "binop" and e.op in ("and", "or"):  # b runs only where a doesn't decide
+            a = self.eval(e.a)
+            ca = self.conv(a, "bool")
+            b = self._eval_where(e.b, ca if e.op == "and" else self.not_(ca))
+            self.line = e.line
+            return self.logic(e.op, a, b)
         if k == "binop":
             a, b = self.eval(e.a), self.eval(e.b)
             self.line = e.line
@@ -2335,6 +2390,14 @@ class Compiler:
                 return self.compare(e.op, a, b)
             return self.logic(e.op, a, b)
         raise self.err(f"cannot evaluate {k}")
+
+    def _eval_where(self, e, cond):
+        """eval(e) as if inside `if cond:` (for the calls in it that make elements)."""
+        self.path.append(cond)
+        try:
+            return self.eval(e)
+        finally:
+            self.path.pop()
 
     def exec(self, s):
         self.line = s.line
@@ -2673,8 +2736,7 @@ class Compiler:
         if geo:  # the next point / primitive numbers change from pass to pass
             for kind in ("point", "poly", "polyline", "vertex"):
                 if kind not in self.geo_counts:
-                    self.geo_counts[kind] = self.count(0, {"point": "POINT", "poly": "FACE", "polyline": "CURVE",
-                                                           "vertex": "CORNER"}[kind])
+                    self.geo_counts[kind] = self.geo_start(kind)
                 items.append(("count", kind, self.geo_counts[kind]))
         types = [v.type for _, _, v in items]
         fields = [_is_field(v) and v.type != "geometry" for _, _, v in items]
@@ -2951,6 +3013,8 @@ def _assigned(body, brk=None, cont=None, outer=()):
     def walk(s, inner):
         if s is None:
             return
+        for t in _call_targets(s):  # translate(m, ...), setcomp(v, ...), out arguments
+            target(t)
         k = s.kind
         if k == "assign":
             target(s.target)
@@ -2979,6 +3043,36 @@ def _assigned(body, brk=None, cont=None, outer=()):
     walk(body, False)
     names.discard(None)
     return names, attrs
+
+
+# Built-ins that assign one of their arguments: name -> which (a slice of the arguments)
+_ARG_TARGETS = {"translate": slice(0, 1), "rotate": slice(0, 1), "scale": slice(0, 1), "setcomp": slice(0, 1),
+                "wnoise": slice(1, 4)}
+
+
+def _call_targets(s):
+    """Variables and attributes the calls in statement `s` assign through their
+    arguments (not inside nested statements, which `_assigned` walks itself)."""
+    found = []
+
+    def visit(x):
+        if isinstance(x, (list, tuple)):
+            for v in x:
+                visit(v)
+            return
+        if not isinstance(x, N):
+            return
+        if x.kind == "call":
+            args = [a for a in x.args if a.kind != "kwarg"]
+            if x.name in _ARG_TARGETS:
+                found.extend(args[_ARG_TARGETS[x.name]])
+            elif x.name == "xyzdist" and len(args) == 3 or x.name == "intersect" and len(args) == 4:
+                found.append(args[-1])
+        for key, v in x.__dict__.items():
+            if key not in ("body", "then", "orelse"):
+                visit(v)
+    visit(s)
+    return [t for t in found if t.kind in ("var", "attr", "member", "index")]
 
 
 def _tuple_arity(s):

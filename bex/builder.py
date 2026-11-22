@@ -179,6 +179,7 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         return group_input(INPUT_SOCKETS[n - 1])
 
     captured = {}  # (IRNode, out) -> Capture Attribute output, see the geometry chain
+    record_base = []  # the geometry after the Capture: GeoOp records read their values there
     closures = {}  # shared ramp name -> its Closure Output
     zones = {}  # repeat_in IRNode -> its Repeat Output node
 
@@ -347,6 +348,8 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             links.new(geometry(p["input"]), n.inputs["Geometry"])
             connect_field(ins[0], n.inputs["Sample Position"])
             return [n.outputs["Index"]]
+        if kind == "count" and p.get("primary"):  # the first new point number (see split_points)
+            return [primary_count(geometry(p["input"]))]
         if kind == "count":  # npoints(1): sums 1 over the domain, across mesh, points and curves
             n = new("GeometryNodeAttributeStatistic")
             n.data_type = "FLOAT"
@@ -636,12 +639,31 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         return n.outputs[0]
 
     def to_points(geo):
-        """Every point of `geo` as a point cloud (mesh vertices and point cloud points)."""
+        """Every point of `geo` as a point cloud (mesh vertices, point cloud points, curve points)."""
         sep = new("GeometryNodeSeparateComponents")
         links.new(geo, sep.inputs[0])
         m2p = new("GeometryNodeMeshToPoints")
         links.new(sep.outputs["Mesh"], m2p.inputs["Mesh"])
-        return join([m2p.outputs[0], sep.outputs["Point Cloud"]])
+        c2p = new("GeometryNodeCurveToPoints")  # copies of curve points are one-point curves
+        c2p.mode = "EVALUATED"
+        links.new(sep.outputs["Curve"], c2p.inputs["Curve"])
+        return join([m2p.outputs[0], sep.outputs["Point Cloud"], c2p.outputs["Points"]])
+
+    def component_points(geo, comp):
+        n = new("GeometryNodeAttributeDomainSize")
+        n.component = comp
+        links.new(geo, n.inputs[0])
+        return n.outputs["Point Count"]
+
+    def primary_count(geo):
+        """How many points Houdini's point numbers count: mesh and point cloud points, else curve points."""
+        main = int_math("ADD", component_points(geo, "MESH"), component_points(geo, "POINTCLOUD"))
+        sw = new("GeometryNodeSwitch")
+        sw.input_type = "INT"
+        links.new(int_compare(main, "GREATER_THAN", 0), _enabled(sw.inputs, "Switch")[0])
+        links.new(component_points(geo, "CURVE"), _enabled(sw.inputs, "False")[0])
+        links.new(main, _enabled(sw.inputs, "True")[0])
+        return _enabled(sw.outputs, "Output")[0]
 
     def split_points(geo):
         """(points, rest): Houdini's point numbers mean the mesh and point cloud
@@ -677,10 +699,14 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         return join([fn(main), rest])
 
     def make_records(mask, values, dom):
-        """One point per element of `dom` where `mask` is true, holding `values`."""
-        geo = points(size(geometry(0), dom))
+        """One point per element of `dom` where `mask` is true, holding `values`.
+        Read on the geometry after the Capture (if any), so captured values are right."""
+        source = record_base[-1] if record_base else geometry(0)
+        if dom == "POINT":  # the points Houdini's numbers mean, not the curve points beside a mesh
+            source = split_points(source)[0]
+        geo = points(size(source, dom))
         for key, val in list(values.items()) + ([("mask", mask)] if not mask.is_const else []):
-            v = val if val.is_const else sample(geometry(0), val.type, val, index(), dom)
+            v = val if val.is_const else sample(source, val.type, val, index(), dom)
             geo = g_store(geo, key, val.type, v)
         if not mask.is_const:
             no = new("FunctionNodeBooleanMath")
@@ -811,15 +837,24 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             copies = pick(split_points(geo)[0], delete(recs, "POINT", int_compare(g_read("src", "int"), "LESS_THAN", 0)),
                           "src", [("n", "int")])  # addpoint(0, ptnum): a copy of that point
             fresh = sort(join([at.outputs[0], to_points(copies)]), weight=g_read("n", "int"))
-            has_mesh = new("GeometryNodeAttributeDomainSize")
-            has_mesh.component = "MESH"
-            links.new(geo, has_mesh.inputs[0])
+            # They join the points the numbers count: mesh vertices when there is a mesh,
+            # else the point cloud, else (only curves) one-point curves.
             verts = new("GeometryNodePointsToVertices")
             links.new(fresh, verts.inputs["Points"])
+            singles = new("GeometryNodePointsToCurves")
+            links.new(fresh, singles.inputs["Points"])
+            links.new(index(), singles.inputs["Curve Group ID"])
+            only_curves = int_compare(int_math("ADD", component_points(geo, "POINTCLOUD"),
+                                               int_compare(component_points(geo, "CURVE"), "EQUAL", 0)), "EQUAL", 0)
+            loose = new("GeometryNodeSwitch")
+            loose.input_type = "GEOMETRY"
+            links.new(only_curves, _enabled(loose.inputs, "Switch")[0])
+            links.new(join([geo, fresh]), _enabled(loose.inputs, "False")[0])
+            links.new(join([geo, singles.outputs[0]]), _enabled(loose.inputs, "True")[0])
             sw = new("GeometryNodeSwitch")
             sw.input_type = "GEOMETRY"
-            links.new(int_compare(has_mesh.outputs["Point Count"], "GREATER_THAN", 0), _enabled(sw.inputs, "Switch")[0])
-            links.new(join([geo, fresh]), _enabled(sw.inputs, "False")[0])
+            links.new(int_compare(component_points(geo, "MESH"), "GREATER_THAN", 0), _enabled(sw.inputs, "Switch")[0])
+            links.new(_enabled(loose.outputs, "Output")[0], _enabled(sw.inputs, "False")[0])
             links.new(join([geo, verts.outputs[0]]), _enabled(sw.inputs, "True")[0])
             geo = _enabled(sw.outputs, "Output")[0]
         # New primitives from their corners: copies of the points they use.
@@ -906,6 +941,7 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         for i, (_, _, val) in enumerate(program.captures):
             captured[(val.node, val.out)] = cap.outputs[2 + i]
         geo = cap.outputs["Geometry"]
+        record_base.append(geo)
 
     for st in program.stores:
         if st.name == "N":  # custom normals

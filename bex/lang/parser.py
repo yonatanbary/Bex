@@ -406,13 +406,14 @@ class Parser:
         if t.kind == "op" and t.val in ("(", "["):
             close = ")" if t.val == "(" else "]"
             self.next()
-            items = [self.expr()]
+            items, comma = [self.expr()], False
             while self.accept(","):
+                comma = True
                 if self.at(close):
                     break
                 items.append(self.expr())
             self.expect(close)
-            if t.val == "(" and len(items) == 1:
+            if t.val == "(" and len(items) == 1 and not comma:  # (1,) is a tuple, as in Python
                 return items[0]
             if len(items) not in (3, 4):  # only usable in `x in (...)`, `for x in (...)`, `a, b = (...)`
                 return N("tuple", t.line, items=items)
