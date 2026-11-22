@@ -17,6 +17,7 @@ import bpy
 _TYPES = {
     "FLOAT": "float", "INT": "int", "INT8": "int", "BOOLEAN": "bool",
     "FLOAT_VECTOR": "vector", "FLOAT_COLOR": "vector", "BYTE_COLOR": "vector", "FLOAT2": "vector",
+    "QUATERNION": "quaternion", "FLOAT4X4": "matrix",
 }
 _HIDDEN = {"position"}       # shown as the built-in @P
 CACHE_SECONDS = 0.3          # drawing asks every frame; the walk reruns at most this often
@@ -24,16 +25,18 @@ _MAX_DEPTH = 64              # guards against cycles through nested groups
 _cache = {}                  # node pointer -> (time, result)
 
 
-def incoming_attributes(node):
+def incoming_attributes(node, input=0, fresh=False):
     """[(name, bex_type)] of named attributes probably on the geometry entering
-    `node` (a BEX Wrangle), sorted by name. Cached for `CACHE_SECONDS`."""
-    key = node.as_pointer()
+    `node` (a BEX Wrangle) at geometry input `input` (0: Geometry, 1-3: Input 2-4),
+    sorted by name. Cached for `CACHE_SECONDS` (drawing), unless `fresh` (compiling)."""
+    key = (node.as_pointer(), input)
     now = time.monotonic()
     hit = _cache.get(key)
-    if hit and now - hit[0] < CACHE_SECONDS:
+    if hit and now - hit[0] < CACHE_SECONDS and not fresh:
         return hit[1]
     found = {}
-    geo = next((s for s in node.inputs if s.type == "GEOMETRY"), None)
+    geos = [s for s in node.inputs if s.type == "GEOMETRY"]
+    geo = geos[input] if input < len(geos) else None
     if geo is not None:
         try:
             found = _from_input(geo, node.id_data, (), set(), 0)

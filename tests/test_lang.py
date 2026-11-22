@@ -91,18 +91,271 @@ def test_variables_like_python():
     assert w["a"].node.kind == "switch"
     fails("if @P.x > 0:\n    y = 2\n@a = y", "only set in one branch", 3)
     # the type follows the value; an annotation converts
-    w = writes("x = 1\nx = x / 2\n@a = x\nn: int = 2.7\ni@n = n\nv: vector = 1\nv@v = v")
-    assert w["a"].const == 0.5 and w["n"].const == 2 and w["v"].const == (1.0, 1.0, 1.0)
+    w = writes("x = 1\nx = x / 2\n@a = x\nn: int = 2.7\ni@n = n\nv: vector = 1\nv@w = v")
+    assert w["a"].const == 0.5 and w["n"].const == 2 and w["w"].const == (1.0, 1.0, 1.0)
     fails("x += 1", "unknown variable 'x'")
 
 
-def test_for_unrolls():
-    w = writes("s = 0\nfor i in range(4):\n    s += i\n@a = s")
+def zone_of(val):
+    """The repeat_out node behind a written value (looking through one conversion level)."""
+    n = val.node
+    assert n is not None and n.kind == "repeat_out", n
+    return n, n.params["zone"]
+
+
+def test_for_folds_constants():
+    w = writes("s = 0\nfor i in range(4):\n    s += i\n@a = s\n@b = i")
+    assert w["a"].const == 6.0 and w["b"].const == 3.0  # the loop variable keeps its last value
+    w = writes("for i in range(3):\n    @a = i * 2")
+    assert w["a"].const == 4.0
+    w = writes("s = 0\nfor i in range(100000):\n    pass\n@a = s")  # too long to fold, nothing changes
+    assert w["a"].const == 0.0
+
+
+def kinds(val):
+    """Every IR node kind `val` depends on (following zones), with counts."""
+    seen, stack, found = set(), [val.node], {}
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        found[n.kind] = found.get(n.kind, 0) + 1
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    return found
+
+
+def test_short_loops_unroll():
+    # Up to UNROLL_MAX iterations: no zone, so components and the Set Position Offset work.
+    c = compile_source("v = @N\nfor i in range(3):\n    v[i] = v[i] * 2\n@a = v.x\nfor i in range(8):\n    @P.z += @a")
+    assert all("repeat_out" not in kinds(v) for _, _, v in c.writes)
+    assert [st.offset for st in c.stores if st.name == "P"] == [True]
+    c = compile_source("x = @P.x\nfor i in range(9):\n    x += i\n@a = x")
+    assert "repeat_out" in kinds(c.writes[0][2])
+
+
+def test_nested_loop_counts():
+    # The inner count comes from the outer loop's Iteration: one value, so it's fine.
+    c = compile_source("for i in range(chi('n', 4)):\n    for j in range(i):\n        @a += @P.x")
+    assert kinds(c.writes[0][2])["repeat_in"] == 2
+    w = writes("s = 0\nfor i in range(4):\n    for j in range(i):\n        s += 1\n@a = s")
     assert w["a"].const == 6.0
-    fails("for i in range(@ptnum):\n    pass", "compile time")
-    fails("for i in range(100000):\n    pass", "more than")
+
+
+def test_per_element_count():
+    # range(@ptnum): the zone runs the longest count (an Attribute Statistic Max), each
+    # element stops changing at its own count.
+    c = compile_source("for i in range(@ptnum):\n    @P.z += 0.1", group="@P.x > 0")
+    found = kinds(c.stores[0].value)
+    assert found["stat"] == 1 and found["repeat_in"] == 1
+    stat = next(n for n in _nodes(c.stores[0].value) if n.kind == "stat")
+    assert stat.inputs[1] == c.group  # only elements in the Group count
+    assert not c.captures
+
+
+def _nodes(val):
+    seen, stack = {}, [val.node]
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen[id(n)] = n
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    return list(seen.values())
+
+
+def test_break_continue():
+    # Constant: worked out now, like Python.
+    w = writes("s = 0\nfor i in range(100):\n    if i == 5:\n        break\n    if i % 2:\n        continue\n    s += i\n"
+               "@a = s\n@b = i")
+    assert w["a"].const == 0 + 2 + 4 and w["b"].const == 5
+    w = writes("i = 0\nwhile True:\n    i += 1\n    if i >= 7:\n        break\n@a = i")
+    assert w["a"].const == 7
+    # Per element: the flags become zone items, values freeze once broken.
+    # A loop that can end early runs in growing chunks, skipped once every element is done.
+    c = compile_source("x = 0.0\nfor i in range(chi('n', 50)):\n    if @P.x * i > 1:\n        break\n    x += 1\n@a = x")
+    (end,) = c.preludes
+    chunk = end.params["chunk"]
+    assert end.kind == "chunk_end" and chunk.params["items"][end.params["flag"]] == "bool"
+    assert chunk.params["count"] == 19  # 32 * (1.5^19 - 1) / 0.5 >= MAX_ZONE_ITERATIONS
+    assert c.writes[0][2].node.kind == "attr" and c.writes[0][2].node.params["name"].startswith(".bex")
+    # Inside another zone: a plain masked zone.
+    c = compile_source("for j in range(chi('m', 3)):\n    for i in range(chi('n', 50)):\n        if @P.x * i > 1:\n"
+                       "            break\n        @a += 1")
+    assert not c.preludes  # the break is the inner loop's, and that one sits in a zone
+    # Values that depend on each other survive the chunk stores (swap through shadows).
+    c = compile_source("a = 0.0\nb = 1.0\nwhile b < @P.x * 1000 + 2:\n    t = a + b\n    a = b\n    b = t\n@f = a")
+    assert len(c.preludes) == 1
+    c = compile_source("x = 0.0\nfor i in range(20):\n    if @P.x > i:\n        continue\n    x += i\n@a = x")
+    assert "repeat_in" in kinds(c.writes[0][2])
+
+
+def test_while_loops():
+    # A constant condition with a non-constant body: a zone with the exact count.
+    c = compile_source("i = 0\nx = @P.x\nwhile i < 20:\n    x = x * 0.5 + 1\n    i += 1\n@a = x")
+    zone = c.writes[0][2].node.params["zone"]
+    assert zone.inputs[0].const == 20
+    # A per-element condition: a zone with the safety cap, stopping each element.
+    c = compile_source("x = @P.x\nn = 0\nwhile x > 1:\n    x *= 0.5\n    n += 1\ni@n = n")
+    assert len(c.preludes) == 1  # chunked
+    c = compile_source("for j in range(chi('m', 2)):\n    x = @P.x\n    while x > 1:\n        x *= 0.5\n    @a += x")
+    zones = [n for n in _nodes(c.writes[0][2]) if n.kind == "repeat_in"]
+    assert sorted(z.inputs[0].const or 0 for z in zones) == [0, 1000]  # inside another loop: the cap
+    # Short ones unroll.
+    w = writes("i = 0\nx = @P.x\nwhile i < 3:\n    x += 1\n    i += 1\n@a = x")
+    assert "repeat_in" not in kinds(w["a"])
+
+
+def test_own_functions():
+    # Inlined: constants fold through, defaults and keywords bind, globals are read.
+    w = writes("""
+scale = 2
+def f(x, k=3):
+    y = x * k
+    return y + scale
+@a = f(1)
+@b = f(1, k=10)
+@c = f(k=1, x=5)
+""")
+    assert (w["a"].const, w["b"].const, w["c"].const) == (5.0, 12.0, 7.0)
+    # Locals stay local; attributes can be written; a value-less call is a statement.
+    w = writes("""
+def lift(h):
+    @P.z += h
+    t = 5
+t = 1
+lift(0.5)
+@a = t
+""")
+    assert w["a"].const == 1.0 and "P" in w
+    # Early return under a per-element condition.
+    c = compile_source("def sgn(x):\n    if x < 0:\n        return -1.0\n    return 1.0\n@a = sgn(@P.x)")
+    assert c.writes[0][2].node.kind == "switch"
+    # return inside a loop leaves it.
+    w = writes("def first_over(limit):\n    for i in range(100):\n        if i * i > limit:\n            return i\n"
+               "    return -1\n@a = first_over(50)")
+    assert w["a"].const == 8.0
+    c = compile_source("def steps(x):\n    n = 0\n    for i in range(chi('cap', 99)):\n        if x < 1:\n"
+                       "            return n\n        x *= 0.5\n        n += 1\n    return n\n@a = steps(@P.x * 100)")
+    assert c.preludes  # can end early: chunked
+    # Recursion that ends while compiling.
+    w = writes("def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n@a = fib(10)")
+    assert w["a"].const == 55.0
+    # A function writing an attribute inside a loop: the attribute is a zone item.
+    c = compile_source("def bump():\n    @w += @P.x\nfor i in range(chi('n', 20)):\n    bump()")
+    assert c.writes[0][0] == "w" and c.writes[0][2].node.kind == "repeat_out"
+
+
+def test_shared_functions_are_closures():
+    src = "def wave(x, f):\n    y = sin(x * f) * 0.5\n    return y * y + x\n@a = wave(@P.x, 3)\n@b = wave(@P.y, 5)\n"
+    c = compile_source(src)
+    calls = [v.node for _, _, v in c.writes]
+    assert [n.kind for n in calls] == ["closure_call", "closure_call"]
+    assert calls[0].params["closure"] is calls[1].params["closure"]  # one body
+    assert sum(1 for n in _nodes(c.writes[0][2]) if n.kind == "math" and n.params["op"] == "SINE") == 1
+    # Called once, all-constant arguments, or writing attributes: inlined.
+    assert writes("def wave(x, f):\n    return sin(x * f)\n@a = wave(@P.x, 3)")["a"].node.kind == "math"
+    w = writes("def sq(x):\n    return x * x\n@a = sq(3) + sq(4)")
+    assert w["a"].const == 25.0
+    c = compile_source("def lift(x):\n    @w += x\n    return x\n@a = lift(@P.x) + lift(@P.y)")
+    assert all("closure_call" not in kinds(v) for _, _, v in c.writes)
+    # Different argument types: one closure each.
+    c = compile_source("def dbl(x):\n    return x * 2\nv@a = dbl(@P) + dbl(@N)\n@b = dbl(@P.x) + dbl(@P.y)")
+    closures = {id(n.params["closure"]) for _, _, v in c.writes for n in _nodes(v) if n.kind == "closure_call"}
+    assert len(closures) == 2
+
+
+def test_review_regressions():
+    # A shared function reads the script's variables / attributes as they are at each call.
+    c = compile_source("k = @P.x\ndef f(a):\n    return a * k\nf@x = f(@P.y)\nk = 5.0\nf@y = f(@P.y + 1)")
+    x, y = (v.node for _, _, v in c.writes)
+    assert x.params["closure"] is not y.params["closure"] if y.kind == "closure_call" else True
+    # A per-element argument used as a loop count inside a shared function: its own closure, a real count.
+    c = compile_source("def f(n, x):\n    for i in range(n):\n        x += 0.5\n    return x\n"
+                       "f@x = f(@ptnum + 9, 1.0)\nf@y = f(@ptnum % 3 + 10, @P.x)")
+    assert any(n.kind == "stat" for _, _, v in c.writes for n in _nodes(v))
+    # return inside two nested zone loops: the outer break flag is an item of the inner zone.
+    c = compile_source("def f(lim):\n    x = 0.0\n    for i in range(12):\n        for j in range(12):\n"
+                       "            x += 1\n            if x > lim:\n                return x\n    return -x\nf@x = f(@ptnum * 3.0)")
+    zones = [n for n in _nodes(c.writes[0][2]) if n.kind == "repeat_in"]
+    assert len(zones) == 2 and all(z.params["items"].count("bool") >= 2 for z in zones)
+    # Rollback keeps channels of a shared function first called inside a long loop.
+    c = compile_source("def f(a):\n    return a * chf('amp', 2.0)\ns = 0.0\nfor i in range(20):\n    s += f(@P.x * i)\n"
+                       "@a = s\n@b = f(@P.y)")
+    assert [p[0] for p in c.params] == ["amp"]
+    # Called once inside a zone loop: inlined (reruns don't count as calls).
+    c = compile_source("def f(a):\n    return a * 2\ns = 0.0\nfor i in range(20):\n    s += f(@P.x * i)\n@a = s")
+    assert "closure_call" not in kinds(c.writes[0][2])
+    # A while inside another loop warns about its cap.
+    assert "stops after 1000" in compile_source("for j in range(chi('m', 3)):\n    y = @P.x\n    while y < 100:\n"
+                                                "        y += 1\n    @a += y").warnings[0]
+    # After no iterations the loop variable keeps its value; defaults see the script's variables.
+    c = compile_source("i = 7\nfor i in range(chi('n', 0)):\n    @a += @P.x\n@b = i")
+    assert c.writes[1][2].node.kind == "switch"
+    w = writes("k = 1\ndef g(x, d=k):\n    return x + d\ndef f(k):\n    return g(k)\n@a = f(10)")
+    assert w["a"].const == 11.0
+
+
+def test_function_errors():
+    fails("def f(x):\n    if x > 0:\n        return 1\n@a = f(@P.x)", "every path")
+    fails("def f(x):\n    y = x\n@a = f(1)", "doesn't return a value")
+    fails("def f(n):\n    return f(n - 1)\n@a = f(@ptnum)", "too deeply")
+    fails("def f(x):\n    return x\n@a = f(1, 2)", "takes 1 argument")
+    fails("def f(x):\n    return x\n@a = f(y=2)", "no parameter 'y'")
+    fails("def f(x):\n    return x\n@a = f()", "missing the argument 'x'")
+    fails("@a = sin(x=1)", "no keyword arguments")
+    fails("def sin(x):\n    return x", "built-in")
+    fails("return 1", "inside a function")
+    fails("def f(a=1, b):\n    return a", "needs a default")
+    fails("@a = g(1)\ndef g(x):\n    return x", "unknown function")
+
+
+def test_for_repeat_zone():
+    # A loop whose values depend on the geometry is one Repeat Zone, not unrolled copies.
+    c = compile_source("x = @P.x\nfor i in range(64):\n    x = x + sin(x * 3 + i * 0.1) * 0.01\n@a = x")
+    out, zone = zone_of(c.writes[0][2])
+    assert zone.inputs[0].const == 64 and zone.params["items"] == ("float",)
+    assert zone.inputs[1].node.kind == "separate"  # starts at @P.x
+    # The body is built once: one sine in the whole program.
+    seen, stack, sines = set(), [out], 0
+    while stack:
+        n = stack.pop()
+        if n is None or id(n) in seen:
+            continue
+        seen.add(id(n))
+        sines += n.kind == "math" and n.params.get("op") == "SINE"
+        stack += [v.node for v in n.inputs] + ([n.params["zone"]] if n.kind == "repeat_out" else []) + ([n.params["closure"]] if n.kind == "closure_call" else [])
+    assert sines == 1
+    # A count from a channel: ceil((stop - start) / step) iterations, never negative.
+    c = compile_source("n = chi('n', 5)\ns = 0.0\nfor i in range(2, n, 2):\n    s += @P.x * i\n@a = s")
+    out, zone = zone_of(c.writes[0][2])
+    clamp = zone.inputs[0].node  # min(max(count, 0), MAX_ZONE_ITERATIONS)
+    assert clamp.params["op"] == "MINIMUM" and clamp.inputs[0].node.params["op"] == "MAXIMUM"
+    # Attributes written in the loop are items too, and the write happens once, after it.
+    c = compile_source("for i in range(chi('n', 3)):\n    @P.y += 0.1\n    @w = @w + @P.y")
+    assert {name for name, _, _ in c.writes} == {"P", "w"}
+    assert len(c.stores) == 2 and all(st.value.node.kind == "repeat_out" for st in c.stores)
+    assert len({id(st.value.node) for st in c.stores}) == 1
+
+
+def test_for_item_types_widen():
+    c = compile_source("x = 0\nfor i in range(chi('n', 3)):\n    x += 0.5\n@a = x")
+    out, zone = zone_of(c.writes[0][2])
+    assert zone.params["items"] == ("float",)
+    c = compile_source("v = 0\nfor i in range(chi('n', 3)):\n    v = v + @N\n@a = v.x")
+    assert c.writes[0][2].node.inputs[0].node.params["zone"].params["items"] == ("vector",)
+
+
+def test_for_errors():
+    fails("n = @ptnum\nfor i in range(chi('m', 4)):\n    n += 1\n    for j in range(n):\n        @a += 1",
+          "can't depend on values an outer loop changes")
+    fails("break", "only be used inside a loop")
+    fails("for i in range(0, 9, chi('s', 1)):\n    pass", "step must be a fixed number")
+    fails("for i in range(1.5):\n    pass", "whole numbers")
+    fails("for i in range(chi('n', 3)):\n    y = @P.x\n@a = y", "only set inside the loop on line 1")
+    w = writes("for i in range(chi('n', 3)):\n    y = @P.x\n    @a = y")  # fine inside the loop
+    assert w["a"].node.kind == "repeat_out"
     fails("while True:\n    pass", "more than")
-    fails("while @P.x > 0:\n    pass", "compile time")
 
 
 def test_channels():
@@ -170,8 +423,8 @@ def test_bbox_and_mapping():
 def test_errors():
     fails("@a = 1 2", "end of the line", 1)
     fails("@a = 1\n@b = foo(2)", "unknown function", 2)
-    fails("@a = @P", "vector as float")
-    fails("@N = (0, 0, 1)", "read-only")
+    fails("@a = @P", "write v@a to store a vector")
+    fails("@ptnum = 1", "read-only")
     fails("@P = (0, 0, 1)", "Points", domain="FACE")
     fails("v@a = 1; f@a = 2", "cannot be used as float")
     fails("@a = 1 $ 2", "unexpected character")
@@ -188,8 +441,8 @@ def test_errors():
     fails("@a = true", "True")
     fails("v@a = (1, 2)", "three components")
     fails("@a = range(3)", "for-loop")
-    fails("for i in (1, 2, 3):\n    pass", "range(")
-    fails("def f():\n    pass", "not supported")
+    fails("for i in 5:\n    pass", "a for loop goes over range()")
+    fails("import math", "not supported")
     fails("@a = (1 +\n2", "never closed", 1)
 
 
@@ -404,6 +657,352 @@ def test_domain_indices():
     fails("i@a = @ptnum", "@elemnum", domain="FACE")
     fails("i@a = @vtxnum", "Corners", domain="POINT")
     fails("@curvenum = 1", "read-only")
+
+
+def test_data_functions():
+    import colorsys
+    # Constants fold.
+    w = writes("v@a = hsvtorgb((0.25, 0.5, 1))\nv@b = rgbtohsl(hsltorgb((0.75, 0.5, 0.25)))\n"
+               "f@c = luminance((1, 1, 1))\nf@d = length2((1, 2, 2)) + distance2((1, 0, 0), (0, 0, 0))\n"
+               "f@e = avg(1, 2, 6)\nf@f = avg((3, 6, 9))\nf@g = invlerp(5, 0, 4)\nf@h = rint(2.5)\n"
+               "v@i = hsvtorgb((1.25, 0.5, 1))")
+    assert w["a"].const == colorsys.hsv_to_rgb(0.25, 0.5, 1)
+    assert all(abs(x - y) < 1e-9 for x, y in zip(w["b"].const, (0.75, 0.5, 0.25)))
+    assert abs(w["c"].const - 1) < 1e-9 and w["d"].const == 10
+    assert w["e"].const == 3 and w["f"].const == 6 and w["g"].const == 1.25 and w["h"].const == 3
+    assert w["i"].const == w["a"].const  # the hue wraps
+    # Out arguments set a variable or attribute, like VEX.
+    w = writes("d = xyzdist(1, @P, prim)\ni@p = prim\ni@h = intersect(2, @P, (0, 0, -5), v@hit)\nf@d = d")
+    assert w["p"].node.params["idname"] == "GeometryNodeSampleNearestSurface" and w["p"].type == "int"
+    assert w["hit"].node.params["idname"] == "GeometryNodeRaycast" and w["hit"].out == 1
+    assert w["h"].node.kind == "switch" and w["d"].node.params["idname"] == "GeometryNodeProximity"
+    assert compile_source("f@d = xyzdist(1, @P, prim)\nf@m = minpos(3, @P).x").inputs == [1, 3]
+    # Topology: a field on this geometry, a sample on another input.
+    w = writes("i@a = primpoint(0, @primnum, 1)\ni@b = primpoint(1, @primnum, 1)\ni@c = neighbour(0, @elemnum, 0)",
+               "FACE")
+    assert w["a"].node.kind == "node" and w["a"].node.params["field"]
+    assert w["b"].node.kind == "sample" and w["b"].node.inputs[1].node.kind == "sample"
+    # A per-element count: the loop runs the largest one.
+    p = compile_source("n = 0\nfor i in range(neighbourcount(0, @ptnum)):\n    n += 1\ni@n = n")
+    assert any(n.kind == "stat" for n in _ir_nodes(p))
+    w = writes("v@t = @tangent\nf@a = @area\ni@i = @island\nf@e = @edgeangle\ni@n = nedges(0) + ncurves(1)")
+    assert w["t"].node.params["name"] == "tangent" and w["e"].node.params["name"] == "edge_angle"
+    fails("i@a = primpoint(1, 0, @ptnum)", "has to be a constant")
+    fails("f@d = xyzdist(1, @P, 3)", "variable name")
+    fails("f@d = intersect(1, @P)", "3 or 4 arguments")
+    fails("@area = 1", "read-only")
+    fails("f@a = avg()", "at least one")
+
+
+def _ir_nodes(p):
+    """Every IR node the program's writes reach."""
+    seen, stack = {}, [v.node for _, _, v in p.writes if v.node is not None]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen[id(n)] = n
+        stack.extend(v.node for v in n.inputs if v.node is not None)
+        stack.extend(x for x in n.params.values() if hasattr(x, "kind"))
+    return list(seen.values())
+
+
+def test_rotations_and_matrices():
+    from lang.compiler import _mat_point, _mat_trs, _qaxis, _qmul, _qrotate
+    # quaternions are (x, y, z, w) like Houdini's orient; constants fold and are unit length
+    w = writes("q = (0, 0, 0, 2)\np@a = q\nf@w = q.w\nf@x = q[0]\nf@last = q[-1]\nq.x = 1\np@b = q")
+    assert w["a"].const == (0.0, 0.0, 0.0, 1.0) and w["w"].const == 1.0 and w["x"].const == 0.0
+    assert w["last"].const == 1.0
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["b"].const, (math.sqrt(0.5), 0, 0, math.sqrt(0.5))))
+    # v * q turns v; q1 * q2 turns by q2 first (Hamilton product, as qmultiply)
+    quarter = _qaxis((0, 0, 1), math.pi / 2)
+    w = writes("q = quaternion(PI / 2, (0, 0, 1))\nv@a = (1, 0, 0) * q\nv@b = q * (1, 0, 0)\n"
+               "v@c = qrotate(q, (1, 0, 0))\np@d = q * quaternion(PI / 2, (1, 0, 0))\np@e = qinvert(q)")
+    for name in "abc":
+        assert all(abs(c - e) < 1e-9 for c, e in zip(w[name].const, (0, 1, 0))), (name, w[name].const)
+    assert w["d"].const == _qmul(quarter, _qaxis((1, 0, 0), math.pi / 2))
+    assert all(abs(c) < 1e-9 for c in _qrotate(_qmul(w["e"].const, quarter), (1, 0, 0))[1:])
+    # Euler orders: the first axis turns first
+    w = writes("p@a = eulertoquaternion((0.1, 0.2, 0.3))\np@b = eulertoquaternion((0.1, 0.2, 0.3), XFORM_ZYX)")
+    qx, qy, qz = (_qaxis(tuple(float(i == k) for i in range(3)), a) for k, a in enumerate((0.1, 0.2, 0.3)))
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["a"].const, _qmul(qz, _qmul(qy, qx))))
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["b"].const, _qmul(qx, _qmul(qy, qz))))
+    # per element: Blender's rotation nodes, Houdini's component order mapped onto W, X, Y, Z
+    w = writes("p@orient = quaternion(@P.x, (0, 0, 1))\nf@w = @orient.w\nf@x = @orient.x\n"
+               "p@s = slerp(@orient, (0, 0, 0, 1), 0.5)\np@l = lerp(@orient, (0, 0, 0, 1), 0.5)\nv@P = @P * @orient")
+    assert w["orient"].node.params["idname"] == "FunctionNodeAxisAngleToRotation"
+    assert w["w"].node.params["idname"] == "FunctionNodeRotationToQuaternion" and w["w"].out == 0
+    assert w["x"].out == 1
+    assert w["s"].node.kind == "mix" and w["s"].node.params["dtype"] == "quaternion" and w["l"] == w["s"]
+    assert w["P"].node.params["idname"] == "FunctionNodeRotateVector"
+    w = writes("q = (@P.x, 0, 0, 1)\nf@y = q.y\nf@x = q.x")  # read back normalized, like a stored rotation
+    assert all(w[k].node.params["idname"] == "FunctionNodeRotationToQuaternion" for k in "xy")
+    # matrices: v * m transforms, m1 * m2 applies m1 first
+    w = writes("m = maketransform((1, 2, 3), quaternion(PI / 2, (0, 0, 1)), (2, 2, 2))\nv@a = (1, 0, 0) * m\n"
+               "n = ident()\ntranslate(n, (0, 0, 5))\nscale(n, (2, 2, 2))\nv@b = (1, 1, 1) * n\n"
+               "v@c = (1, 0, 0) * (m * n)")
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["a"].const, (1, 4, 3))), w["a"].const
+    assert w["b"].const == (2.0, 2.0, 12.0)  # translated, then scaled
+    trs = _mat_trs((1, 2, 3), quarter, (2, 2, 2))
+    assert w["c"].const == _mat_point(_mat_trs((0, 0, 0), (0, 0, 0, 1), (2, 2, 2)),
+                                      tuple(x + d for x, d in zip(_mat_point(trs, (1, 0, 0)), (0, 0, 5))))
+    w = writes("4@m = maketransform(@N, (0, 0, 1), @P)\np@orient = quaternion(@m)\nv@P = @P * @m\n"
+               "f@d = determinant(invert(transpose(@m)))\nm = @m\nrotate(m, 1, (0, 0, 1))\n4@m = m * @m")
+    assert w["m"].node.params["idname"] == "FunctionNodeMatrixMultiply"
+    assert w["orient"].node.params["idname"] == "FunctionNodeSeparateTransform" and w["orient"].out == 1
+    assert w["P"].node.params["idname"] == "FunctionNodeTransformPoint"
+    # types never convert by themselves
+    fails("p@q = (0, 0, 0, 1)\nf@a = @q", "cannot use a quaternion as float")
+    fails("p@q = (0, 0, 0, 1)\nx = @q + 1", "'+' doesn't work on a quaternion")
+    fails("m = ident()\nv@P = m * @P", "write the vector first")
+    fails("v@P.w = 1", "components 0 to 2")
+    fails("@q = (0, 0, 0, 1)", "write p@q to store a quaternion")
+    fails("@m = ident()", "write 4@m to store a matrix")
+    fails("translate(ident(), (1, 0, 0))", "give it a variable name")
+    fails("p@q = quaternion(1, (0, 0, 1)) == (0, 0, 0, 1)", "cannot compare quaternions")
+    fails("p@q = quaterniontoeuler((0, 0, 0, 1), XFORM_ZYX)", "only gives the XYZ order")
+
+
+def test_houdini_names_and_storage():
+    prog = compile_source("@v = (1, 2, 3)\n@pscale = 0.5\n@uv = @P\n@Cd = (1, 0, 0)\nu@st = @P\n"
+                          "f@a = point(1, \"v@v\", 0).x + @opinput1_pscale")
+    assert [n for n, _t, _v in prog.writes] == ["velocity", "radius", "UVMap", "Cd", "st", "a"]
+    assert {st.name: st.storage for st in prog.stores} == {"velocity": None, "radius": None, "UVMap": "FLOAT2",
+                                                           "Cd": "FLOAT_COLOR", "st": "FLOAT2", "a": None}
+    assert {n.params["name"] for n in _ir_nodes(prog) if n.kind == "attr"} == {"velocity", "radius"}
+    assert [t for n, t, _v in prog.writes] == ["vector", "float", "vector", "vector", "vector", "float"]
+    w = writes("p@orient = @orient * quaternion(0.1, (0, 0, 1))\n4@transform = ident()")  # known types
+    assert set(w) == {"orient", "transform"}
+
+
+def test_noise_family():
+    prog = compile_source('f@a = noise(@P, @Time, freq=4, octaves=3, amp=2)\nf@b = snoise(@P)\n'
+                          'f@c = ridgednoise(@P, gain=2, ridge=0.5)\nv@d = curlnoise(@P, freq=2)\n'
+                          'f@e = voronoi(@P, metric="manhattan", jitter=0.5)\nv@f = voronoicell(@P)\n'
+                          'f@g = wnoise(@P, s, f1, f2)\ni@h = s\nf@k = f2 - f1\nf@m = gabor(@P, stripes=4)\n'
+                          'f@n = nrandom(@ptnum)\nf@o = rand(@ptnum, 7)\nv@q = sample_direction_uniform(vrand(@ptnum))\n'
+                          'v@r = sample_direction_cone((0, 0, 1), 0.3, vrand(@ptnum))')
+    w = {n: v for n, _t, v in prog.writes}
+    noise = w["a"].node.inputs[0].node  # amp multiplies the texture
+    assert noise.params["idname"] == "ShaderNodeTexNoise" and ("noise_dimensions", "4D") in noise.params["props"]
+    ins = dict(zip(noise.params["ins"], noise.inputs))
+    assert ins["Scale"].const == 4.0 and ins["Detail"].const == 2.0  # octaves 3 = Detail 2
+    assert ("noise_type", "RIDGED_MULTIFRACTAL") in w["c"].node.params["props"]
+    assert dict(zip(w["c"].node.params["ins"], w["c"].node.inputs))["Gain"].const == 2.0
+    assert w["d"].node.kind == "group" and w["d"].node.params["name"] == "curl"
+    assert ("distance", "MANHATTAN") in w["e"].node.params["props"]
+    assert w["f"].node.params["outs"][w["f"].out] == "Color"
+    assert w["h"].type == "int" and w["k"].node.kind == "math"
+    assert w["m"].node.params["idname"] == "ShaderNodeTexGabor"
+    assert w["o"].node.params["idname"] == "ShaderNodeTexWhiteNoise"
+    c = writes("v@a = sample_sphere_uniform((1, 0.25, 1))\nv@b = sample_circle_edge_uniform(0.25)")
+    assert all(abs(x - y) < 1e-6 for x, y in zip(c["a"].const, (0.0, 0.0, -1.0)))
+    assert all(abs(x - y) < 1e-6 for x, y in zip(c["b"].const, (0.0, 1.0, 0.0)))
+    fails("f@a = noise(@P, frq=2)", "no option 'frq'")
+    fails("f@a = sin(@P.x, freq=2)", "takes no keyword arguments")
+    fails('f@a = voronoi(@P, metric="taxi")', "metric= is one of")
+    fails("f@a = noise(@P, freq=1, freq=2)", "twice")
+    fails("f@a = noise(@P, ridge=1)", "no option 'ridge'")
+
+
+def test_statistics_and_lookups():
+    w = writes('f@m = mean(@P.x, @island)\ni@c = countof()\nv@a = at(@P, 0)\nf@p = promote(@P.x, "prim")\n'
+               'f@b = blur(@P.x)\nv@u = primuv(1, "P", 0, 0.5)', domain="POINT")
+    m = w["m"].node
+    assert m.params["idname"] == "GeometryNodeFieldAverage" and ("domain", "POINT") in m.params["props"]
+    assert m.inputs[1].node.kind == "input"  # the group: @island
+    assert w["c"].type == "int" and w["c"].node.params["outs"][w["c"].out] == "Total"
+    assert ("domain", "FACE") in w["p"].node.params["props"]
+    assert w["u"].node.params["geo"] == ("Curves", 1)
+    w = writes("f@m = mean(@P.x)", domain="FACE")
+    assert ("domain", "FACE") in w["m"].node.params["props"]
+    fails('f@p = promote(@P.x, "volume")', "promote() takes a value and a domain")
+    fails("f@m = mean(quaternion(0.1, (0, 0, 1)))", "works on numbers and vectors")
+    fails('v@u = primuv(1, P, 0, 0.5)', "attribute name in quotes")
+
+
+def test_language_extras():
+    w = writes("v@a = (1, 2, 3).zyx\nv@b = (1, 2, 3).xy\nf@c = min(4, 2, 8)\nf@d = max((1, 5, 2))\n"
+               "x, y = 1, 2\nx, y = y, x\nf@e = x * 10 + y\n"
+               "def split(v):\n    return v.x, v.y + 1\np, q = split((3, 4, 5))\nf@f = p * 10 + q\n"
+               "t = 0\nfor k in (1, 2, 5):\n    t += k\nf@g = t\n"
+               "u = 0\nfor c in (1, 2, 3) * 2:\n    u += c\nf@h = u\n"
+               "b@i = 3 in (1, 2, 3)\nb@j = 4 not in (1, 2, 3)\ni@k = (6 & 3) | (1 << 4) ^ 1\ni@l = ~5 >> 1\n"
+               "f@m = E\nb@n = isnan(1.0)\ni@o = len(@P)\nx2, y2, z2 = (7, 8, 9)\nf@p = z2")
+    assert w["a"].const == (3.0, 2.0, 1.0) and w["b"].const == (1.0, 2.0, 0.0)
+    assert w["c"].const == 2 and w["d"].const == 5
+    assert w["e"].const == 21 and w["f"].const == 35 and w["g"].const == 8 and w["h"].const == 12
+    assert w["i"].const is True and w["j"].const is True
+    assert w["k"].const == ((6 & 3) | (1 << 4) ^ 1) and w["l"].const == (~5 >> 1)
+    assert abs(w["m"].const - math.e) < 1e-9 and w["n"].const is False and w["o"].const == 3 and w["p"].const == 9
+    # per element
+    w = writes("i@a = @ptnum & 3\ni@b = @ptnum << 2\nb@c = @ptnum in (2, 5)\n"
+               "def mm(v):\n    if v.x > 0:\n        return v.x, v.y\n    return v.y, v.x\nlo, hi = mm(@P)\nf@d = hi\n"
+               "s = 0\nfor c in @P:\n    s += c\nf@e = s\nv@f = @P.zxy\nb@g = isfinite(@P.x)")
+    assert w["a"].node.params["idname"] == "FunctionNodeBitMath" and w["b"].node.params["props"] == (("operation", "SHIFT"),)
+    assert w["c"].node.kind == "bmath" and w["d"].node.kind == "switch" and w["e"].node.kind == "math"
+    assert w["f"].node.kind == "combine"
+    fails("a, b = 1, 2, 3", "2 names but 3 values")
+    fails("def f():\n    return 1, 2\n@a = f()", "returns 2 values")
+    fails("def f():\n    return 1\na, b = f()", "returns one value")
+    fails("x = 1, 2", "only for")
+    fails("f@a = 1.5 & 2", "works on whole numbers")
+    fails("a, b += 1", "needs a single target")
+    fails("1, 2", "do nothing")
+
+
+def test_matrix_elements_and_instances():
+    w = writes("m = maketransform((1, 2, 3), quaternion(0, (0, 0, 1)))\nf@tx = m[3][0]\nm[3][1] = 5\n"
+               "v@p = (0, 0, 0) * m\nf@g = getcomp(m, 3, 2)\nv = (1, 2, 3)\nsetcomp(v, 9, 1)\nv@v2 = v")
+    assert w["tx"].const == 1.0 and w["p"].const == (1, 5, 3) and w["g"].const == 3.0 and w["v2"].const == (1, 9, 3)
+    w = writes("f@a = 4@m[3][0]\n@m[0][0] = 2")
+    assert w["a"].node.params["idname"] == "FunctionNodeSeparateMatrix" and w["a"].out == 12
+    assert w["m"].node.params["idname"] == "FunctionNodeCombineMatrix"
+    fails("m = ident()\nf@a = m[1]", "row of a matrix")
+    fails("m = ident()\nf@a = m[-5][0]", "rows 0 to 3")
+    fails("v@a = cracktransform(1, 0, 0, (0, 0, 0), ident())", "trs = 0")
+    # instances: orient / scale / P are one instance_transform
+    prog = compile_source("p@orient = quaternion(@elemnum, (0, 0, 1))\n@scale = (2, 2, 2)\nf@w = 1", "INSTANCE")
+    assert [n for n, _t, _v in prog.writes] == ["instance_transform", "w"]
+    w = writes("f@a = @orient.w", domain="INSTANCE")
+    assert w["a"].node.inputs[0].node.params["name"] == "instance_rotation"
+    w = writes("@N = (0, 0, 1)", domain="FACE")
+    assert set(w) == {"N"}
+    fails("@N = (0, 0, 1)", "custom normals", domain="EDGE")
+
+
+def test_geometry_functions():
+    prog = compile_source('pt = addpoint(0, @P + @N)\nprim = addprim(0, "polyline")\naddvertex(0, prim, @ptnum)\n'
+                          'addvertex(0, prim, pt)\nif @P.x > 0:\n    removepoint(0, @ptnum)\n'
+                          'setpointattrib(0, "Cd", pt, (1, 0, 0))\nsetprimattrib(0, "w", prim, 2.0, "add")\n'
+                          'i@made = pt')
+    kinds = [op.kind for op in prog.geo_ops]
+    assert kinds == ["addpoint", "vertex", "vertex", "remove", "set", "set"]
+    assert prog.geo_ops[3].mask.node.kind == "compare"  # only where the if runs
+    assert prog.geo_ops[5].info["domain"] == "CURVE"  # a polyline is a curve
+    assert prog.geo_ops[4].info["storage"] == "FLOAT_COLOR"
+    made = {n: v for n, _t, v in prog.writes}["made"]
+    assert made.node.kind == "imath"  # the point count plus the elements before
+    prog = compile_source("for i in range(20):\n    addpoint(0, @P + (0, 0, i))")
+    assert len(prog.geo_ops) == 20  # unrolled
+    prog = compile_source("addpoint(0, @P)", group="@P.x > 0")
+    assert prog.geo_ops[0].mask.node.kind == "compare"
+    prog = compile_source('for i in range(chi("n")):\n    pt = addpoint(0, @P)\n    setpointattrib(0, "k", pt, i)')
+    assert [(op.kind, op.records is not None) for op in prog.geo_ops] == [("addpoint", True), ("set", True)]
+    fails('for j in range(chi("m")):\n    for i in range(chi("n")):\n        addpoint(0, @P)', "inside another loop")
+    fails("addpoint(1, @P)", "first argument is the geometry")
+    fails("addvertex(0, 3, @ptnum)", "made with addprim()")
+    fails('setdetailattrib(0, "x", 1)', "no detail attributes")
+    fails('setpointattrib(0, "x", 0, 1.0, "toggle")', "mode is one of")
+    fails('setpointgroup(0, "g", 0, 1)\nsetpointattrib(0, "b@g", 0, True, "add")', "needs numbers")
+    fails('addprim(0, "sphere")', '"poly" or "polyline"')
+    fails('setpointattrib(0, "ptnum", 0, 1)', "can't write")
+
+
+def test_input_types_from_the_graph():
+    src = 'v@a = point(1, "vel", 0)\nv@b = @opinput2_dir\nf@c = point(1, "other", 0)'
+    prog = compile_source(src, input_types={1: {"vel": "vector"}, 2: {"dir": "vector"}})
+    assert [t for _n, t, _v in prog.writes] == ["vector", "vector", "float"]
+    w = {n: v for n, _t, v in prog.writes}
+    assert w["a"].node.params["dtype"] == "vector"
+    assert writes('v@a = point(1, "vel", 0)')["a"].node.params["dtype"] == "float"  # no guess: a float
+
+
+def test_channel_ranges():
+    prog = compile_source('f@a = chf("amp", 1, min=0, max=10)\ni@n = chi("count", 3, min=1)')
+    assert prog.limits == {"amp": (0, 10), "count": (1, None)}
+    fails('f@a = chf("amp", 1, min=5, max=1)', "larger than")
+    fails('f@a = chf("amp", 1, low=0)', "no option 'low'")
+    fails('f@a = chf("amp", 1, min=@P.x)', "constant number")
+
+
+def test_review_fixes():
+    # call arguments that assign are loop items
+    prog = compile_source('m = ident()\nfor i in range(chi("n", 3)):\n    translate(m, (0, 0, 1))\n@P *= m')
+    assert any(n.kind == "repeat_in" for n in _ir_nodes(prog))
+    prog = compile_source('v = (0, 0, 0)\nfor i in range(chi("n", 3)):\n    setcomp(v, v.x + 1, 0)\nv@a = v')
+    assert any(n.kind == "repeat_in" for n in _ir_nodes(prog))
+    # a quaternion / matrix returned early under a per-element if
+    w = writes("def f(x):\n    if x > 0:\n        return quaternion(x, (0, 1, 0))\n    return quaternion(0, (0, 1, 0))\n"
+               "p@o = f(@P.x)\ndef g(x):\n    if x > 0:\n        return ident()\n    return maketransform((x, 0, 0), "
+               "quaternion(0, (0, 0, 1)))\n4@m = g(@P.x)")
+    assert w["o"].type == "quaternion" and w["m"].type == "matrix"
+    # a geometry function in one branch of a ternary / and runs only there
+    prog = compile_source("x = addpoint(0, @P) if @P.x > 0 else -1\nb = @P.y > 0 and addpoint(0, @P) >= 0")
+    assert all(not op.mask.is_const for op in prog.geo_ops)
+    # a function making elements, called twice in a zone: inlined, two calls
+    prog = compile_source('def mk(h):\n    return addpoint(0, @P + (0, 0, h))\nfor i in range(chi("n", 3)):\n'
+                          '    a = mk(i + 1.0)\n    b = mk(i + 1.5)')
+    seen, stack = {}, [prog.geo_ops[0].records.node]
+    while stack:
+        n = stack.pop()
+        if id(n) not in seen:
+            seen[id(n)] = n
+            stack.extend(v.node for v in n.inputs if v.node is not None)
+            stack.extend(x for x in n.params.values() if hasattr(x, "kind"))
+    nodes = list(seen.values())
+    assert not any(n.kind in ("closure_out", "closure_in") for n in nodes)
+    assert sum(n.kind == "records" for n in nodes) == 2
+    fails("p@o = blur(p@orient)", "numbers and vectors")
+    fails('f@a = noise(@P, amp="x")', "amp= takes a number")
+    fails('m = ident()\nf@a = promote(m[0], "face")', "row of a matrix")
+    fails("m = ident()\ni = 1\nf@a = m[i][0]", "indexes have to be constant")
+    assert writes("b@a = 1 in (1,)")["a"].const is True
+    prog = compile_source('i@a = chi("n", 9, min=0.5, max=3.7)')
+    assert prog.limits == {"n": (1, 3)} and prog.params == [("n", "int", 3)]
+    w = writes("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
+    assert w["w"].node.params["idname"] == "FunctionNodeRotationToQuaternion"  # normalized, like a stored one
+    prog = compile_source("f@a = 1", group="pscale > 0.5")
+    assert ("radius", "float") in prog.reads and not any(n == "pscale" for n, _t in prog.reads)
+    prog = compile_source('pr = addprim(0, "polyline")\nif @P.x > 0:\n    pr = addprim(0, "polyline")\n'
+                          'addvertex(0, pr, @ptnum)')
+    assert prog.geo_ops[-1].info["ptype"] == "polyline"
+    w = writes('setpointattrib(0, "foo", 0, @P)\nv@b = @foo')
+    assert w["b"].node.params["dtype"] == "vector"
+
+
+def test_second_review_fixes():
+    w = writes('def f(x):\n    q = quaternion(0, (0, 1, 0))\n    for i in range(chi("n", 3)):\n'
+               '        q *= quaternion(0.1, (0, 1, 0))\n        if x < i:\n            return q\n    return q\n'
+               'p@o = f(@P.x)')
+    assert w["o"].type == "quaternion"
+    w = writes("def w():\n    @foo = 5\n    return 1\nx = w() if @P.x > 0 else 0")
+    assert w["foo"].node.kind == "switch"  # only where the branch is picked
+    fails("p@o = p@orient if @P.x > 0 else False", "cannot use a bool as quaternion")
+    fails("m = ident()\nr = m[0]\nif @P.x > 0:\n    r = m[1]\n@a = r[0]", "row of a matrix")
+    fails("m = ident()\nb@a = m[0] == m[1]", "row of a matrix")
+    fails("m = ident()\ni = 1\nm[0][i] = 1", "indexes have to be constant")
+    fails('i@n = chi("n", 5, min=0.5, max=0.7)', "no whole number")
+    fails('addprim(0, "polyline")\naddvertex(0, 3, @ptnum)', "made with addprim()")
+
+
+def test_arrays():
+    w = writes("a = [1, 2, 3]\nf@x = a[1] + len(a) + a[-1]\nb = []\nb.append(2)\npush(b, 5.5)\nf@s = sum(b)\n"
+               "c = [3, 1, 2]\nb@h = 2 in c\ni@f = find(c, 1)\nf@m = sort(c)[0]\nf@r = reverse(c)[0]\n"
+               "d = [1, 2, 3]\nv = d.pop()\ninsert(d, 0, 9)\nremoveindex(d, 1)\nf@pv = v\nf@d0 = d[0]\n"
+               "i@dn = len(d)\nf@lo = min(c)\nf@av = avg(c)\nv@vec = [1, 2, 3]\nf@oob = a[7]\n"
+               "e = [1]\nresize(e, 3)\ni@en = len(e)\nf@e2 = e[2]")
+    assert w["x"].const == 8 and w["s"].const == 7.5 and w["h"].const is True and w["f"].const == 1
+    assert w["m"].const == 1 and w["r"].const == 2 and w["pv"].const == 3 and w["d0"].const == 9 and w["dn"].const == 2
+    assert w["lo"].const == 1 and abs(w["av"].const - 2) < 1e-9 and w["vec"].const == (1, 2, 3)
+    assert w["oob"].const == 0 and w["en"].const == 3 and w["e2"].const == 0
+    # per element: lengths that differ, a variable index (one Index Switch), loops
+    prog = compile_source("a = [1]\nif @P.x > 0:\n    a.append(7)\ni@n = len(a)\nb = [@P.x, @P.y]\n"
+                          "f@y = b[@ptnum % 2]\nc = []\nfor i in range(chi(\"k\", 5)):\n    c.append(i)\n"
+                          "f@cs = sum(c)\nt = 0\nfor x in a:\n    t += x\nf@t = t")
+    w = {n: v for n, _t, v in prog.writes}
+    assert w["n"].node.kind == "switch" and any(n.kind == "pick" for n in _ir_nodes(prog))
+    zone = next(n for n in _ir_nodes(prog) if n.kind == "repeat_in" and len(n.params["items"]) > 30)
+    assert len(zone.params["items"]) >= 33  # 32 slots and a length
+    w = writes("def mk(n):\n    r = []\n    for i in range(n):\n        r.append(i)\n    return r\nf@s = sum(mk(3))")
+    assert w["s"].const == 3
+    fails("f@a = [1, 2]", "no array attributes")
+    fails("a = [1, quaternion(0, (0, 0, 1))]", "holds one type")
+    fails("a = [[1], [2]]", "can't hold arrays")
+    fails("f@a = sum(1)", "works on an array")
+    fails("a = [1]\nb = a + 1", "cannot use an array")
+    fails('n = nearpoints(0, @P, 1, 100)', "at most 64")
+    fails('n = neighbours(0, @ptnum, max=0)', "above 0")
 
 
 if __name__ == "__main__":

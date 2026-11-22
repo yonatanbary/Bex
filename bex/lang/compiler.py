@@ -2,21 +2,34 @@
 
 The script is executed *symbolically*: every variable and attribute holds a
 `Val`, which is either a compile-time constant or an output of an `IRNode`.
-Constants are folded, `if` becomes a per-element Switch, and `for` / `while`
-loops are unrolled (their range or condition has to be known at compile time).
+Constants are folded and `if` becomes a per-element Switch. Loops are unrolled
+when short or constant, else they become a Repeat Zone (see the loops section).
 Variables work like Python's: assigning creates them, and they are visible until
 the end of the script.
 """
 
+import colorsys
+import itertools
 import math
 import re
 from dataclasses import dataclass, field
 
-from .lexer import _PREFIX_TYPES, BexError
+from .lexer import _PREFIX_TYPES, ALIASES, BexError
 from .parser import N, parse, parse_group
 
-MAX_LOOP_ITERATIONS = 1024
-RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3}
+MAX_LOOP_ITERATIONS = 1024  # longest loop run at compile time
+UNROLL_MAX = 8  # loops this short are unrolled even when they make nodes
+MAX_ZONE_ITERATIONS = 100_000  # a Repeat Zone never runs more often than this
+WHILE_CAP = 1000  # iterations of a while loop whose end differs per element (inside another loop)
+TEMP_PREFIX = ".bex"  # hidden attributes a chunked loop keeps its values in; removed at the end
+CHUNK_FIRST, CHUNK_GROWTH = 32, 1.5
+MAX_CALL_DEPTH = 50  # nested calls of your own functions (recursion has to end while compiling)
+MAX_CALLS = 10_000  # calls of your own functions in one script  # chunk k of a loop that can end early runs floor(32 * 1.5^k) times
+RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5, "geometry": 9, "array": 10}
+# Types that never convert to or from another (a quaternion is a Blender Rotation, a matrix a 4x4 Matrix).
+OPAQUE = ("quaternion", "matrix")
+SIZES = {"vector": 3, "quaternion": 4}
+PREFIXES = {"vector": "v", "quaternion": "p", "matrix": "4"}  # the prefix that gives an attribute this type  # components: v.x .y .z, a quaternion's .w too (Houdini order x, y, z, w)
 
 
 class IRNode:
@@ -36,14 +49,30 @@ class IRNode:
 
 @dataclass(frozen=True)
 class Val:
-    type: str  # float | int | vector | bool
-    const: object = None  # python value when known at compile time
+    type: str  # float | int | vector | bool | quaternion | matrix
+    # python value when known at compile time: a vector is (x, y, z), a quaternion (x, y, z, w),
+    # a matrix 16 floats in Blender's order (column by column, translation in the last column)
+    const: object = None
     node: object = None  # IRNode otherwise
     out: int = 0  # which output of the node
 
     @property
     def is_const(self):
-        return self.node is None
+        return self.node is None and (self.type != "array" or self.const.is_const)
+
+
+@dataclass(frozen=True)
+class Arr:
+    """An array (Val type "array", this as its const): a row of slots, each an
+    ordinary value (a field, so every element has its own array), and how many of
+    them are used. Blender's lists can't differ per element, so arrays live here."""
+    type: str  # the elements' type
+    items: tuple  # the slots (Vals); their number is the array's capacity
+    length: object  # an int Val: how many slots are used (may differ per element)
+
+    @property
+    def is_const(self):
+        return self.length.is_const and all(v.is_const for v in self.items)
 
 
 @dataclass
@@ -61,6 +90,22 @@ class Program:
     inputs: list = field(default_factory=list)  # extra geometry inputs the script reads (1-3), sorted
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
+    preludes: list = field(default_factory=list)  # chunk_end IRNodes: chunked loops, run on the geometry first
+    limits: dict = field(default_factory=dict)  # ch*() name -> (min, max) of its slider, from min= / max=
+    geo_ops: list = field(default_factory=list)  # [GeoOp]: added / removed elements, writes to other elements
+
+
+@dataclass
+class GeoOp:
+    """One call site of addpoint() / addprim() / addvertex() / remove*() / set*attrib().
+    Every element of the run-over domain where `mask` is true makes one record;
+    `values` are fields of that element (read on the incoming geometry)."""
+    kind: str  # addpoint | vertex | remove | set
+    mask: Val
+    values: dict  # name -> Val: pos or src (addpoint), prim + pt (vertex), target (+ value for set)
+    info: dict  # vertex: ptype (poly / polyline); remove: domain, mode; set: domain, name, type, mode, storage
+    line: int = 0
+    records: Val = None  # made in a Repeat Zone: the records of every pass (a geometry Val), instead of values
 
 
 @dataclass
@@ -72,6 +117,7 @@ class Store:
     selection: object = None  # bool Val: which elements are written, None = all
     conds: list = field(default_factory=list)  # the bool Vals ANDed into `selection` (Group first)
     offset: bool = False  # Set Position: `value` goes into Offset, not Position
+    storage: str = None  # the attribute's data type when it isn't the type's own (Cd: FLOAT_COLOR)
 
 
 # Built-in attributes that read from a field node instead of a named attribute.
@@ -91,6 +137,13 @@ BUILTINS = {
     "Frame": ("float", "time", 1),
     "curveu": ("float", "spline_parameter", 0),  # 0-1 along each curve (Spline Parameter's Factor)
     "curvelength": ("float", "spline_parameter", 1),  # distance along the curve from its start
+    "tangent": ("vector", "tangent", 0),  # direction along the curve
+    "area": ("float", "face_area", 0),
+    "island": ("int", "mesh_island", 0),  # which connected piece of the mesh
+    "edgeangle": ("float", "edge_angle", 0),  # angle between an edge's two faces, 0 when flat
+    "cyclic": ("bool", "spline_cyclic", 0),  # the curve is closed
+    "curveptnum": ("int", "curve_of_point", 1),  # a curve point's number within its curve: 0, 1, 2...
+    "TimeInc": ("float", "time", 0),  # seconds per frame (read_original computes it)
 }
 # Index built-ins that depend on the Run Over domain, like Formula to Nodes / Houdini:
 # name -> {domain: (input kind, output)}. @elemnum / @index are always the element's index.
@@ -112,8 +165,15 @@ INDEX_HINTS = {
 
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame", "curveu", "curvelength"} | set(COUNT_ATTRS)
-KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
+READ_ONLY = {"ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
+             "curveu", "curvelength", "tangent", "area", "island", "edgeangle", "cyclic", "curveptnum",
+             "TimeInc"} | set(COUNT_ATTRS)
+KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "UVMap": "vector",
+               "scale": "vector", "orient": "quaternion", "rot": "quaternion", "transform": "matrix",
+               "Alpha": "float"}
+# Attributes stored as another Blender data type than their BEX type, so the rest of Blender
+# sees them for what they are: Cd as a colour attribute, the UV map as 2D vectors.
+STORAGE = {"Cd": "FLOAT_COLOR", "UVMap": "FLOAT2"}
 
 
 def _sign(x):
@@ -164,6 +224,7 @@ MATH1 = {
     "trunc": ("TRUNC", math.trunc),
     "frac": ("FRACT", lambda x: x - math.floor(x)),
     "sign": ("SIGN", _sign),
+    "rint": ("ROUND", lambda x: math.floor(x + 0.5)),
     "radians": ("RADIANS", math.radians),
     "degrees": ("DEGREES", math.degrees),
 }
@@ -182,6 +243,74 @@ VMATH1 = {"ABSOLUTE": "ABSOLUTE", "FLOOR": "FLOOR", "CEIL": "CEIL", "ROUND": "RO
           "SIGN": "SIGN", "SINE": "SINE", "COSINE": "COSINE", "TANGENT": "TANGENT"}
 VMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM", "POWER": "POWER", "SNAP": "SNAP"}
 IMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM"}
+
+# A function's return value before any `return`: never used where it is still this,
+# so it merges with (and starts a loop item of) any type. Compared by identity.
+NOT_RETURNED = Val("bool", False)
+
+# -- quaternions (x, y, z, w) and matrices (16 floats, column by column) for constant folding
+_IDENTITY = tuple(float(c == r) for c in range(4) for r in range(4))
+
+
+def _qnorm(q):
+    """Blender's rotations are unit quaternions; a zero one is no rotation."""
+    n = math.sqrt(sum(c * c for c in q))
+    return tuple(float(c / n) for c in q) if n > 1e-12 else (0.0, 0.0, 0.0, 1.0)
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _qrotate(q, v):
+    u, w = q[:3], q[3]
+    t = tuple(2 * c for c in _cross(u, v))
+    c = _cross(u, t)
+    return tuple(v[i] + w * t[i] + c[i] for i in range(3))
+
+
+def _qaxis(axis, angle):
+    n = math.sqrt(sum(c * c for c in axis))
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    s = math.sin(angle / 2) / n
+    return (axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2))
+
+
+def _qeuler(angles, order):
+    q = (0.0, 0.0, 0.0, 1.0)
+    for axis in order:  # the first axis turns first
+        k = "XYZ".index(axis)
+        q = _qmul(_qaxis(tuple(float(i == k) for i in range(3)), angles[k]), q)
+    return q
+
+
+def _qinv(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def _mat_mul(a, b):
+    """Blender's A @ B."""
+    return tuple(sum(a[k * 4 + r] * b[c * 4 + k] for k in range(4)) for c in range(4) for r in range(4))
+
+
+def _mat_point(m, v):
+    return tuple(sum(m[c * 4 + r] * v[c] for c in range(3)) + m[12 + r] for r in range(3))
+
+
+def _mat_trs(t, q, s):
+    cols = [_qrotate(q, tuple(s[k] * (i == k) for i in range(3))) for k in range(3)]
+    return tuple(x for col in cols for x in (*col, 0.0)) + (*t, 1.0)
+
 
 def _floor_div(a, b):
     return math.floor(a / b) if b else 0
@@ -205,7 +334,10 @@ ARITH = {
     "%": ("FLOORED_MODULO", _floor_mod),
     "**": ("POWER", _safe_pow),
 }
-CONSTANTS = {"PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau}
+CONSTANTS = {"XFORM_SRT": 0, "E": math.e, "M_E": math.e, "PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
+             # rotation orders, as in VEX (eulertoquaternion(r, XFORM_ZYX)): the first axis turns first
+             "XFORM_XYZ": 0, "XFORM_XZY": 1, "XFORM_YXZ": 2, "XFORM_YZX": 3, "XFORM_ZXY": 4, "XFORM_ZYX": 5}
+EULER_ORDERS = ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX")
 COMPARE = {
     "<": ("LESS_THAN", lambda a, b: a < b),
     "<=": ("LESS_EQUAL", lambda a, b: a <= b),
@@ -224,7 +356,82 @@ BBOX = ("getbbox_min", "getbbox_max", "getbbox_size", "getbbox_center", "relbbox
 # node's "Input N" sockets (always there).
 MAX_INPUT = 3
 SAMPLE_FUNCS = {"point": "POINT", "prim": "FACE", "vertex": "CORNER"}  # point(1, "P", i) -> domain
-COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nvertices": "CORNER"}  # npoints(1)
+COUNT_FUNCS = {"npoints": "POINT", "nprims": "FACE", "nprimitives": "FACE", "nvertices": "CORNER",
+               "nedges": "EDGE", "ncurves": "CURVE"}  # npoints(1)
+# Mesh topology on an input: name -> (node, output, index socket, domain of the index)
+TOPOLOGY = {
+    "primvertexcount": ("GeometryNodeCornersOfFace", "Total", "Face Index", "FACE"),
+    "vertexpoint": ("GeometryNodeVertexOfCorner", "Vertex Index", "Corner Index", "CORNER"),
+    "vertexprim": ("GeometryNodeFaceOfCorner", "Face Index", "Corner Index", "CORNER"),
+    "vertexprimindex": ("GeometryNodeFaceOfCorner", "Index in Face", "Corner Index", "CORNER"),
+    "neighbourcount": ("GeometryNodeEdgesOfVertex", "Total", "Vertex Index", "POINT"),
+}
+# Every output of the topology nodes, in socket order (an IR node's `out` indexes these).
+NODE_OUTS = {
+    "GeometryNodeCornersOfFace": ("Corner Index", "Total"),
+    "GeometryNodeEdgesOfVertex": ("Edge Index", "Total"),
+    "GeometryNodeVertexOfCorner": ("Vertex Index",),
+    "GeometryNodeFaceOfCorner": ("Face Index", "Index in Face"),
+    "GeometryNodeInputMeshEdgeVertices": ("Vertex Index 1", "Vertex Index 2"),
+    "GeometryNodeCornersOfVertex": ("Corner Index", "Total"),
+}
+# Quaternion and matrix functions (Compiler.transform_call)
+TRANSFORM_FUNCS = ("quaternion", "eulertoquaternion", "quaterniontoeuler", "qrotate", "qmultiply", "qinvert",
+                   "slerp", "dihedral", "ident", "maketransform", "invert", "transpose", "determinant",
+                   "translate", "rotate", "scale", "lookat", "cracktransform")
+MATRIX_OUTS = tuple(f"Column {c} Row {r}" for c in range(1, 5) for r in range(1, 5))  # Separate Matrix
+# On the Instance domain these read and write the instance's own transform (instance_transform)
+INSTANCE_ATTRS = {"orient": ("quaternion", "instance_rotation"), "scale": ("vector", "instance_scale"),
+                  "transform": ("matrix", "instance_transform")}
+# Noise (Compiler.noise_call). name -> Noise Texture type; every one takes the NOISE_OPTS keywords.
+NOISE_FUNCS = {"noise": "FBM", "vnoise": "FBM", "snoise": "FBM", "flownoise": "FBM",
+               "ridgednoise": "RIDGED_MULTIFRACTAL", "hybridnoise": "HYBRID_MULTIFRACTAL",
+               "heteronoise": "HETERO_TERRAIN", "multinoise": "MULTIFRACTAL"}
+NOISE_OPTS = ("freq", "offset", "amp", "octaves", "rough", "lacunarity", "distortion")
+FRACTAL_OPTS = ("gain", "ridge")  # the multifractal types' Gain and Offset
+# Voronoi: name -> (feature, output). wnoise() also fills seed, f1, f2 out arguments, like VEX.
+VORONOI_FUNCS = {"voronoi": ("F1", "Distance"), "voronoif2": ("F2", "Distance"),
+                 "voronoiedge": ("DISTANCE_TO_EDGE", "Distance"), "voronoicell": ("F1", "Color"),
+                 "voronoipos": ("F1", "Position"), "wnoise": ("F1", "Distance")}
+VORONOI_OPTS = ("freq", "offset", "amp", "jitter", "metric", "exponent", "octaves", "rough", "lacunarity")
+VORONOI_METRICS = {"euclidean": "EUCLIDEAN", "manhattan": "MANHATTAN", "chebyshev": "CHEBYCHEV",
+                   "chebychev": "CHEBYCHEV", "minkowski": "MINKOWSKI"}
+GABOR_OPTS = ("freq", "offset", "amp", "stripes", "anisotropy", "direction")
+SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemisphere",
+               "sample_circle_uniform", "sample_circle_edge_uniform", "sample_direction_cone")
+# Built-in functions that take keyword options: name -> allowed keywords
+FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
+KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
+            "curlnoise": NOISE_OPTS, "neighbours": ("max",), "primpoints": ("max",), "pointprims": ("max",),
+            "chf": ("min", "max"), "chi": ("min", "max"), "chv": ("min", "max"), **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+# Arrays (Compiler.array_call)
+ARRAY_FUNCS = ("array", "append", "push", "pop", "insert", "removeindex", "find", "sort", "reverse", "sum",
+               "isvalidindex", "resize", "neighbours", "primpoints", "pointprims", "nearpoints", "pcfind")
+ARRAY_ZONE_CAP = 32  # slots of an array that grows inside a Repeat Zone (its longest length)
+LIST_CAP = 16  # how many neighbours(), primpoints(), pointprims(), nearpoints() return at most (max= to change)
+MAX_ARRAY = 1024  # the most slots an array can have
+# Making and removing elements, writing to other elements (Compiler.geo_call)
+GEO_FUNCS = ("addpoint", "addprim", "addvertex", "removepoint", "removeprim", "setpointattrib", "setprimattrib",
+             "setpointgroup", "setprimgroup", "setvertexattrib", "setdetailattrib")
+GEO_UNROLL_MAX = 64  # a loop making elements is unrolled up to this many passes
+PRIM_TYPES = {"poly": "poly", "polygon": "poly", "polyline": "polyline"}
+SET_MODES = ("set", "add", "min", "max")
+# Statistics over the run-over domain, optionally per group (Compiler.aggregate): name -> (node, output)
+AGGREGATES = {"mean": ("GeometryNodeFieldAverage", "Mean"), "median": ("GeometryNodeFieldAverage", "Median"),
+              "minof": ("GeometryNodeFieldMinAndMax", "Min"), "maxof": ("GeometryNodeFieldMinAndMax", "Max"),
+              "stddev": ("GeometryNodeFieldVariance", "Standard Deviation"),
+              "variance": ("GeometryNodeFieldVariance", "Variance"),
+              "sumof": ("GeometryNodeAccumulateField", "Total"), "accumulate": ("GeometryNodeAccumulateField", "Leading")}
+AGGREGATE_OUTS = {"GeometryNodeFieldAverage": ("Mean", "Median"), "GeometryNodeFieldMinAndMax": ("Min", "Max"),
+                  "GeometryNodeFieldVariance": ("Standard Deviation", "Variance"),
+                  "GeometryNodeAccumulateField": ("Leading", "Trailing", "Total")}
+INT_AGGREGATES = ("GeometryNodeFieldMinAndMax", "GeometryNodeAccumulateField")  # also work on whole numbers
+DATA_TYPES = {"float": "FLOAT", "int": "INT", "bool": "BOOLEAN", "vector": "FLOAT_VECTOR",
+              "quaternion": "QUATERNION", "matrix": "FLOAT4X4"}
+DOMAIN_NAMES = {"point": "POINT", "edge": "EDGE", "face": "FACE", "prim": "FACE", "primitive": "FACE",
+                "corner": "CORNER", "vertex": "CORNER", "curve": "CURVE", "instance": "INSTANCE"}
+COLOR_MODES = {"hsvtorgb": "HSV", "rgbtohsv": "HSV", "hsltorgb": "HSL", "rgbtohsl": "HSL"}
+LUMINANCE = (0.2126, 0.7152, 0.0722)  # Rec. 709, for linear colours
 # Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
 INPUT_SOCKETS = tuple(f"Input {n + 1}" for n in range(1, MAX_INPUT + 1))
 OPINPUT_RE = re.compile(r"opinput(\d)_(\w+)$")  # @opinput1_P: same element number on input 1
@@ -233,8 +440,11 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "log", "log10", "clamp", "lerp", "mix", "fit", "efit", "fit01", "fit11", "smoothstep",
     "length", "normalize", "dot", "cross", "distance", "set", "vector", "float", "bool", "int",
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
-    "nearpoint",
-}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS)
+    "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
+    "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
+    "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
+    "countof", "blur", "at", "promote", *GEO_FUNCS, *ARRAY_FUNCS, "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
+}) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
 # BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
@@ -263,10 +473,14 @@ SIGNATURES = {
     "floor": (("value",), "Rounds down."),
     "ceil": (("value",), "Rounds up."),
     "round": (("value",), "Rounds to the nearest whole number."),
+    "rint": (("value",), "Same as round()."),
     "trunc": (("value",), "Cuts off the decimals."),
     "frac": (("value",), "Just the decimals: frac(2.75) is 0.75."),
-    "min": (("a", "b"), "The smaller of the two."),
-    "max": (("a", "b"), "The larger of the two."),
+    "min": (("a", "b", "[more...]"), "The smallest value. min(v) of one vector: its smallest component."),
+    "max": (("a", "b", "[more...]"), "The largest value. max(v) of one vector: its largest component."),
+    "isnan": (("value",), "True when value is not a number (0 / 0 and the like)."),
+    "isfinite": (("value",), "True for an ordinary number: not infinite, not NaN."),
+    "len": (("value",), "Length of an array; 3 for a vector, 4 for a quaternion."),
     "clamp": (("value", "min", "max"), "Keeps value between min and max."),
     "mod": (("value", "divisor"), "Remainder after division. Never negative for a positive divisor."),
     "fmod": (("value", "divisor"), "Same as mod()."),
@@ -285,6 +499,8 @@ SIGNATURES = {
     "smootherstep": (("min", "max", "value"), "Like smoothstep(), with softer ends."),
     "lerp": (("a", "b", "t"), "Blends from a (t = 0) to b (t = 1)."),
     "mix": (("a", "b", "t"), "Same as lerp()."),
+    "invlerp": (("value", "a", "b"), "Where value sits between a (0) and b (1). Not clamped."),
+    "avg": (("values...",), "Average of the values. With one vector, the average of its components."),
     # Vectors
     "set": (("x", "y", "z"), "Makes a vector."),
     "length": (("vector",), "How long the vector is."),
@@ -292,18 +508,79 @@ SIGNATURES = {
     "dot": (("a", "b"), "Dot product of two vectors."),
     "cross": (("a", "b"), "A vector at right angles to both."),
     "distance": (("a", "b"), "Distance between two points."),
+    "length2": (("vector",), "Squared length: faster than length() for comparing."),
+    "distance2": (("a", "b"), "Squared distance between two points."),
+    "reflect": (("direction", "normal"), "The direction bounced off a surface with this normal."),
+    "refract": (("direction", "normal", "ior"), "The direction bent through a surface; ior is the ratio of the two indices."),
+    "faceforward": (("normal", "direction"), "The normal, flipped if needed to face against direction."),
+    # Colour
+    "hsvtorgb": (("hsv",), "Hue, saturation, value (each 0 to 1) to an RGB colour."),
+    "rgbtohsv": (("rgb",), "An RGB colour to hue, saturation, value."),
+    "hsltorgb": (("hsl",), "Hue, saturation, lightness (each 0 to 1) to an RGB colour."),
+    "rgbtohsl": (("rgb",), "An RGB colour to hue, saturation, lightness."),
+    "luminance": (("rgb",), "Brightness of a linear colour."),
+    "blackbody": (("temperature", "[brightness]"), "Colour of a glowing body at this temperature in kelvin."),
     # Types
     "vector": (("x", "y", "z"), "Makes a vector. With one value, all three are set to it."),
     "float": (("value",), "Turns value into a float."),
     "int": (("value",), "Turns value into a whole number, cutting off the decimals."),
     "bool": (("value",), "True unless value is 0."),
+    # Rotations and matrices
+    "quaternion": (("angle", "axis"), "A rotation by angle (radians) around axis. Also quaternion(m), "
+                                      "quaternion(x, y, z, w)."),
+    "eulertoquaternion": (("angles", "[order]"), "Rotation from Euler angles in radians (order XFORM_XYZ...)."),
+    "quaterniontoeuler": (("q", "[order]"), "Euler angles in radians, XYZ order."),
+    "qrotate": (("q", "v"), "v turned by the rotation q. Same as v * q."),
+    "qmultiply": (("a", "b"), "Both rotations: b first, then a. Same as a * b."),
+    "qinvert": (("q",), "The opposite rotation."),
+    "slerp": (("a", "b", "t"), "Turns smoothly from rotation a (t = 0) to b (t = 1)."),
+    "dihedral": (("a", "b"), "The rotation that turns direction a onto b."),
+    "ident": ((), "The identity matrix: no change."),
+    "maketransform": (("zaxis", "yaxis", "[translate]"),
+                      "Matrix facing zaxis with yaxis up. Also maketransform(translate, q, [scale])."),
+    "invert": (("m",), "The matrix (or quaternion) that undoes m."),
+    "transpose": (("m",), "Rows and columns swapped."),
+    "determinant": (("m",), "How much the matrix scales volume."),
+    "translate": (("m", "offset"), "Moves the matrix variable m by offset, after what it does."),
+    "rotate": (("m", "angle", "axis"), "Turns the matrix variable m, after what it does."),
+    "scale": (("m", "size"), "Scales the matrix variable m, after what it does."),
+    "lookat": (("from", "to", "[up]"), "Rotation matrix turning -Z to look from one point at another."),
+    "cracktransform": (("trs", "xyz", "c", "pivot", "m"),
+                       "Part of a matrix: c = 0 translation, 1 rotation (degrees), 2 scale. trs, xyz, pivot: 0."),
+    "getcomp": (("v", "i", "[j]"), "Component i of a vector, or element [i][j] of a matrix."),
+    "setcomp": (("v", "value", "i", "[j]"), "Sets component i of the vector variable v (or [i][j] of a matrix)."),
     # Noise and random
-    "noise": (("position",), "Smooth noise, roughly between 0 and 1."),
-    "vnoise": (("position",), "Smooth noise as a vector, one value per axis."),
-    "rand": (("seed",), "Random number between 0 and 1. Same seed, same number."),
-    "vrand": (("seed",), "Random vector, each axis between 0 and 1."),
+    "noise": (("position", "[time]"), "Smooth noise, about 0 to 1. Options: freq=, offset=, amp=, octaves=, "
+                                     "rough=, lacunarity=, distortion=."),
+    "vnoise": (("position", "[time]"), "Smooth noise as a vector, one value per axis. Same options as noise()."),
+    "snoise": (("position", "[time]"), "Signed noise, about -1 to 1. Same options as noise()."),
+    "flownoise": (("position", "flow"), "Noise that changes smoothly as flow changes. Same options as noise()."),
+    "ridgednoise": (("position", "[time]"), "Ridged multifractal noise: sharp creases. noise() options, plus gain=, ridge=."),
+    "hybridnoise": (("position", "[time]"), "Hybrid multifractal noise. noise() options, plus gain=, ridge=."),
+    "heteronoise": (("position", "[time]"), "Hetero terrain noise: smooth valleys, rough peaks. noise() options, plus ridge=."),
+    "multinoise": (("position", "[time]"), "Multifractal noise. Same options as noise()."),
+    "curlnoise": (("position", "[time]"), "A swirling vector field with no sources or sinks, for flows. "
+                                         "Same options as noise()."),
+    "voronoi": (("position", "[time]"), "Distance to the nearest cell point. Options: freq=, offset=, amp=, jitter=, "
+                                       'metric="euclidean", exponent=, octaves=, rough=, lacunarity=.'),
+    "voronoif2": (("position", "[time]"), "Distance to the second nearest cell point. Same options as voronoi()."),
+    "voronoiedge": (("position", "[time]"), "Distance to the nearest cell edge. Same options as voronoi()."),
+    "voronoicell": (("position", "[time]"), "A random colour per cell. Same options as voronoi()."),
+    "voronoipos": (("position", "[time]"), "Position of the nearest cell point. Same options as voronoi()."),
+    "wnoise": (("position", "[seed]", "[f1]", "[f2]"),
+               "Worley noise: the nearest distance. Variables as seed, f1, f2 get the cell number and both distances."),
+    "gabor": (("position",), "Gabor noise: stripes in random patches. Options: freq=, stripes=, anisotropy=, direction=, amp=."),
+    "rand": (("seed", "[seed2]"), "Random number between 0 and 1. Same seed, same number."),
+    "vrand": (("seed", "[seed2]"), "Random vector, each axis between 0 and 1."),
+    "nrandom": (("seed",), "Random number with a normal (bell curve) spread: mean 0, deviation 1."),
+    "sample_direction_uniform": (("u",), "A direction (length 1), spread evenly; u is a random vector."),
+    "sample_sphere_uniform": (("u",), "A point inside the unit sphere, spread evenly; u is a random vector."),
+    "sample_hemisphere": (("[normal]", "u"), "A direction on the half sphere around normal (default up)."),
+    "sample_circle_uniform": (("u",), "A point inside the unit circle on the XY plane."),
+    "sample_circle_edge_uniform": (("u",), "A point on the unit circle on the XY plane; u is a random number."),
+    "sample_direction_cone": (("center", "angle", "u"), "A direction at most angle (radians) away from center."),
     # Node values
-    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed."),
+    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed. min= / max= set its range."),
     "chi": (("name", "[default]"), "A whole number value on the node."),
     "chv": (("name", "[default]"), "A vector value on the node."),
     "chb": (("name", "[default]"), "A checkbox on the node."),
@@ -321,25 +598,113 @@ SIGNATURES = {
     "npoints": (("input",), "Number of points on an input."),
     "nprims": (("input",), "Number of faces on an input."),
     "nvertices": (("input",), "Number of corners on an input."),
+    "nprimitives": (("input",), "Same as nprims()."),
+    "nedges": (("input",), "Number of edges on an input."),
+    "ncurves": (("input",), "Number of curves on an input."),
     "nearpoint": (("input", "position"), "Index of the point on the input closest to position."),
+    "xyzdist": (("input", "position", "[prim]"),
+                "Distance to the input's surface. A variable as prim gets the closest face."),
+    "minpos": (("input", "position"), "The closest position on the input's surface."),
+    "intersect": (("input", "origin", "direction", "[pos]"),
+                  "Face a ray hits, or -1. The ray is as long as direction. A variable as pos gets the hit."),
+    # Topology
+    "primpoint": (("input", "prim", "n"), "Point number of a face's nth corner."),
+    "primvertexcount": (("input", "prim"), "Number of corners of a face."),
+    "vertexpoint": (("input", "vertex"), "Point number of a corner."),
+    "vertexprim": (("input", "vertex"), "Face a corner belongs to."),
+    "vertexprimindex": (("input", "vertex"), "Which corner of its face a corner is: 0, 1, 2..."),
+    "neighbour": (("input", "point", "n"), "Point number of a point's nth neighbour along an edge."),
+    "neighbourcount": (("input", "point"), "Number of points connected to a point by an edge."),
+    # Statistics and other elements
+    "mean": (("value", "[group]"), "Average of value over all elements, or over those with the same group number."),
+    "median": (("value", "[group]"), "Middle value over all elements (or per group)."),
+    "minof": (("value", "[group]"), "Smallest value over all elements (or per group)."),
+    "maxof": (("value", "[group]"), "Largest value over all elements (or per group)."),
+    "sumof": (("value", "[group]"), "Total of value over all elements (or per group)."),
+    "stddev": (("value", "[group]"), "Standard deviation of value over all elements (or per group)."),
+    "variance": (("value", "[group]"), "Variance of value over all elements (or per group)."),
+    "countof": (("[group]",), "Number of elements (or of elements with this group number)."),
+    "accumulate": (("value", "[group]"), "Running total: this element's value plus all before it (per group)."),
+    "blur": (("value", "[iterations]", "[weight]"), "value averaged with the neighbours', iterations times."),
+    "at": (("value", "index"), "value as computed at another element of this geometry."),
+    "promote": (("value", "domain"), 'value computed on another domain ("face", "point"...) and read back here.'),
+    "primuv": (("input", "name", "curve", "u"), 'An attribute along a curve, at u from 0 to 1: primuv(1, "P", 0, 0.5).'),
+    "uvsample": (("input", "name", "uvname", "uv"), 'An attribute at a UV position: uvsample(1, "P", "UVMap", uv).'),
+    # Making and removing elements
+    "addpoint": (("geo", "position"), "Adds a point; gives its number. addpoint(0, ptnum) copies that point."),
+    "addprim": (("geo", "type", "[points...]"), 'Adds a "poly" (a face) or "polyline" (a curve); gives its number.'),
+    "addvertex": (("geo", "prim", "point"), "Adds a corner using point to a primitive addprim() made."),
+    "removepoint": (("geo", "point"), "Removes a point (and the faces using it) after the script."),
+    "removeprim": (("geo", "prim", "[andpoints]"), "Removes a face (or curve); andpoints = 1 also its unused points."),
+    "setpointattrib": (("geo", "name", "point", "value", "[mode]"),
+                       'Writes an attribute on any point. mode: "set", "add", "min" or "max".'),
+    "setprimattrib": (("geo", "name", "prim", "value", "[mode]"), "Writes an attribute on any face (or curve)."),
+    "setpointgroup": (("geo", "group", "point", "value"), "Puts a point in a group (a bool attribute) or takes it out."),
+    "setprimgroup": (("geo", "group", "prim", "value"), "Puts a face in a group (a bool attribute) or takes it out."),
+    "setvertexattrib": (("geo", "name", "prim", "vertex", "value"), "Not available in BEX."),
+    "setdetailattrib": (("geo", "name", "value"), "Not available: Blender has no detail attributes."),
+    # Arrays
+    "array": (("values...",), "An array of the values: array(1, 2, 3) is [1, 2, 3]."),
+    "append": (("array", "value"), "Adds value at the end of the array variable. Also a.append(value). "
+                                   "In a loop that isn't unrolled, an array keeps at most 32 values."),
+    "push": (("array", "value"), "Same as append()."),
+    "pop": (("array", "[index]"), "Takes the last value (or the one at index) out of the array variable."),
+    "insert": (("array", "index", "value"), "Puts value into the array variable at index."),
+    "removeindex": (("array", "index"), "Takes the value at index out of the array variable."),
+    "find": (("array", "value"), "The first index holding value, or -1."),
+    "sort": (("array",), "The array sorted from small to large."),
+    "reverse": (("array",), "The array back to front."),
+    "sum": (("array",), "All the values added up."),
+    "isvalidindex": (("array", "index"), "True when the array has a value at index."),
+    "resize": (("array", "length"), "Makes the array variable this long (new values are 0)."),
+    "neighbours": (("geo", "point"), "Array of the points connected to point by an edge (max= the most, 16)."),
+    "primpoints": (("geo", "prim"), "Array of a face's points, in order (max= the most, 16)."),
+    "pointprims": (("geo", "point"), "Array of the faces using point (max= the most, 16)."),
+    "nearpoints": (("geo", "position", "radius", "[maxpts]"),
+                   "Array of the points within radius, nearest first (at most maxpts, 16). Checks every point."),
+    "pcfind": (("geo", "channel", "position", "radius", "[maxpts]"), 'Same as nearpoints(); the channel is "P".'),
     # Loops
     "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
 }
 
 
 class Compiler:
-    def __init__(self, domain="POINT", pending_line=None, known_params=()):
+    def __init__(self, domain="POINT", pending_line=None, known_params=(), input_types=None):
         self.domain = domain
+        # {input number: {attribute: type}}: what the node graph says reaches inputs 1-3,
+        # used for point(1, "name", i) and @opinput1_name without a type prefix
+        self.input_types = input_types or {}
         # A ch*() on `pending_line` (the line being typed) whose name is not in
         # `known_params` compiles as its default constant instead of creating
         # an input, so half-typed names don't add and remove sockets.
         self.pending_line = pending_line
         self.known_params = frozenset(known_params)
         self.pending = []
+        self.limits = {}
         self.reads = []  # (name, type) read from the incoming geometry, first-read order
         self.cse = {}  # (kind, params, inputs) -> IRNode
         self.vars = {}  # variable name -> Val (Python-style: one flat namespace)
         self.half_set = {}  # name -> line of an `if` that set it in only one branch
+        self.loop_only = {}  # name -> line of a Repeat Zone loop that first set it inside
+        self.loops = []  # (break flag, continue flag) of each enclosing loop
+        self.loop_count = 0
+        self.group_sel = None  # the Group's bool Val: a per-element loop count only counts those
+        self.zone_depth = 0  # Repeat Zones the statement being run sits in
+        self.preludes = []  # chunk_end IRNodes, in script order
+        self.funcs = {}  # name -> `def` statement of the script's own functions
+        self.call_counts = {}  # (name, argument types) -> calls with a non-constant argument
+        self.closure_keys = frozenset()  # those built once as a Closure (the second compile)
+        self.closures = {}  # (name, argument types) -> closure_out IRNode, or None (inlined after all)
+        self.frames = []  # one dict per running call of an own function (see call_user)
+        self.calls = 0
+        self.path = []  # conditions of the `if` branches being run (a loop starts stopped outside them)
+        self.geo_ops = []  # GeoOp, in call order
+        self.geo_counts = {}  # "point" / "poly" / "polyline" / "vertex" -> the next number (an int Val)
+        self.zone_ops = []  # per Repeat Zone that makes elements: the GeoOps of the pass being run
+        self.expr_conds = []  # conditions of the ternary branches / and-or sides being evaluated
+        self.prim_kinds = {}  # (IRNode, out) of a number addprim() gave -> "poly" / "polyline"
+        self.reading = []  # per closure being built: what its body read from outside (see _closure)
+        self.warnings = []
         self.attrs = {}  # attribute name -> current Val (only attributes that were written)
         self.attr_types = {}  # attribute name -> type, fixed on first use
         self.written = []  # attribute names in first-write order
@@ -349,6 +714,7 @@ class Compiler:
         self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
         self.bare_attributes = False
         self.inputs = []  # extra geometry inputs (1-3) the script reads, first-use order
+        self.storage = dict(STORAGE)  # attribute name -> Blender data type, when not the BEX type's own
 
     # -- IR construction ---------------------------------------------------
     def err(self, msg):
@@ -363,8 +729,24 @@ class Compiler:
 
     def conv(self, v, type):
         """Implicit conversion. Node outputs rely on Blender's link conversion."""
+        if v.type == "row":
+            raise self.err("m[i] is a row of a matrix: pick one element with m[i][j]")
         if v.type == type:
             return v
+        if v.type == "array":  # [1, 2, 3] used as a vector, [x, y, z, w] as a quaternion
+            a = v.const
+            n = SIZES.get(type)
+            if n and a.length.is_const and a.length.const == n == len(a.items) and RANK[a.type] <= 2:
+                return self.combine([self.conv(x, "float") for x in a.items])
+            raise self.err(f"cannot use an array as {type} (pick a value with a[i], or len(a))")
+        if type == "array":
+            raise self.err(f"expected an array, not a {v.type} (make one with [a, b] or array(a, b))")
+        if v.type in OPAQUE or type in OPAQUE:
+            hint = {"quaternion": " (make one with quaternion(), or (x, y, z, w))",
+                    "matrix": " (make one with maketransform() or ident())"}.get(type, "")
+            if v.type == "quaternion":
+                hint = " (pick a component like .w, or use qrotate())"
+            raise self.err(f"cannot use a {v.type} as {type}{hint}")
         if v.type == "vector":
             raise self.err(f"cannot use a vector as {type} (use length() or a component like .x)")
         if not v.is_const:
@@ -392,7 +774,49 @@ class Compiler:
         return Val(type, r)
 
     # -- operators ---------------------------------------------------------
+    def bitop(self, op, a, b):
+        """& | ^ << >> ~ on whole numbers (Bit Math); & | ^ on bools are and / or / xor."""
+        if a.type == "bool" and b.type == "bool" and op in ("&", "|", "^"):
+            if op == "^":
+                return self.compare("!=", self.conv(a, "int"), self.conv(b, "int"))
+            return self.logic("and" if op == "&" else "or", a, b)
+        if RANK[a.type] > 1 or RANK[b.type] > 1:
+            raise self.err(f"'{op}' works on whole numbers (int), not a {a.type if RANK[a.type] > 1 else b.type}")
+        a, b = self.conv(a, "int"), self.conv(b, "int")
+        fn = {"&": lambda x, y: x & y, "|": lambda x, y: x | y, "^": lambda x, y: x ^ y,
+              "<<": lambda x, y: x << y if y >= 0 else x >> -y, ">>": lambda x, y: x >> y if y >= 0 else x << -y,
+              "~": lambda x, y: ~x}[op]
+        folded = self.fold("int", fn, a, b)
+        if folded:
+            return folded
+        if op in ("<<", ">>"):
+            shift = b if op == "<<" else self.negate(b)
+            return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a, shift), ("A", "Shift"),
+                              props=(("operation", "SHIFT"),))
+        if op == "~":
+            return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a,), ("A",), props=(("operation", "NOT"),))
+        return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a, b), ("A", "B"),
+                          props=(("operation", {"&": "AND", "|": "OR", "^": "XOR"}[op]),))
+
+    def items(self, e):
+        """The values of `(a, b, c)` or a vector's components (for `in`, `for ... in`, unpacking)."""
+        if e.kind == "tuple" or (e.kind == "call" and e.name == "set"):
+            return [self.eval(x) for x in (e.items if e.kind == "tuple" else e.args)]
+        v = self.eval(e)
+        if v.type == "array":
+            a = v.const
+            if not a.length.is_const:
+                raise self.err("this array's length differs per element: use a loop (for x in a) or find()")
+            return list(a.items[:a.length.const])
+        if v.type not in SIZES:
+            raise self.err(f"expected several values, like (a, b) or a vector, not a {v.type}")
+        return [self.member(v, i) for i in range(SIZES[v.type])]
+
     def arith(self, op, a, b):
+        if op in ("&", "|", "^", "<<", ">>"):
+            return self.bitop(op, a, b)
+        if a.type in OPAQUE or b.type in OPAQUE:
+            return self.transform_arith(op, a, b)
         bop, fn = ARITH[op]
         if op == "//":
             # floor(a / b), kept integer when both sides are
@@ -425,6 +849,12 @@ class Compiler:
 
     def compare(self, op, a, b):
         bop, fn = COMPARE[op]
+        for x in (a, b):
+            if x.type == "row":
+                self.conv(x, "float")  # explains m[i][j]
+        for x in (a, b):
+            if x.type in OPAQUE:
+                raise self.err(f"'{op}' cannot compare {x.type}s")
         if "vector" in (a.type, b.type):
             if op not in ("==", "!="):
                 raise self.err(f"'{op}' cannot compare vectors (compare length() or a component)")
@@ -441,12 +871,17 @@ class Compiler:
     def logic(self, op, a, b):
         a, b = self.conv(a, "bool"), self.conv(b, "bool")
         is_and = op == "and"
+        if _negates(a, b) or _negates(b, a):  # x or not x, x and not x
+            return Val("bool", not is_and)
         for x, y in ((a, b), (b, a)):
             if x.is_const:  # true && y -> y, false && y -> false, ...
                 return y if x.const == is_and else Val("bool", not is_and)
         return self.node("bmath", "bool", (a, b), op="AND" if is_and else "OR")
 
     def negate(self, a):
+        if a.type in OPAQUE:
+            raise self.err(f"cannot negate a {a.type}" + (" (qinvert() turns it the other way)"
+                                                          if a.type == "quaternion" else " (use invert())"))
         if a.type == "vector":
             return self.arith("*", a, Val("float", -1.0))
         if a.type == "float":
@@ -454,8 +889,30 @@ class Compiler:
         a = self.conv(a, "int")
         return self.fold("int", lambda x: -x, a) or self.node("imath", "int", (a,), op="NEGATE")
 
+    def not_(self, a):
+        a = self.conv(a, "bool")
+        return Val("bool", not a.const) if a.is_const else self.node("bmath", "bool", (a,), op="NOT")
+
     def select(self, cond, a, b):
         """cond ? a : b"""
+        for x in (a, b):
+            if x.type == "row":
+                self.conv(x, "float")  # explains m[i][j]
+        # where a function hasn't returned yet its value is never used: any neutral value will do
+        if a is NOT_RETURNED and b.type != "bool":
+            a = self._neutral(b.type) if b.type != "array" else self.empty_array(b.const.type)
+        elif b is NOT_RETURNED and a.type != "bool":
+            b = self._neutral(a.type) if a.type != "array" else self.empty_array(a.const.type)
+        if a.type == "array" or b.type == "array":
+            if a.type != b.type:
+                raise self.err("can't mix an array and a single value here")
+            if cond.is_const:
+                return a if cond.const else b
+            t = self.array_type([a.const.type, b.const.type])
+            n = max(len(a.const.items), len(b.const.items))
+            xa, xb = self.padded(a.const, n, t), self.padded(b.const, n, t)
+            return self.make_arr(t, [self.select(cond, x, y) for x, y in zip(xa, xb)],
+                                 self.select(cond, a.const.length, b.const.length))
         t = a.type if RANK[a.type] >= RANK[b.type] else b.type
         a, b = self.conv(a, t), self.conv(b, t)
         if cond.is_const:
@@ -464,20 +921,277 @@ class Compiler:
             return a
         return self.node("switch", t, (cond, b, a), dtype=t)
 
+    @staticmethod
+    def _neutral(t):
+        return Val(t, {"quaternion": (0.0, 0.0, 0.0, 1.0), "matrix": _IDENTITY, "vector": (0.0, 0.0, 0.0),
+                       "float": 0.0, "int": 0, "bool": False}[t])
+
+    def size(self, v):
+        """How many components `v` has (a vector 3, a quaternion 4)."""
+        if v.type not in SIZES:
+            raise self.err(f"only vectors and quaternions have components, this is a {v.type}")
+        return SIZES[v.type]
+
     def member(self, v, i):
-        if v.type != "vector":
-            raise self.err(f"only vectors have components, this is a {v.type}")
+        if v.type == "array":
+            return self.arr_get(v.const, Val("int", i))
+        if v.type == "matrix":  # m[i] is half of m[i][j]: a "row" until the second index
+            if not -4 <= i < 4:
+                raise self.err("a matrix has rows 0 to 3: m[i][j]")
+            return Val("row", (v, i % 4))
+        if v.type == "row":  # VEX's m[i][j] is Blender's column i, row j (VEX puts translation in row 3)
+            m, r = v.const
+            if not -4 <= i < 4:
+                raise self.err("a matrix has columns 0 to 3: m[i][j]")
+            k = r * 4 + i % 4
+            if m.is_const:
+                return Val("float", m.const[k])
+            if m.node.kind == "node" and m.node.params["idname"] == "FunctionNodeCombineMatrix":
+                return m.node.inputs[k]
+            return self.gnode("float", "FunctionNodeSeparateMatrix", MATRIX_OUTS, k, (m,), ("Matrix",))
+        n = self.size(v)
+        if not -n <= i < n:
+            raise self.err(f"a {v.type} has components 0 to {n - 1}" + (" (.x .y .z)" if n == 3 else ""))
+        i %= n
         if v.is_const:
             return Val("float", v.const[i])
+        if v.type == "quaternion":  # Blender's order is w, x, y, z; read back, so normalized like a stored one
+            return self.gnode("float", "FunctionNodeRotationToQuaternion", ("W", "X", "Y", "Z"), (i + 1) % 4,
+                              (v,), ("Rotation",))
         if v.node.kind == "combine":
             return v.node.inputs[i]
         return self.node("separate", "float", (v,), out=i)
 
+    def combine_matrix(self, elems):
+        """A matrix from 16 floats, column by column (Blender's order)."""
+        elems = [self.conv(e, "float") for e in elems]
+        if all(e.is_const for e in elems):
+            return Val("matrix", tuple(e.const for e in elems))
+        return self.gnode("matrix", "FunctionNodeCombineMatrix", ("Matrix",), 0, elems, tuple(range(16)))
+
     def combine(self, comps):
+        """A vector from three numbers, or a quaternion from four (x, y, z, w)."""
         comps = [self.conv(c, "float") for c in comps]
+        if len(comps) == 4:
+            if all(c.is_const for c in comps):
+                return Val("quaternion", _qnorm(tuple(c.const for c in comps)))
+            x, y, z, w = comps
+            return self.gnode("quaternion", "FunctionNodeQuaternionToRotation", ("Rotation",), 0, (w, x, y, z),
+                              ("W", "X", "Y", "Z"))
         if all(c.is_const for c in comps):
             return Val("vector", tuple(c.const for c in comps))
         return self.node("combine", "vector", comps)
+
+    # -- rotations and matrices ---------------------------------------------
+    # Operators follow VEX: v * q and v * m turn / transform a vector, q1 * q2 is
+    # qmultiply (q2 turns first), and m1 * m2 applies m1 first, then m2 (row vectors,
+    # as in Houdini; Blender's own order is the other way round).
+
+    def transform_arith(self, op, a, b):
+        types = (a.type, b.type)
+        if op == "*":
+            if types in (("vector", "quaternion"), ("quaternion", "vector")):
+                q, v = (b, a) if a.type == "vector" else (a, b)
+                return self.qrotate(q, v)
+            if types == ("quaternion", "quaternion"):
+                return self.qmultiply(a, b)
+            if types == ("vector", "matrix"):
+                return self.transform(a, b)
+            if types == ("matrix", "matrix"):
+                return self.matmul(a, b)
+            if types == ("matrix", "vector"):
+                raise self.err("write the vector first, as in VEX: v * m")
+        other = {"quaternion": "qmultiply(), qrotate() or slerp()",
+                 "matrix": "* with another matrix or a vector (v * m)"}
+        t = a.type if a.type in OPAQUE else b.type
+        raise self.err(f"'{op}' doesn't work on a {t} and a {b.type if t == a.type else a.type}; "
+                       f"use {other[t]}")
+
+    def quat(self, v, fn):
+        if v.type != "quaternion":
+            raise self.err(f"{fn}() needs a quaternion, got a {v.type}")
+        return v
+
+    def mat(self, v, fn):
+        if v.type != "matrix":
+            raise self.err(f"{fn}() needs a matrix, got a {v.type}")
+        return v
+
+    def qrotate(self, q, v):
+        v = self.conv(v, "vector")
+        if q.is_const and v.is_const:
+            return Val("vector", _qrotate(q.const, v.const))
+        return self.gnode("vector", "FunctionNodeRotateVector", ("Vector",), 0, (v, q), ("Vector", "Rotation"))
+
+    def qmultiply(self, a, b):
+        """Hamilton product a * b: b turns first, then a."""
+        if a.is_const and b.is_const:
+            return Val("quaternion", _qmul(a.const, b.const))
+        return self.gnode("quaternion", "FunctionNodeRotateRotation", ("Rotation",), 0, (b, a),
+                          ("Rotation", "Rotate By"), props=(("rotation_space", "GLOBAL"),))
+
+    def axis_angle(self, angle, axis):
+        angle, axis = self.conv(angle, "float"), self.conv(axis, "vector")
+        if angle.is_const and axis.is_const:
+            return Val("quaternion", _qaxis(axis.const, angle.const))
+        return self.gnode("quaternion", "FunctionNodeAxisAngleToRotation", ("Rotation",), 0, (axis, angle),
+                          ("Axis", "Angle"))
+
+    def euler_order(self, v, fn):
+        if not (v.is_const and v.type == "int" and 0 <= v.const < len(EULER_ORDERS)):
+            raise self.err(f"{fn}()'s rotation order is a constant like XFORM_XYZ (0) to XFORM_ZYX (5)")
+        return EULER_ORDERS[v.const]
+
+    def euler(self, angles, order="XYZ"):
+        """Euler angles in radians to a quaternion; the first axis of `order` turns first."""
+        angles = self.conv(angles, "vector")
+        if angles.is_const:
+            return Val("quaternion", _qeuler(angles.const, order))
+        if order == "XYZ":
+            return self.gnode("quaternion", "FunctionNodeEulerToRotation", ("Rotation",), 0, (angles,), ("Euler",))
+        q = None
+        for axis in order:
+            k = "XYZ".index(axis)
+            step = self.axis_angle(self.member(angles, k), Val("vector", tuple(float(i == k) for i in range(3))))
+            q = step if q is None else self.qmultiply(step, q)
+        return q
+
+    def transform(self, v, m):
+        v = self.conv(v, "vector")
+        if v.is_const and m.is_const:
+            return Val("vector", _mat_point(m.const, v.const))
+        return self.gnode("vector", "FunctionNodeTransformPoint", ("Vector",), 0, (v, m), ("Vector", "Transform"))
+
+    def matmul(self, a, b):
+        """VEX's a * b: a applies first, then b. Blender's Multiply Matrices is B @ A for that."""
+        if a.is_const and b.is_const:
+            return Val("matrix", _mat_mul(b.const, a.const))
+        return self.gnode("matrix", "FunctionNodeMatrixMultiply", ("Matrix",), 0, (b, a), (0, 1))
+
+    def trs(self, t, q, s):
+        """Translate, rotate and scale as one matrix (scale first, then rotate, then translate)."""
+        t, s = self.conv(t, "vector"), self.conv(s, "vector")
+        if t.is_const and q.is_const and s.is_const:
+            return Val("matrix", _mat_trs(t.const, q.const, s.const))
+        return self.gnode("matrix", "FunctionNodeCombineTransform", ("Transform",), 0, (t, q, s),
+                          ("Translation", "Rotation", "Scale"))
+
+    def transform_call(self, name, a, arg_nodes, want):
+        """The quaternion and matrix functions."""
+        if name == "quaternion":
+            want(1, 2, 4)
+            if len(a) == 4:
+                return self.combine(a)
+            if len(a) == 2:
+                return self.axis_angle(a[0], a[1])
+            v = a[0]
+            if v.type == "quaternion":
+                return v
+            if v.type == "matrix":
+                return self.gnode("quaternion", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"),
+                                  1, (v,), ("Transform",))
+            v = self.conv(v, "vector")  # angle * axis in one vector
+            length = Val("float", math.hypot(*v.const)) if v.is_const else \
+                self.node("vmath", "float", (v,), op="LENGTH")
+            return self.axis_angle(length, v)
+        if name == "eulertoquaternion":
+            want(1, 2)
+            return self.euler(a[0], self.euler_order(a[1], name) if len(a) == 2 else "XYZ")
+        if name == "quaterniontoeuler":
+            want(1, 2)
+            if len(a) == 2 and self.euler_order(a[1], name) != "XYZ":
+                raise self.err("quaterniontoeuler() only gives the XYZ order (XFORM_XYZ) in Blender")
+            return self.gnode("vector", "FunctionNodeRotationToEuler", ("Euler",), 0, (self.quat(a[0], name),),
+                              ("Rotation",))
+        if name == "qrotate":
+            want(2)
+            return self.qrotate(self.quat(a[0], name), a[1])
+        if name == "qmultiply":
+            want(2)
+            return self.qmultiply(self.quat(a[0], name), self.quat(a[1], name))
+        if name == "qinvert" or (name == "invert" and a and a[0].type == "quaternion"):
+            want(1)
+            q = self.quat(a[0], name)
+            if q.is_const:
+                return Val("quaternion", _qinv(q.const))
+            return self.gnode("quaternion", "FunctionNodeInvertRotation", ("Rotation",), 0, (q,), ("Rotation",))
+        if name == "slerp":
+            want(3)
+            q1, q2 = self.quat(a[0], name), self.quat(a[1], name)
+            return self.node("mix", "quaternion", (self.conv(a[2], "float"), q1, q2), dtype="quaternion")
+        if name == "dihedral":
+            want(2)
+            v, w = self.conv(a[0], "vector"), self.conv(a[1], "vector")
+            if v.is_const and w.is_const:
+                axis = Val("vector", _cross(v.const, w.const))
+                angle = Val("float", math.atan2(math.hypot(*axis.const), sum(x * y for x, y in zip(v.const, w.const))))
+            else:
+                axis = self.node("vmath", "vector", (v, w), op="CROSS_PRODUCT")
+                angle = self.fn2("ARCTAN2", math.atan2, self.node("vmath", "float", (axis,), op="LENGTH"),
+                                 self.node("vmath", "float", (v, w), op="DOT_PRODUCT"))
+            return self.axis_angle(angle, axis)
+        if name == "ident":
+            want(0)
+            return Val("matrix", _IDENTITY)
+        if name == "maketransform":
+            want(2, 3)
+            if a[1].type == "quaternion":  # maketransform(translate, rotation, [scale])
+                return self.trs(a[0], a[1], a[2] if len(a) == 3 else Val("vector", (1.0, 1.0, 1.0)))
+            z, y = self.conv(a[0], "vector"), self.conv(a[1], "vector")  # VEX: maketransform(zaxis, yaxis, [t])
+            rot = self.gnode("quaternion", "FunctionNodeAxesToRotation", ("Rotation",), 0, (z, y),
+                             ("Primary Axis", "Secondary Axis"), props=(("primary_axis", "Z"), ("secondary_axis", "Y")))
+            return self.trs(a[2] if len(a) == 3 else Val("vector", (0.0, 0.0, 0.0)), rot, Val("vector", (1.0, 1.0, 1.0)))
+        if name == "lookat":  # VEX: the rotation that points -Z from `from` towards `to`, Y towards up
+            want(2, 3)
+            back = self.arith("-", self.conv(a[0], "vector"), self.conv(a[1], "vector"))
+            up = self.conv(a[2], "vector") if len(a) == 3 else Val("vector", (0.0, 1.0, 0.0))
+            rot = self.gnode("quaternion", "FunctionNodeAxesToRotation", ("Rotation",), 0, (back, up),
+                             ("Primary Axis", "Secondary Axis"), props=(("primary_axis", "Z"), ("secondary_axis", "Y")))
+            return self.trs(Val("vector", (0.0, 0.0, 0.0)), rot, Val("vector", (1.0, 1.0, 1.0)))
+        if name == "cracktransform":
+            want(5)
+            trs, xyz, c, pivot = a[:4]
+            if not (trs.is_const and trs.const == 0 and xyz.is_const and xyz.const == 0):
+                raise self.err("cracktransform() only reads Blender's order: trs = 0 (XFORM_SRT), xyz = 0 (XFORM_XYZ)")
+            if not (pivot.is_const and not any(pivot.const if pivot.type == "vector" else [pivot.const])):
+                raise self.err("cracktransform()'s pivot has to be (0, 0, 0)")
+            if not (c.is_const and c.const in (0, 1, 2)):
+                raise self.err("cracktransform()'s c is 0 (translation), 1 (rotation in degrees) or 2 (scale)")
+            m = self.mat(a[4], name)
+            if c.const != 1:
+                return self.gnode("vector", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"),
+                                  c.const, (m,), ("Transform",))
+            q = self.gnode("quaternion", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"), 1,
+                           (m,), ("Transform",))
+            return self.arith("*", self.call_val("quaterniontoeuler", q), Val("float", 180 / math.pi))
+        if name == "invert":
+            want(1)
+            return self.gnode("matrix", "FunctionNodeInvertMatrix", ("Matrix", "Invertible"), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        if name == "transpose":
+            want(1)
+            return self.gnode("matrix", "FunctionNodeTransposeMatrix", ("Matrix",), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        if name == "determinant":
+            want(1)
+            return self.gnode("float", "FunctionNodeMatrixDeterminant", ("Determinant",), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        # translate(m, t), rotate(m, angle, axis), scale(m, s): change the matrix variable, as in VEX
+        want(3 if name == "rotate" else 2)
+        m = self.mat(a[0], name)
+        target = arg_nodes[0]
+        if target.kind not in ("var", "attr"):
+            raise self.err(f"{name}()'s first argument is the matrix it changes: give it a variable name")
+        one, zero, no_turn = Val("vector", (1.0, 1.0, 1.0)), Val("vector", (0.0, 0.0, 0.0)), Val("quaternion", (0.0, 0.0, 0.0, 1.0))
+        if name == "translate":
+            step = self.trs(a[1], no_turn, one)
+        elif name == "scale":
+            step = self.trs(zero, no_turn, a[1])
+        else:
+            step = self.trs(zero, self.axis_angle(a[1], a[2]), one)
+        result = self.matmul(m, step)
+        self.assign(target, result)
+        return result
 
     # -- functions ---------------------------------------------------------
     def fn1(self, op, fn, a):
@@ -558,22 +1272,801 @@ class Compiler:
         if not name:
             raise self.err(f"{fn}() needs an attribute name")
         if type is None:
-            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+            type = self.input_attr_type(n, name)
         return self.sample(n, name, type, self.eval(args[2]), SAMPLE_FUNCS[fn])
+
+    def input_attr_type(self, n, name):
+        """The type of an attribute read from input `n` without a prefix: a built-in's,
+        else the guess from the node graph (input_types), else a known name's, else float."""
+        if name in BUILTINS:
+            return BUILTINS[name][0]
+        return self.input_types.get(n, {}).get(name) or KNOWN_TYPES.get(name, "float")
 
     def count(self, n, domain):
         return self.node("count", "int", (), input=n, domain=domain)
+
+    def gnode(self, type, idname, outs, out=0, inputs=(), ins=(), **params):
+        """One Blender node `idname` (IR `node`): `inputs` go to the sockets named `ins`,
+        and the Val is output `out` of the sockets named `outs`. Other params: `props`
+        ((property, value) pairs), `menus` ((socket, item) pairs), `geo` ((socket, input
+        number): the geometry it reads), `implicit` (sockets that fall back to a field when
+        unlinked), `field` (a field of the geometry it is evaluated on, even with constant
+        inputs), `src` (the input it is evaluated on, inside a node that reads that input)."""
+        return self.node("node", type, tuple(inputs), out=out, idname=idname, outs=tuple(outs),
+                         ins=tuple(ins), **params)
+
+    def topology(self, fn, n, idname, output, index_sock, index, domain, extra=()):
+        """A mesh topology node read on input `n` at `index` (an element of `domain`).
+        On this geometry it is a field taking the index directly; on another input it is
+        evaluated there, at every element, and sampled at `index`. `extra`: other int
+        inputs (socket, Val), which have to be constants on another input."""
+        outs = NODE_OUTS[idname]
+        index = self.conv(index, "int")
+        socks = tuple(s for s, _ in extra)
+        vals = tuple(self.conv(v, "int") for _, v in extra)
+        if n == 0:
+            return self.gnode("int", idname, outs, outs.index(output), (index,) + vals, (index_sock,) + socks,
+                              implicit=(index_sock,), field=True)
+        if not all(v.is_const for v in vals):
+            raise self.err(f"on another input, {fn}()'s last argument has to be a constant")
+        value = self.gnode("int", idname, outs, outs.index(output), vals, socks, src=n)
+        return self.node("sample", "int", (value, index), input=n, domain=domain, dtype="int")
+
+    def proximity(self, n, pos, out):
+        """Geometry Proximity to input `n`'s faces: out 0 the closest position, 1 the distance."""
+        return self.gnode("float" if out else "vector", "GeometryNodeProximity", ("Position", "Distance"), out,
+                          (pos,), ("Sample Position",), geo=("Geometry", n), props=(("target_element", "FACES"),),
+                          implicit=("Sample Position",))
+
+    def out_arg(self, fn, arg, val):
+        """VEX's output arguments: `xyzdist(1, @P, prim)` sets the variable `prim`."""
+        if arg.kind not in ("var", "attr", "member", "index"):
+            self.line = arg.line
+            raise self.err(f"{fn}()'s last argument receives a value: give it a variable name")
+        self.assign(arg, val)
+
+    def query(self, fn, args):
+        """xyzdist() and intersect(), which can fill in a last output argument."""
+        need = 2 if fn == "xyzdist" else 3
+        if len(args) not in (need, need + 1):
+            usage = "xyzdist(1, @P) or xyzdist(1, @P, prim)" if fn == "xyzdist" else \
+                "intersect(1, origin, direction) or intersect(1, origin, direction, pos)"
+            raise self.err(f"{fn}() takes {need} or {need + 1} arguments: {usage}")
+        a = [self.eval(x) for x in args[:need]]
+        n = self.input_number(a[0], fn)
+        # The face is read through Face of Corner: both nodes look values up on the corners.
+        face = self.gnode("int", "GeometryNodeFaceOfCorner", NODE_OUTS["GeometryNodeFaceOfCorner"], 0, src=n)
+        if fn == "xyzdist":
+            pos = self.conv(a[1], "vector")
+            if len(args) > need:
+                prim = self.gnode("int", "GeometryNodeSampleNearestSurface", ("Value",), 0, (face, pos),
+                                  ("Value", "Sample Position"), props=(("data_type", "INT"),), geo=("Mesh", n),
+                                  implicit=("Sample Position",))
+                self.out_arg(fn, args[need], prim)
+            return self.proximity(n, pos, 1)
+        origin, direction = self.conv(a[1], "vector"), self.conv(a[2], "vector")
+        length = (Val("float", math.hypot(*direction.const)) if direction.is_const
+                  else self.node("vmath", "float", (direction,), op="LENGTH"))
+
+        def ray(type, out):
+            return self.gnode(type, "GeometryNodeRaycast", ("Is Hit", "Hit Position", "Hit Normal", "Hit Distance",
+                                                            "Attribute"), out,
+                              (face, origin, direction, length),
+                              ("Attribute", "Source Position", "Ray Direction", "Ray Length"),
+                              props=(("data_type", "INT"),), menus=(("Interpolation", "Nearest"),),
+                              geo=("Target Geometry", n), implicit=("Source Position",))
+        if len(args) > need:
+            self.out_arg(fn, args[need], ray("vector", 1))
+        return self.select(ray("bool", 0), ray("int", 4), Val("int", -1))
+
+    def color(self, name, v):
+        """hsvtorgb() and friends. Blender's HSL order is hue, saturation, lightness."""
+        mode, to_rgb = COLOR_MODES[name], name.endswith("torgb")
+        if v.is_const:
+            h, s, x = v.const
+            if mode == "HSV":
+                r = colorsys.hsv_to_rgb(h, s, x) if to_rgb else colorsys.rgb_to_hsv(h, s, x)
+            elif to_rgb:
+                r = colorsys.hls_to_rgb(h, x, s)
+            else:
+                h, l, s = colorsys.rgb_to_hls(h, s, x)
+                r = (h, s, l)
+            return Val("vector", tuple(float(c) for c in r))
+        if to_rgb:  # hue wraps around like an angle (Combine Color would clamp it)
+            comps = [self.member(v, i) for i in range(3)]
+            comps[0] = self.fn1("FRACT", lambda x: x - math.floor(x), comps[0])
+            return self.gnode("vector", "FunctionNodeCombineColor", ("Color",), 0, comps, ("Red", "Green", "Blue"),
+                              props=(("mode", mode),))
+        return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
+                                        ("Color",), props=(("mode", mode),)) for i in range(3)])
+
+    # -- arrays --------------------------------------------------------------
+    # An array is a row of slots plus a length. Slots past the length hold leftovers
+    # and are never read. Changing an array makes a new one (like every value here).
+
+    def make_arr(self, type, items, length):
+        if len(items) > MAX_ARRAY:
+            raise self.err(f"an array can have at most {MAX_ARRAY} values")
+        return Val("array", Arr(type, tuple(items), self.conv(length, "int")))
+
+    def empty_array(self, type):
+        return self.make_arr(type, [], Val("int", 0))
+
+    def array_type(self, types):
+        """The type of an array holding these types (numbers widen; others must match)."""
+        types = [t for t in types if t is not None]
+        if not types:
+            return "float"
+        if any(t in OPAQUE for t in types) and len(set(types)) > 1:
+            raise self.err(f"an array holds one type, not {' and '.join(sorted(set(types)))}")
+        if "array" in types:
+            raise self.err("an array can't hold arrays")
+        return max(types, key=lambda t: RANK[t])
+
+    def padded(self, a, n, t=None):
+        """`a`'s slots converted to `t`, padded with zeros to `n`."""
+        t = t or a.type
+        return [self.conv(x, t) for x in a.items] + [self._neutral(t)] * (n - len(a.items))
+
+    def arr(self, v, fn):
+        if v.type != "array":
+            raise self.err(f"{fn}() works on an array, not a {v.type}")
+        return v.const
+
+    def _index(self, a, i):
+        """A Python-style index (negative counts from the end) as a slot number."""
+        if i.is_const and a.length.is_const:
+            return Val("int", i.const + a.length.const if i.const < 0 else i.const)
+        if i.is_const and i.const >= 0:
+            return i
+        return self.select(self.compare("<", i, Val("int", 0)), self.arith("+", i, a.length), i)
+
+    def arr_get(self, a, i):
+        i = self._index(a, self.conv(i, "int"))
+        if i.is_const:
+            if not 0 <= i.const < len(a.items) or (a.length.is_const and i.const >= a.length.const):
+                return self._neutral(a.type)  # VEX: out of range gives 0
+            v = a.items[i.const]
+            return v if a.length.is_const else self.select(self.compare("<", i, a.length), v, self._neutral(a.type))
+        if not a.items:
+            return self._neutral(a.type)
+        valid = self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        picked = self.node("pick", a.type, (i,) + tuple(a.items), dtype=a.type)  # one Index Switch
+        return self.select(valid, picked, self._neutral(a.type))
+
+    def arr_set(self, a, i, v):
+        """a with slot i set to v (growing it when i is the next slot past a constant length)."""
+        t = self.array_type([a.type, v.type])
+        i = self._index(a, self.conv(i, "int"))
+        items = self.padded(a, len(a.items), t)
+        v = self.conv(v, t)
+        if i.is_const:
+            if i.const < 0:
+                raise self.err("array index out of range")
+            if i.const >= len(items):
+                if not a.length.is_const:
+                    raise self.err("setting a value past an array's end needs append() here")
+                items += [self._neutral(t)] * (i.const + 1 - len(items))
+            items[i.const] = v
+            length = a.length
+            if a.length.is_const and i.const >= a.length.const:
+                length = Val("int", i.const + 1)  # VEX grows the array
+            return self.make_arr(t, items, length)
+        return self.make_arr(t, [self.select(self.compare("==", i, Val("int", k)), v, x)
+                                 for k, x in enumerate(items)], a.length)
+
+    def arr_append(self, a, v):
+        t = self.array_type([a.type, v.type])
+        v = self.conv(v, t)
+        items = self.padded(a, len(a.items), t)
+        if a.length.is_const and a.length.const == len(items):
+            return self.make_arr(t, items + [v], Val("int", len(items) + 1))
+        # the length differs per element: every slot might be the next one
+        items = [self.select(self.compare("==", a.length, Val("int", k)), v, x) for k, x in enumerate(items)]
+        cap = len(items)
+        if self.zone_depth and cap >= ARRAY_ZONE_CAP:  # a loop's array has a fixed number of slots
+            return self.make_arr(t, items, self.fn2("MINIMUM", min, self.arith("+", a.length, Val("int", 1)),
+                                                    Val("int", cap)))
+        items.append(self.select(self.compare("==", a.length, Val("int", cap)), v, self._neutral(t)))
+        return self.make_arr(t, items, self.arith("+", a.length, Val("int", 1)))
+
+    def arr_find(self, a, v):
+        """The first used slot equal to v, or -1."""
+        found = Val("int", -1)
+        for k in range(len(a.items) - 1, -1, -1):
+            hit = self.compare("==", a.items[k], v)
+            if not a.length.is_const:
+                hit = self.logic("and", hit, self.compare("<", Val("int", k), a.length))
+            elif k >= a.length.const:
+                continue
+            found = self.select(hit, Val("int", k), found)
+        return found
+
+    def _used(self, a, k):
+        return Val("bool", k < a.length.const) if a.length.is_const else self.compare("<", Val("int", k), a.length)
+
+    def arr_reduce(self, name, a):
+        """sum(), min(), max(), avg() over the used slots."""
+        if a.type not in ("int", "float", "vector", "bool"):
+            raise self.err(f"{name}() of an array of {a.type}s")
+        t = "int" if a.type == "bool" else a.type
+        if name in ("sum", "avg"):
+            total = self._neutral(t)
+            for k, x in enumerate(a.items):
+                total = self.arith("+", total, self.select(self._used(a, k), self.conv(x, t), self._neutral(t)))
+            if name == "sum":
+                return total
+            return self.arith("/", total, self.fn2("MAXIMUM", max, self.conv(a.length, "float"), Val("float", 1.0)))
+        if not a.items:
+            return self._neutral(t)
+        result = self.conv(a.items[0], t)
+        for k, x in enumerate(a.items[1:], 1):
+            better = self.fn2(*MATH2[name], result, self.conv(x, t))
+            result = self.select(self._used(a, k), better, result)
+        return result
+
+    def arr_sort(self, a):
+        """Sorted, small to large (odd-even transposition: one compare-swap per pair per round)."""
+        if a.type not in ("int", "float", "bool"):
+            raise self.err(f"sort() works on numbers, not {a.type}s")
+        vals = list(a.items)
+        used = [self._used(a, k) for k in range(len(vals))]
+        n = len(vals)
+        for rnd in range(n):
+            for k in range(rnd % 2, n - 1, 2):
+                # swap when the right one is used and smaller, or the left one isn't used
+                swap = self.logic("and", used[k + 1], self.logic("or", self.not_(used[k]),
+                                                                 self.compare("<", vals[k + 1], vals[k])))
+                vals[k], vals[k + 1] = self.select(swap, vals[k + 1], vals[k]), self.select(swap, vals[k], vals[k + 1])
+                used[k], used[k + 1] = self.select(swap, used[k + 1], used[k]), self.select(swap, used[k], used[k + 1])
+        return self.make_arr(a.type, vals, a.length)
+
+    def _mutate(self, fn, args, result):
+        """append(a, x) & co. change their first argument, a variable or an @name."""
+        target = args[0]
+        if target.kind not in ("var", "attr", "member", "index"):
+            raise self.err(f"{fn}()'s first argument is the array it changes: give it a variable name")
+        self.assign(target, result)
+
+    def array_call(self, name, args, kw):
+        line = self.line
+        if name == "array":
+            vals = [self.eval(x) for x in args]
+            self.line = line
+            t = self.array_type([v.type for v in vals])
+            return self.make_arr(t, [self.conv(v, t) for v in vals], Val("int", len(vals)))
+        if name in ("neighbours", "primpoints", "pointprims", "nearpoints", "pcfind"):
+            return self.topology_array(name, args, kw)
+        if not args:
+            raise self.err(f"{name}() needs an array")
+        a = self.arr(self.eval(args[0]), name)
+        rest = [self.eval(x) for x in args[1:]]
+        self.line = line
+        need = {"append": 1, "push": 1, "insert": 2, "removeindex": 1, "find": 1, "sort": 0, "reverse": 0,
+                "sum": 0, "isvalidindex": 1, "resize": 1}.get(name)
+        if name == "pop":
+            if len(rest) > 1:
+                raise self.err("pop() takes an array and an optional index")
+            i = self._index(a, self.conv(rest[0], "int")) if rest else self.arith("-", a.length, Val("int", 1))
+            value = self.arr_get(a, i)
+            self._mutate(name, args, self.arr_remove(a, i))
+            return value
+        if len(rest) != need:
+            raise self.err(f"{name}() takes an array" + (f" and {need} more argument(s)" if need else ""))
+        if name in ("append", "push"):
+            self._mutate(name, args, self.arr_append(a, rest[0]))
+            return a.length
+        if name == "insert":
+            self._mutate(name, args, self.arr_insert(a, self._index(a, self.conv(rest[0], "int")), rest[1]))
+            return a.length
+        if name == "removeindex":
+            value = self.arr_get(a, rest[0])
+            self._mutate(name, args, self.arr_remove(a, self._index(a, self.conv(rest[0], "int"))))
+            return value
+        if name == "resize":
+            n = self.conv(rest[0], "int")
+            if not n.is_const or n.const < 0:
+                raise self.err("resize()'s length has to be a constant whole number")
+            items = self.padded(a, max(n.const, len(a.items)))[:n.const] if a.length.is_const else \
+                self.padded(a, max(n.const, len(a.items)))
+            fresh = [self.select(self._used(a, k), x, self._neutral(a.type)) for k, x in enumerate(items)]
+            result = self.make_arr(a.type, fresh[:n.const], n)
+            self._mutate(name, args, result)
+            return n
+        if name == "find":
+            return self.arr_find(a, rest[0])
+        if name == "isvalidindex":
+            i = self.conv(rest[0], "int")
+            return self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        if name == "sum":
+            return self.arr_reduce("sum", a)
+        if name == "sort":
+            return self.arr_sort(a)
+        # reverse
+        if a.length.is_const:
+            return self.make_arr(a.type, list(reversed(a.items[:a.length.const])), a.length)
+        last = self.arith("-", a.length, Val("int", 1))
+        return self.make_arr(a.type, [self.arr_get(a, self.arith("-", last, Val("int", k)))
+                                      for k in range(len(a.items))], a.length)
+
+    def arr_insert(self, a, i, v):
+        t = self.array_type([a.type, v.type])
+        v = self.conv(v, t)
+        items = self.padded(a, len(a.items), t)
+        if i.is_const and a.length.is_const:
+            k = min(max(i.const, 0), a.length.const)
+            return self.make_arr(t, items[:k] + [v] + items[k:a.length.const], Val("int", a.length.const + 1))
+        out = []
+        for k in range(len(items) + 1):
+            before = items[k] if k < len(items) else self._neutral(t)
+            shifted = items[k - 1] if k > 0 else self._neutral(t)
+            out.append(self.select(self.compare("<", Val("int", k), i), before,
+                                   self.select(self.compare("==", Val("int", k), i), v, shifted)))
+        return self.make_arr(t, out, self.arith("+", a.length, Val("int", 1)))
+
+    def arr_remove(self, a, i):
+        if i.is_const and a.length.is_const:
+            if not 0 <= i.const < a.length.const:
+                return Val("array", a)  # VEX: nothing to remove
+            items = list(a.items[:a.length.const])
+            del items[i.const]
+            return self.make_arr(a.type, items, Val("int", a.length.const - 1))
+        out = []
+        for k in range(len(a.items)):
+            nxt = a.items[k + 1] if k + 1 < len(a.items) else self._neutral(a.type)
+            out.append(self.select(self.compare("<", Val("int", k), i), a.items[k], nxt))
+        valid = self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        return self.make_arr(a.type, out, self.select(valid, self.arith("-", a.length, Val("int", 1)), a.length))
+
+    def topology_array(self, name, args, kw):
+        """neighbours() / primpoints() / pointprims() / nearpoints(): arrays from the geometry."""
+        cap = kw.get("max")
+        if cap is not None and (isinstance(cap, str) or not cap.is_const or cap.type != "int" or cap.const < 1):
+            raise self.err(f"{name}()'s max= is a whole number above 0")
+        cap = cap.const if cap is not None else LIST_CAP
+        if name in ("nearpoints", "pcfind"):
+            if name == "pcfind":
+                if len(args) < 2 or args[1].kind != "str" or args[1].value != "P":
+                    raise self.err('pcfind() searches positions: pcfind(0, "P", position, radius, [maxpts])')
+                args = args[:1] + args[2:]
+            if len(args) not in (3, 4):
+                raise self.err(f"{name}() takes an input, a position, a radius and an optional most points")
+            return self.nearpoints(args, cap)
+        if len(args) != 2:
+            raise self.err(f"{name}() takes an input number and an element number")
+        n = self.input_number(self.eval(args[0]), name)
+        elem = self.conv(self.eval(args[1]), "int")
+        if name == "neighbours":
+            count = self.call_val("neighbourcount", Val("int", n), elem)
+            items = [self.call_val("neighbour", Val("int", n), elem, Val("int", k)) for k in range(cap)]
+        elif name == "primpoints":
+            count = self.call_val("primvertexcount", Val("int", n), elem)
+            items = [self.call_val("primpoint", Val("int", n), elem, Val("int", k)) for k in range(cap)]
+        else:  # pointprims: the faces of the point's corners
+            count = self.topology(name, n, "GeometryNodeCornersOfVertex", "Total", "Vertex Index", elem, "POINT")
+            items = []
+            for k in range(cap):
+                corner = self.topology(name, n, "GeometryNodeCornersOfVertex", "Corner Index", "Vertex Index", elem,
+                                       "POINT", [("Sort Index", Val("int", k))])
+                items.append(self.topology(name, n, "GeometryNodeFaceOfCorner", "Face Index", "Corner Index", corner,
+                                           "CORNER"))
+        return self.make_arr("int", items, self.fn2("MINIMUM", min, count, Val("int", cap)))
+
+    def nearpoints(self, args, cap):
+        """The points of an input within a radius, nearest first: a loop over every point
+        keeping the `maxpts` nearest (written in BEX itself, see _NEARPOINTS)."""
+        n = self.input_number(self.eval(args[0]), "nearpoints")
+        pos = self.conv(self.eval(args[1]), "vector")
+        radius = self.conv(self.eval(args[2]), "float")
+        if len(args) == 4:
+            m = self.eval(args[3])
+            if not (m.is_const and m.type == "int" and m.const >= 1):
+                raise self.err("nearpoints()'s maxpts has to be a constant whole number above 0")
+            cap = m.const
+        if cap > 64:
+            raise self.err("nearpoints() keeps at most 64 points")
+        line = self.line
+        self.loop_count += 1
+        tag = f"__np{self.loop_count}_"
+        src = _NEARPOINTS.format(t=tag, n=n, last=cap - 1, minus=", ".join(["-1"] * cap),
+                                 radii=", ".join([tag + "r"] * cap), swaps="".join(
+            _NEARPOINTS_SWAP.format(t=tag, a=k, b=k - 1) for k in range(cap - 1, 0, -1)))
+        stmts = parse(src)
+        _set_lines(stmts, line)
+        self.vars[tag + "q"], self.vars[tag + "r"] = pos, self.arith("*", radius, radius)
+        for st in stmts:
+            self.exec(st)
+        found = self.vars[tag + "idx"]
+        count = self.vars.get(tag + "n", Val("int", 0))
+        for name in [v for v in self.vars if v.startswith(tag)]:
+            self.vars.pop(name)
+            self.loop_only.pop(name, None)
+            self.half_set.pop(name, None)
+        self.line = line
+        a = found.const
+        return self.make_arr("int", a.items, self.fn2("MINIMUM", min, count, Val("int", cap)))
+
+    # -- making and removing elements ----------------------------------------
+    # Each call site is a GeoOp. The builder turns every element where the call ran
+    # into a record point, then, after the writes: adds the new points and
+    # primitives, writes other elements' attributes, and removes elements.
+    # Numbers given back follow Houdini's rule for one call site (in element order)
+    # and continue across call sites in the order the script runs them.
+
+    def geo_mask(self):
+        """Where a call made now runs: the Group, the `if` branches around it, not
+        after a break / continue / return, and where its function was called."""
+        m = self._live()
+        if self.frames:
+            m = self.logic("and", m, self.frames[-1]["live"])
+        for c in self.path:
+            m = self.logic("and", m, c)
+        if self.group_sel is not None:
+            m = self.logic("and", m, self.group_sel)
+        return m
+
+    def geo_number(self, kind, mask):
+        """The number the element's record gets: the next free number, plus how
+        many elements before it made one at this call site."""
+        if kind not in self.geo_counts:
+            self.geo_counts[kind] = self.geo_start(kind)
+        made = self.conv(mask, "int")
+        outs = AGGREGATE_OUTS["GeometryNodeAccumulateField"]
+        acc = lambda out: self.gnode("int", "GeometryNodeAccumulateField", outs, out,  # noqa: E731
+                                     (made, Val("int", 0)), ("Value", "Group ID"),
+                                     props=(("domain", self.domain), ("data_type", "INT")), field=True)
+        base = self.geo_counts[kind]
+        self.geo_counts[kind] = self.arith("+", base, acc(2))
+        return self.arith("+", base, acc(1))
+
+    def geo_start(self, kind):
+        """The first new number: point numbers mean the mesh and point cloud points
+        (curve points only when there are none), like the builder's split_points."""
+        if kind == "point":
+            return self.node("count", "int", (), input=0, domain="POINT", primary=True)
+        return self.count(0, {"poly": "FACE", "polyline": "CURVE", "vertex": "CORNER"}[kind])
+
+    def geo_call(self, fn, args):
+        usage = {
+            "addpoint": "addpoint(0, position) or addpoint(0, point_number)",
+            "addprim": 'addprim(0, "poly", pt0, pt1, pt2...) or addprim(0, "polyline", pt0, pt1...)',
+            "addvertex": "addvertex(0, prim, point)",
+            "removepoint": "removepoint(0, point)", "removeprim": "removeprim(0, prim, 1)",
+            "setpointattrib": 'setpointattrib(0, "name", point, value, "set")',
+            "setprimattrib": 'setprimattrib(0, "name", prim, value, "set")',
+            "setpointgroup": 'setpointgroup(0, "name", point, 1)', "setprimgroup": 'setprimgroup(0, "name", prim, 1)',
+        }
+        if fn == "setdetailattrib":
+            raise self.err("Blender has no detail attributes: store the value on every point (@name = value), "
+                           "or read a statistic with mean() / sumof()")
+        if fn == "setvertexattrib":
+            raise self.err("setvertexattrib() isn't available; run over Corners and write @name instead")
+        if self.zone_depth and (self.zone_depth > 1 or not self.zone_ops):
+            raise self.err(f"{fn}() can't run in a loop inside another loop that becomes a Repeat Zone "
+                           f"(loops of up to {GEO_UNROLL_MAX} passes with a fixed count are fine)")
+        if not args:
+            raise self.err(f"{fn}() takes: {usage[fn]}")
+        geo = self.eval(args[0])
+        if not (geo.is_const and geo.type == "int" and geo.const == 0):
+            raise self.err(f"{fn}()'s first argument is the geometry it changes: 0 (this node's output)")
+        line = self.line
+        mask = self.geo_mask()
+        if mask.is_const and not mask.const:
+            return Val("int", -1)  # never runs
+        if fn == "addpoint":
+            if len(args) != 2:
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            x = self.eval(args[1])
+            if x.type == "vector":
+                values, info = {"pos": x, "src": Val("int", -1)}, {}
+            elif RANK.get(x.type, 9) <= 1:
+                values, info = {"pos": Val("vector", (0.0, 0.0, 0.0)), "src": self.conv(x, "int")}, {}
+            else:
+                raise self.err(f"addpoint() takes a position (a vector) or a point number, not a {x.type}")
+            self.add_geo_op(GeoOp("addpoint", mask, values, info, line))
+            return self.geo_number("point", mask)
+        if fn == "addprim":
+            if len(args) < 2 or args[1].kind != "str" or args[1].value not in PRIM_TYPES:
+                raise self.err(f'addprim()\'s second argument is "poly" or "polyline": {usage[fn]}')
+            ptype = PRIM_TYPES[args[1].value]
+            pts = []  # (point, where it is used): an array gives one corner per used slot
+            for x in args[2:]:
+                v = self.eval(x)
+                if v.type == "array":
+                    a = v.const
+                    pts += [(self.conv(p, "int"), self._used(a, k)) for k, p in enumerate(a.items)]
+                else:
+                    pts.append((self.conv(v, "int"), Val("bool", True)))
+            self.line = line
+            prim = self.geo_number(ptype, mask)
+            for pt, used in pts:
+                m = self.logic("and", mask, used)
+                if m.is_const and not m.const:
+                    continue
+                self.add_geo_op(GeoOp("vertex", m, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
+                                      {"ptype": ptype}, line))
+                self.geo_number("vertex", m)
+            if not prim.is_const:
+                self.prim_kinds[(prim.node, prim.out)] = ptype
+            return prim
+        if fn == "addvertex":
+            if len(args) != 3:
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            prim, pt = self.conv(self.eval(args[1]), "int"), self.conv(self.eval(args[2]), "int")
+            self.line = line
+            ptype = self._prim_kind(prim)
+            made = set(self.prim_kinds.values())
+            if ptype is None and len(made) == 1 and not prim.is_const:  # through an if or a loop: the one kind made
+                ptype = next(iter(made))
+            if ptype is None:
+                raise self.err("addvertex() adds to a primitive this script made with addprim(); when the "
+                               "script makes both polys and polylines, pass addprim()'s number directly")
+            self.add_geo_op(GeoOp("vertex", mask, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
+                                  {"ptype": ptype}, line))
+            return self.geo_number("vertex", mask)
+        if fn in ("removepoint", "removeprim"):
+            if len(args) not in (2, 3):
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            target = self.conv(self.eval(args[1]), "int")
+            flag = self.eval(args[2]) if len(args) == 3 else Val("int", 1)
+            if not flag.is_const:
+                raise self.err(f"{fn}()'s last argument has to be a constant 0 or 1")
+            self.line = line
+            domain = "POINT" if fn == "removepoint" else self._prim_domain(target)
+            mode = "ALL" if fn == "removepoint" or flag.const else "ONLY_FACE"
+            self.add_geo_op(GeoOp("remove", mask, {"target": target}, {"domain": domain, "mode": mode}, line))
+            return Val("int", 0)
+        # set*attrib / set*group
+        group = fn.endswith("group")
+        need = 4 if group else (4, 5)
+        if len(args) not in ((need,) if group else need) or args[1].kind != "str":
+            raise self.err(f"{fn}() takes: {usage[fn]}")
+        name, type = _typed_name(args[1].value)
+        name = ALIASES.get(name, name)
+        target = self.conv(self.eval(args[2]), "int")
+        value = self.eval(args[3])
+        mode = "set"
+        if len(args) == 5:
+            if args[4].kind != "str" or args[4].value not in SET_MODES:
+                raise self.err(f'{fn}()\'s mode is one of {", ".join(repr(m) for m in SET_MODES)}')
+            mode = args[4].value
+        self.line = line
+        if group:
+            type = "bool"
+        elif type is None:
+            type = self.attr_types.get(name) or BUILTINS.get(name, (None,))[0] or KNOWN_TYPES.get(name) or value.type
+        if name in READ_ONLY or name in BUILTINS and name not in ("P",):
+            raise self.err(f"{fn}() can't write @{name}")
+        if mode != "set" and type in ("bool",) + OPAQUE:
+            raise self.err(f'mode "{mode}" needs numbers or vectors, not a {type}')
+        value = self.conv(value, type)
+        if name not in BUILTINS:
+            self.attr_types.setdefault(name, type)  # a later @name reads it with this type
+        domain = "POINT" if fn.startswith("setpoint") else self._prim_domain(target)
+        if name == "P":
+            if domain != "POINT":
+                raise self.err("only points have a position")
+            name = "position"
+        self.add_geo_op(GeoOp("set", mask, {"target": target, "value": value},
+                                  {"domain": domain, "name": name, "type": type, "mode": mode,
+                                   "storage": self.storage.get(name)}, line))
+        return value
+
+    def add_geo_op(self, op):
+        """Program order, or, inside a Repeat Zone, this pass's ops (the zone collects their records)."""
+        (self.zone_ops[-1] if self.zone_depth else self.geo_ops).append(op)
+
+    def _prim_kind(self, prim):
+        return None if prim.is_const else self.prim_kinds.get((prim.node, prim.out))
+
+    def _prim_domain(self, prim):
+        """A primitive number means a curve when running over curves or when addprim() made a polyline."""
+        kind = self._prim_kind(prim)
+        if kind is None and set(self.prim_kinds.values()) == {"polyline"}:
+            kind = "polyline"
+        return "CURVE" if self.domain == "CURVE" or kind == "polyline" else "FACE"
+
+    # -- statistics and other elements -------------------------------------
+    def aggregate(self, name, v, group):
+        """mean(), sumof()...: one value over the whole run-over domain, or per group number."""
+        idname, out = AGGREGATES[name]
+        if v.type in ("bool", "int"):
+            v = self.conv(v, "int" if idname in INT_AGGREGATES else "float")
+        elif v.type not in ("float", "vector"):
+            raise self.err(f"{name}() works on numbers and vectors, not a {v.type}")
+        group = self.conv(group, "int") if group is not None else Val("int", 0)
+        outs = AGGREGATE_OUTS[idname]
+        return self.gnode(v.type, idname, outs, outs.index(out), (v, group), ("Value", "Group ID"),
+                          props=(("domain", self.domain), ("data_type", DATA_TYPES[v.type])), field=True)
+
+    def surface_sample(self, fn, args):
+        """primuv(1, "P", curve, u) along a curve, uvsample(1, "P", "UVMap", uv) on a mesh by UV."""
+        usage = ('primuv(1, "P", curve, u)' if fn == "primuv" else 'uvsample(1, "P", "UVMap", uv)')
+        if len(args) != 4 or args[1].kind != "str" or (fn == "uvsample" and args[2].kind != "str"):
+            raise self.err(f"{fn}() takes an input number, an attribute name in quotes, then: {usage}")
+        n = self.input_number(self.eval(args[0]), fn)
+        name, type = _typed_name(args[1].value)
+        name = ALIASES.get(name, name)
+        if type is None:
+            type = self.input_attr_type(n, name)
+        value = self.read_input(n, name, type)
+        if fn == "primuv":
+            curve, u = self.conv(self.eval(args[2]), "int"), self.eval(args[3])
+            u = self.member(u, 0) if u.type == "vector" else self.conv(u, "float")
+            return self.gnode(type, "GeometryNodeSampleCurve", ("Value", "Position", "Tangent", "Normal"), 0,
+                              (value, u, curve), ("Value", "Factor", "Curve Index"),
+                              props=(("data_type", DATA_TYPES[type]), ("mode", "FACTOR"), ("use_all_curves", False)),
+                              geo=("Curves", n))
+        uvname = ALIASES.get(args[2].value, args[2].value)
+        uvmap = self.read_input(n, uvname, "vector")
+        uv = self.conv(self.eval(args[3]), "vector")
+        return self.gnode(type, "GeometryNodeSampleUVSurface", ("Value", "Is Valid"), 0, (value, uvmap, uv),
+                          ("Value", "UV Map", "Sample UV"), props=(("data_type", DATA_TYPES[type]),), geo=("Mesh", n))
+
+    # -- noise ---------------------------------------------------------------
+    def call_val(self, name, *vals):
+        """A built-in function called with values that are already computed."""
+        return self.call(name, [N("val", self.line, val=v) for v in vals])
+
+    def _opt(self, kw, key, default, type="float"):
+        v = kw.get(key)
+        if isinstance(v, str):
+            raise self.err(f"{key}= takes a number, not text")
+        return self.conv(v, type) if v is not None else Val(type, default)
+
+    def _noise_pos(self, a, kw):
+        """The position (moved by offset=) and, with a second argument, the 4D time."""
+        p = self.conv(a[0], "vector")
+        if "offset" in kw:
+            p = self.arith("+", p, self._opt(kw, "offset", (0.0, 0.0, 0.0), "vector"))
+        if len(a) > 1:
+            return [p, self.conv(a[1], "float")], ["Vector", "W"], "4D"
+        return [p], ["Vector"], "3D"
+
+    def _amp(self, v, kw):
+        if "amp" not in kw:
+            return v
+        amp = kw["amp"]
+        if isinstance(amp, str) or amp.type not in ("int", "float", "vector"):
+            raise self.err("amp= takes a number (or a vector)")
+        return self.arith("*", v, amp)
+
+    def noise_call(self, name, a, kw):
+        """noise() and its family: one Noise Texture. octaves=N is Blender's Detail N - 1."""
+        ins, socks, dims = self._noise_pos(a, kw)
+        octaves = self.arith("-", self._opt(kw, "octaves", 1.0), Val("float", 1.0))
+        ins += [self._opt(kw, "freq", 1.0), octaves, self._opt(kw, "rough", 0.5), self._opt(kw, "lacunarity", 2.0),
+                self._opt(kw, "distortion", 0.0)]
+        socks += ["Scale", "Detail", "Roughness", "Lacunarity", "Distortion"]
+        for key, sock, default in (("ridge", "Offset", 0.0), ("gain", "Gain", 1.0)):
+            if key in KEYWORDS.get(name, ()):  # only the multifractal types have these sockets
+                ins.append(self._opt(kw, key, default))
+                socks.append(sock)
+        if name == "curlnoise":
+            if dims == "3D":
+                ins.insert(1, Val("float", 0.0))
+            return self._amp(self.node("group", "vector", tuple(ins[:7]), name="curl"), kw)
+        vector = name == "vnoise"
+        v = self.gnode("vector" if vector else "float", "ShaderNodeTexNoise", ("Factor", "Color"), int(vector),
+                       ins, socks, props=(("noise_dimensions", dims), ("noise_type", NOISE_FUNCS[name])),
+                       implicit=("Vector",))
+        if name == "snoise":
+            v = self.arith("*", self.arith("-", v, Val("float", 0.5)), Val("float", 2.0))
+        return self._amp(v, kw)
+
+    def _voronoi_node(self, a, kw, feature, out):
+        ins, socks, dims = self._noise_pos(a, kw)
+        octaves = self.arith("-", self._opt(kw, "octaves", 1.0), Val("float", 1.0))
+        ins += [self._opt(kw, "freq", 1.0), octaves, self._opt(kw, "rough", 0.5), self._opt(kw, "lacunarity", 2.0),
+                self._opt(kw, "jitter", 1.0)]
+        socks += ["Scale", "Detail", "Roughness", "Lacunarity", "Randomness"]
+        metric = kw.get("metric", "euclidean")
+        if not isinstance(metric, str) or metric.lower() not in VORONOI_METRICS:
+            raise self.err('metric= is one of "euclidean", "manhattan", "chebyshev", "minkowski"')
+        if VORONOI_METRICS[metric.lower()] == "MINKOWSKI":
+            ins.append(self._opt(kw, "exponent", 0.5))
+            socks.append("Exponent")
+        outs = ("Distance", "Color", "Position", "W", "Radius")
+        type = "float" if out == "Distance" else "vector"
+        return self.gnode(type, "ShaderNodeTexVoronoi", outs, outs.index(out), ins, socks,
+                          props=(("voronoi_dimensions", dims), ("feature", feature),
+                                 ("distance", VORONOI_METRICS[metric.lower()])), implicit=("Vector",))
+
+    def voronoi(self, name, a, kw):
+        feature, out = VORONOI_FUNCS[name]
+        return self._amp(self._voronoi_node(a, kw, feature, out), kw)
+
+    def wnoise(self, args, kw):
+        """VEX's wnoise(p, seed, f1, f2): the nearest distance, filling the out arguments."""
+        if not 1 <= len(args) <= 4:
+            raise self.err("wnoise() takes a position, then optionally variables for seed, f1 and f2")
+        p = [self.eval(args[0])]
+        f1 = self._voronoi_node(p, kw, "F1", "Distance")
+        if len(args) > 1:  # a number per cell, from the cell's random colour
+            cell = self.member(self._voronoi_node(p, kw, "F1", "Color"), 0)
+            self.out_arg("wnoise", args[1], self.conv(self.fn1(*MATH1["floor"], self.arith(
+                "*", cell, Val("float", 16777215.0))), "int"))
+        if len(args) > 2:
+            self.out_arg("wnoise", args[2], self._amp(f1, kw))
+        if len(args) > 3:
+            self.out_arg("wnoise", args[3], self._amp(self._voronoi_node(p, kw, "F2", "Distance"), kw))
+        return self._amp(f1, kw)
+
+    def gabor(self, p, kw):
+        p = self.conv(p, "vector")
+        if "offset" in kw:
+            p = self.arith("+", p, self._opt(kw, "offset", (0.0, 0.0, 0.0), "vector"))
+        ins = [p, self._opt(kw, "freq", 1.0), self._opt(kw, "stripes", 2.0), self._opt(kw, "anisotropy", 1.0),
+               self._opt(kw, "direction", (1.0, 0.0, 0.0), "vector")]
+        v = self.gnode("float", "ShaderNodeTexGabor", ("Value", "Phase", "Intensity"), 0, ins, (0, 1, 2, 3, 5),
+                       props=(("gabor_type", "3D"),), implicit=(0,))
+        return self._amp(v, kw)
+
+    def sample_dir(self, name, a, want):
+        """VEX's sample_*(): turn random numbers 0-1 into evenly spread directions and points."""
+        f = lambda x: Val("float", x)  # noqa: E731
+        mul = lambda x, y: self.arith("*", x, y)  # noqa: E731
+        sqrt, sin, cos = (lambda x: self.fn1(*MATH1["sqrt"], x)), (lambda x: self.fn1(*MATH1["sin"], x)), \
+            (lambda x: self.fn1(*MATH1["cos"], x))
+
+        def around(z, phi):  # the unit vector at height z and angle phi around the Z axis
+            r = sqrt(self.fn2(*MATH2["max"], self.arith("-", f(1.0), mul(z, z)), f(0.0)))
+            return self.combine([mul(r, cos(phi)), mul(r, sin(phi)), z])
+
+        def turned(center, v):  # v with its Z axis turned onto center
+            q = self.call_val("dihedral", Val("vector", (0.0, 0.0, 1.0)), self.conv(center, "vector"))
+            return self.qrotate(q, v)
+
+        if name == "sample_circle_edge_uniform":
+            want(1)
+            phi = mul(self.conv(a[0], "float"), f(math.tau))
+            return self.combine([cos(phi), sin(phi), f(0.0)])
+        if name == "sample_hemisphere":
+            want(1, 2)
+            u = self.conv(a[-1], "vector")
+            v = around(self.member(u, 0), mul(self.member(u, 1), f(math.tau)))
+            return turned(a[0], v) if len(a) == 2 else v
+        if name == "sample_direction_cone":
+            want(3)
+            u = self.conv(a[2], "vector")
+            span = self.arith("-", f(1.0), cos(self.conv(a[1], "float")))
+            v = around(self.arith("-", f(1.0), mul(self.member(u, 0), span)), mul(self.member(u, 1), f(math.tau)))
+            return turned(a[0], v)
+        want(1)
+        u = self.conv(a[0], "vector")
+        if name == "sample_circle_uniform":
+            r, phi = sqrt(self.member(u, 0)), mul(self.member(u, 1), f(math.tau))
+            return self.combine([mul(r, cos(phi)), mul(r, sin(phi)), f(0.0)])
+        d = around(self.arith("-", f(1.0), mul(self.member(u, 0), f(2.0))), mul(self.member(u, 1), f(math.tau)))
+        if name == "sample_direction_uniform":
+            return d
+        return mul(d, self.fn2(*MATH2["pow"], self.member(u, 2), f(1.0 / 3.0)))  # sample_sphere_uniform
 
     def read_opinput(self, n, name, prefix_type):
         if n > MAX_INPUT:
             raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
         self.input_number(Val("int", n), f"@opinput{n}")
-        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or KNOWN_TYPES.get(name, "float")
+        name = ALIASES.get(name, name)
+        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or self.input_attr_type(n, name)
         index = self.read_original("index", "int")
         return self.sample(n, name, type, index, self.domain)
 
-    def channel(self, name, args):
+    def channel(self, name, args, kw=None):
         type = CHANNELS[name]
+        for key, v in (kw or {}).items():
+            if isinstance(v, str) or not v.is_const or v.type not in ("int", "float"):
+                raise self.err(f"{name}()'s {key}= is a constant number")
+        if kw and args and args[0].kind == "str":
+            label = args[0].value.strip()
+            lo, hi = (kw[k].const if k in kw else None for k in ("min", "max"))
+            if lo is not None and hi is not None and lo > hi:
+                raise self.err(f"{name}(): min= is larger than max=")
+            if type == "int":  # an int slider takes whole-number limits
+                lo = math.ceil(lo) if lo is not None else None
+                hi = math.floor(hi) if hi is not None else None
+                if lo is not None and hi is not None and lo > hi:
+                    raise self.err(f"{name}(): there is no whole number between min= and max=")
+            self.limits[label] = (lo, hi)
         if not args or args[0].kind != "str":
             raise self.err(f'{name}() needs a name in quotes, e.g. {name}("amount")')
         label = args[0].value.strip()
@@ -586,6 +2079,12 @@ class Compiler:
             default = self.conv(self.eval(args[1]), type)
             if not default.is_const:
                 raise self.err(f"the default value of {name}() must be a constant")
+        lo, hi = self.limits.get(label, (None, None)) if kw else (None, None)
+        if type in ("int", "float") and (lo is not None or hi is not None):  # keep the default in the range
+            c = default.const
+            c = max(c, lo) if lo is not None else c
+            c = min(c, hi) if hi is not None else c
+            default = Val(type, int(c) if type == "int" else float(c))
         if args[0].line == self.pending_line and label not in self.known_params and label not in self.params:
             if label not in self.pending:
                 self.pending.append(label)
@@ -615,14 +2114,64 @@ class Compiler:
         return self.node("ramp", RAMPS[name], (pos,), name=label)
 
     def call(self, name, arg_nodes):
+        if name in self.funcs:
+            return self.call_user(name, arg_nodes)
+        kw = {}
+        for k in (a for a in arg_nodes if a.kind == "kwarg"):
+            self.line = k.line
+            allowed = KEYWORDS.get(name, ())
+            if not allowed:
+                raise self.err(f"{name}() takes no keyword arguments")
+            if k.name not in allowed:
+                raise self.err(f"{name}() has no option '{k.name}'; it takes {', '.join(n + '=' for n in allowed)}")
+            if k.name in kw:
+                raise self.err(f"{name}() got {k.name}= twice")
+            kw[k.name] = k.value.value if k.value.kind == "str" else self.eval(k.value)
+        arg_nodes = [a for a in arg_nodes if a.kind != "kwarg"]
         if name in CHANNELS:
-            return self.channel(name, arg_nodes)
+            return self.channel(name, arg_nodes, kw)
         if name in RAMPS:
             return self.ramp(name, arg_nodes)
         if name in SAMPLE_FUNCS:
             return self.sample_call(name, arg_nodes)
+        if name in ("xyzdist", "intersect"):
+            return self.query(name, arg_nodes)
+        if name == "wnoise":
+            return self.wnoise(arg_nodes, kw)
+        if name in ("primuv", "uvsample"):
+            return self.surface_sample(name, arg_nodes)
+        if name in GEO_FUNCS:
+            return self.geo_call(name, arg_nodes)
+        if name in ARRAY_FUNCS:
+            return self.array_call(name, arg_nodes, kw)
+        if name == "setcomp":  # setcomp(v, value, i, [j]): v[i] = value, v[i][j] = value
+            if len(arg_nodes) not in (3, 4) or arg_nodes[0].kind not in ("var", "attr"):
+                raise self.err("setcomp() takes a variable, a value and one or two constant indexes")
+            target = arg_nodes[0]
+            for i in arg_nodes[2:]:
+                k = self.eval(i)
+                if not (k.is_const and k.type == "int"):
+                    raise self.err("setcomp()'s indexes have to be whole-number constants")
+                target = N("member", i.line, obj=target, comp=k.const)
+            val = self.eval(arg_nodes[1])
+            self.assign(target, val)
+            return val
+        if name == "promote":
+            if len(arg_nodes) != 2 or arg_nodes[1].kind != "str" or arg_nodes[1].value.lower() not in DOMAIN_NAMES:
+                raise self.err('promote() takes a value and a domain in quotes: "point", "edge", "face", '
+                               '"corner", "curve" or "instance"')
+            v = self.eval(arg_nodes[0])
+            if v.type == "row":
+                self.conv(v, "float")  # explains m[i][j]
+            return self.gnode(v.type, "GeometryNodeFieldOnDomain", ("Value",), 0, (v,), ("Value",),
+                              props=(("domain", DOMAIN_NAMES[arg_nodes[1].value.lower()]),
+                                     ("data_type", DATA_TYPES[v.type])), field=True)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
+        if name != "getcomp":
+            for x in a:
+                if x.type == "row":
+                    self.conv(x, "float")  # explains m[i][j]
 
         def want(*counts):
             if len(a) not in counts:
@@ -634,6 +2183,58 @@ class Compiler:
 
         if name == "range":
             raise self.err("range() can only be used in a for-loop: for i in range(8):")
+        if name == "$pick":  # for x in (a, b, c): the item for this pass
+            i = self.conv(a[-1], "int")
+            if i.is_const:
+                return a[i.const]
+            result = a[0]
+            for c in range(1, len(a) - 1):
+                result = self.select(self.compare("==", i, Val("int", c)), a[c], result)
+            return result
+        if name == "$len" and a[0].type == "array":
+            return a[0].const.length
+        if name == "$len":
+            if a[0].type not in SIZES:
+                raise self.err(f"a for loop goes over range(), (a, b, c) or a vector's components, not a {a[0].type}")
+            return Val("int", SIZES[a[0].type])
+        if name in ("min", "max", "avg") and len(a) == 1 and a[0].type == "array":
+            return self.arr_reduce(name, a[0].const)
+        if name in ("min", "max") and len(a) != 2:  # min(a, b, c...), or of one vector's components
+            if len(a) == 1 and a[0].type == "vector":
+                a = [self.member(a[0], i) for i in range(3)]
+            if len(a) < 2:
+                raise BexError(f"{name}() takes two or more values, or one vector", line)
+            result = a[0]
+            for x in a[1:]:
+                result = self.fn2(*MATH2[name], result, x)
+            return result
+        if name == "getcomp":
+            want(2, 3)
+            idx = [x for x in a[1:]]
+            if not all(i.is_const and i.type == "int" for i in idx):
+                raise BexError("getcomp()'s indexes have to be whole-number constants", line)
+            v = a[0]
+            for i in idx:
+                v = self.member(v, i.const)
+            return self.conv(v, "float")
+        if name in ("isnan", "isfinite"):
+            want(1)
+            x = self.conv(a[0], "float")
+            if x.is_const:
+                return Val("bool", math.isnan(x.const) if name == "isnan" else math.isfinite(x.const))
+            nan = self.not_(self.node("compare", "bool", (x, x), op="EQUAL", dtype="FLOAT"))  # NaN never equals itself
+            if name == "isnan":
+                return nan
+            big = self.node("compare", "bool", (self.fn1("ABSOLUTE", abs, x), Val("float", 3.4e38)),
+                            op="LESS_THAN", dtype="FLOAT")
+            return big  # NaN compares false too
+        if name == "len" and len(a) == 1 and a[0].type == "array":
+            return a[0].const.length
+        if name == "len":
+            want(1)
+            if a[0].type not in SIZES:
+                raise BexError(f"len() of a {a[0].type}: only vectors and quaternions have components", line)
+            return Val("int", SIZES[a[0].type])
         if name in MATH1:
             want(1)
             return self.fn1(*MATH1[name], a[0])
@@ -650,8 +2251,12 @@ class Compiler:
                 return self.fn2("MINIMUM", min, self.fn2("MAXIMUM", max, a[0], a[1]), a[2])
             x, lo, hi = floats()
             return self.fold("float", lambda v, l, h: min(max(v, l), h), x, lo, hi) or self.node("clamp", "float", (x, lo, hi))
+        if name in TRANSFORM_FUNCS:
+            return self.transform_call(name, a, arg_nodes, want)
         if name in ("lerp", "mix"):
             want(3)
+            if "quaternion" in (a[0].type, a[1].type):
+                return self.transform_call("slerp", a, arg_nodes, want)
             t = "vector" if "vector" in (a[0].type, a[1].type) else "float"
             x, y, f = self.conv(a[0], t), self.conv(a[1], t), self.conv(a[2], "float")
             return self.node("mix", t, (f, x, y), dtype=t)
@@ -685,10 +2290,78 @@ class Compiler:
             want(2)
             n = self.input_number(a[0], name)
             return self.node("nearest", "int", (self.conv(a[1], "vector"),), input=n, domain="POINT")
+        if name == "minpos":
+            want(2)
+            return self.proximity(self.input_number(a[0], name), self.conv(a[1], "vector"), 0)
+        if name in TOPOLOGY:
+            want(2)
+            idname, output, sock, domain = TOPOLOGY[name]
+            return self.topology(name, self.input_number(a[0], name), idname, output, sock, a[1], domain)
+        if name == "primpoint":
+            want(3)
+            n = self.input_number(a[0], name)
+            corner = self.topology(name, n, "GeometryNodeCornersOfFace", "Corner Index", "Face Index", a[1], "FACE",
+                                   [("Sort Index", a[2])])
+            return self.topology(name, n, "GeometryNodeVertexOfCorner", "Vertex Index", "Corner Index", corner,
+                                 "CORNER")
+        if name == "neighbour":
+            want(3)
+            n = self.input_number(a[0], name)
+            edge = self.topology(name, n, "GeometryNodeEdgesOfVertex", "Edge Index", "Vertex Index", a[1], "POINT",
+                                 [("Sort Index", a[2])])
+            outs = NODE_OUTS["GeometryNodeInputMeshEdgeVertices"]
+            ends = [self.node("sample", "int", (self.gnode("int", "GeometryNodeInputMeshEdgeVertices", outs, i, src=n),
+                                                edge), input=n, domain="EDGE", dtype="int") for i in (0, 1)]
+            return self.select(self.compare("==", ends[0], self.conv(a[1], "int")), ends[1], ends[0])
+        if name in ("reflect", "faceforward"):
+            want(2)
+            v, w = self.conv(a[0], "vector"), self.conv(a[1], "vector")
+            if name == "reflect":
+                return self.node("vmath", "vector", (v, w), op="REFLECT")
+            return self.node("vmath", "vector", (v, w, v), op="FACEFORWARD")  # flips v when dot(v, w) > 0
+        if name == "refract":
+            want(3)
+            v, w, ior = self.conv(a[0], "vector"), self.conv(a[1], "vector"), self.conv(a[2], "float")
+            return self.node("vmath", "vector", (v, w, ior), op="REFRACT")
+        if name in ("length2", "distance2"):
+            want(1 if name == "length2" else 2)
+            v = self.conv(a[0], "vector")
+            if name == "distance2":
+                v = self.arith("-", v, self.conv(a[1], "vector"))
+            if v.is_const:
+                return Val("float", sum(c * c for c in v.const))
+            return self.node("vmath", "float", (v, v), op="DOT_PRODUCT")
+        if name == "avg":
+            if not a:
+                raise BexError("avg() needs at least one value", line)
+            if len(a) == 1 and a[0].type == "vector":
+                a = [self.member(a[0], i) for i in range(3)]
+            total = a[0]
+            for x in a[1:]:
+                total = self.arith("+", total, x)
+            return self.arith("/", total, Val("float", float(len(a))))
+        if name == "invlerp":
+            want(3)
+            return self.map_range([a[0], a[1], a[2], Val("float", 0.0), Val("float", 1.0)], "LINEAR", clamp=False)
+        if name in COLOR_MODES:
+            want(1)
+            return self.color(name, self.conv(a[0], "vector"))
+        if name == "luminance":
+            want(1)
+            v = self.conv(a[0], "vector")
+            if v.is_const:
+                return Val("float", sum(c * w for c, w in zip(v.const, LUMINANCE)))
+            return self.node("vmath", "float", (v, Val("vector", LUMINANCE)), op="DOT_PRODUCT")
+        if name == "blackbody":
+            want(1, 2)
+            c = self.gnode("vector", "ShaderNodeBlackbody", ("Color",), 0, (self.conv(a[0], "float"),), ("Temperature",))
+            return self.arith("*", c, a[1]) if len(a) == 2 else c
         if name in BBOX:
             return self.bbox(name, a, want)
         if name in ("length", "normalize"):
             want(1)
+            if name == "normalize" and a[0].type == "quaternion":
+                return a[0]  # Blender's rotations are always unit quaternions
             v = self.conv(a[0], "vector")
             return self.node("vmath", "float" if name == "length" else "vector", (v,), op=name.upper())
         if name in ("dot", "cross", "distance"):
@@ -697,7 +2370,7 @@ class Compiler:
             op = {"dot": "DOT_PRODUCT", "cross": "CROSS_PRODUCT", "distance": "DISTANCE"}[name]
             return self.node("vmath", "vector" if name == "cross" else "float", (v, w), op=op)
         if name == "set" or (name == "vector" and len(a) == 3):
-            want(3)
+            want(3, 4) if name == "set" else want(3)
             return self.combine(a)
         if name == "vector":
             want(1, 3)
@@ -713,10 +2386,54 @@ class Compiler:
             if a[0].type == "float" and not a[0].is_const:
                 return self.conv(self.node("math", "float", (a[0],), op="TRUNC"), "int")
             return self.conv(a[0], "int")
-        if name in ("noise", "vnoise"):
+        if name in AGGREGATES:
+            want(1, 2)
+            return self.aggregate(name, a[0], a[1] if len(a) == 2 else None)
+        if name == "countof":
+            want(0, 1)
+            return self.aggregate("sumof", Val("int", 1), a[0] if a else None)
+        if name == "blur":
+            want(1, 2, 3)
+            if a[0].type in OPAQUE or a[0].type == "row":
+                raise BexError(f"blur() works on numbers and vectors, not a {a[0].type}", line)
+            v = a[0] if a[0].type in ("float", "int", "vector") else self.conv(a[0], "int")
+            its = self.conv(a[1], "int") if len(a) > 1 else Val("int", 1)
+            weight = self.conv(a[2], "float") if len(a) > 2 else Val("float", 1.0)
+            return self.gnode(v.type, "GeometryNodeBlurAttribute", ("Value",), 0, (v, its, weight),
+                              ("Value", "Iterations", "Weight"), props=(("data_type", DATA_TYPES[v.type]),), field=True)
+        if name == "at":
+            want(2)
+            v = a[0]
+            return self.gnode(v.type, "GeometryNodeFieldAtIndex", ("Value",), 0, (v, self.conv(a[1], "int")),
+                              ("Value", "Index"), props=(("domain", self.domain), ("data_type", DATA_TYPES[v.type])),
+                              field=True)
+        if name in NOISE_FUNCS or name == "curlnoise":
+            want(2) if name == "flownoise" else want(1, 2)
+            return self.noise_call(name, a, kw)
+        if name in VORONOI_FUNCS:
+            want(1, 2)
+            return self.voronoi(name, a, kw)
+        if name == "gabor":
             want(1)
-            p = self.conv(a[0], "vector")
-            return self.node("noise", "float", (p,)) if name == "noise" else self.node("noise", "vector", (p,), out=1)
+            return self.gabor(a[0], kw)
+        if name in SAMPLE_DIRS:
+            return self.sample_dir(name, a, want)
+        if name == "nrandom":
+            want(1)
+            u = self.call_val("vrand", a[0])
+            r = self.fn1(*MATH1["sqrt"], self.arith("*", Val("float", -2.0), self.fn2(
+                "LOGARITHM", math.log, self.fn2(*MATH2["max"], self.member(u, 0), Val("float", 1e-7)),
+                Val("float", math.e))))
+            return self.arith("*", r, self.fn1(*MATH1["cos"], self.arith("*", self.member(u, 1), Val("float", math.tau))))
+        if name in ("rand", "vrand") and len(a) == 2:  # two seeds: 2D (two numbers) or 4D (a vector and a number)
+            if a[0].type == "vector":
+                ins, socks, dims = (a[0], self.conv(a[1], "float")), ("Vector", "W"), "4D"
+            else:
+                ins, socks, dims = (self.combine([self.conv(a[0], "float"), self.conv(a[1], "float"),
+                                                  Val("float", 0.0)]),), ("Vector",), "2D"
+            return self.gnode("float" if name == "rand" else "vector", "ShaderNodeTexWhiteNoise", ("Value", "Color"),
+                              int(name == "vrand"), ins, socks, props=(("noise_dimensions", dims),),
+                              implicit=("Vector",))
         if name in ("rand", "vrand"):
             want(1)
             if a[0].type == "vector":
@@ -729,6 +2446,12 @@ class Compiler:
         raise BexError(f"unknown function '{name}()'", line)
 
     # -- attributes and variables -----------------------------------------
+    def note_storage(self, e):
+        """`u@name`: a vector kept as a 2D vector attribute."""
+        storage = getattr(e, "storage", None)
+        if storage:
+            self.storage[e.name] = storage
+
     def attr_type(self, name, prefix_type):
         known = self.attr_types.get(name)
         builtin = BUILTINS.get(name)
@@ -747,6 +2470,13 @@ class Compiler:
             if found is None:
                 raise self.err(INDEX_HINTS[name].format(d=self.domain.lower() + "s"))
             return self.node("input", "int", (), out=found[1], name=found[0])
+        if self.domain == "INSTANCE" and name in INSTANCE_ATTRS:
+            return self.node("input", INSTANCE_ATTRS[name][0], (), out=0, name=INSTANCE_ATTRS[name][1])
+        if name == "TimeInc":  # seconds / frame; at frame 0 assume 24 frames a second
+            seconds, frame = self.node("input", "float", (), out=0, name="time"), \
+                self.node("input", "float", (), out=1, name="time")
+            return self.select(self.compare("==", frame, Val("float", 0.0)), Val("float", 1 / 24),
+                               self.arith("/", seconds, frame))
         if name in BUILTINS:
             _, kind, out = BUILTINS[name]
             return self.node("input", type, (), out=out, name=kind)
@@ -754,6 +2484,8 @@ class Compiler:
 
     def read_attr(self, name, type):
         val = self.attrs.get(name)
+        for deps in self.reading:  # a closure being built depends on this attribute's value
+            deps.append(("attr", name, val))
         if val is not None:
             return val
         if (name, type) not in self.reads:
@@ -764,36 +2496,234 @@ class Compiler:
         val = self.vars.get(name)
         if val is not None:
             return val
+        if self.frames and name in self.frames[0]["globals"]:  # inside a function: the script's variables
+            val = self.frames[0]["globals"][name]
+            for deps in self.reading:
+                deps.append(("var", name, val))
+            return val
         if name in CONSTANTS:
-            return Val("float", CONSTANTS[name])
+            c = CONSTANTS[name]
+            return Val("int" if isinstance(c, int) else "float", c)
         if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
+            name = ALIASES.get(name, name)
             return self.read_attr(name, self.attr_type(name, None))
+        if name in self.loop_only:
+            raise self.err(f"'{name}' is only set inside the loop on line {self.loop_only[name]}; "
+                           f"give it a value before the loop")
         if name in self.half_set:
             raise self.err(f"'{name}' is only set in one branch of the if on line {self.half_set[name]}; "
                            f"give it a value before the if")
         raise self.err(f"unknown variable '{name}' (give it a value first, e.g. {name} = 0)")
 
+    def component_index(self, e, n):
+        """`v[i]`: the component number (0 to n - 1) as an int Val; negative counts from the end."""
+        i = self.conv(self.eval(e.index), "int")
+        self.line = e.line
+        if i.is_const:
+            if not -n <= i.const < n:
+                raise self.err(f"component index must be 0 to {n - 1} (or negative, from the end)")
+            return Val("int", i.const % n)
+        return self.arith("%", i, Val("int", n))
+
     def assign(self, target, val):
+        if target.kind in ("index", "member"):
+            cur = self.eval(target.obj)
+            if cur.type == "array":  # a[i] = value
+                i = Val("int", target.comp) if target.kind == "member" else self.conv(self.eval(target.index), "int")
+                return self.assign(target.obj, self.arr_set(cur.const, i, val))
+        if target.kind == "index":
+            cur = self.eval(target.obj)
+            if cur.type in ("matrix", "row"):
+                raise self.err("a matrix's indexes have to be constant numbers: m[3][0] = value")
+            n = self.size(cur)
+            i = self.component_index(target, n)
+            if i.is_const:
+                return self.assign(N("member", target.line, obj=target.obj, comp=i.const), val)
+            val = self.conv(val, "float")
+            comps = [self.select(self.compare("==", i, Val("int", c)), val, self.member(cur, c)) for c in range(n)]
+            return self.assign(target.obj, self.combine(comps))
         if target.kind == "member":
             cur = self.eval(target.obj)
-            comps = [self.member(cur, i) for i in range(3)]
-            comps[target.comp] = self.conv(val, "float")
+            self.line = target.line
+            if cur.type == "row":  # m[i][j] = x
+                m, r = cur.const
+                self.member(cur, target.comp)
+                elems = [self.member(Val("row", (m, k // 4)), k % 4) for k in range(16)]
+                elems[r * 4 + target.comp % 4] = self.conv(val, "float")
+                return self.assign(target.obj.obj, self.combine_matrix(elems))
+            if cur.type == "matrix":
+                raise self.err("m[i] is a row of a matrix: set one element with m[i][j] = value")
+            comps = [self.member(cur, i) for i in range(self.size(cur))]
+            self.member(cur, target.comp)  # checks the component exists
+            comps[target.comp % len(comps)] = self.conv(val, "float")
             return self.assign(target.obj, self.combine(comps))
+        live = self._live()
+        for c in self.expr_conds:  # inside `a if c else b`: only where this branch is picked
+            live = self.logic("and", live, c)
         if target.kind == "var":
+            old = self.vars.get(target.name)
+            if old is not None and not (live.is_const and live.const):
+                val = self.select(live, val, old)  # after a break / continue: keep the old value
             self.vars[target.name] = val
             self.half_set.pop(target.name, None)
+            self.loop_only.pop(target.name, None)
             return
         name = target.name
+        self.note_storage(target)
         if OPINPUT_RE.match(name):
             raise self.err(f"@{name} reads another input, it cannot be written")
+        fresh = not target.type and name not in self.attr_types and name not in KNOWN_TYPES and name not in BUILTINS
         type = self.attr_type(name, target.type)
+        if val.type == "array":
+            a = val.const
+            if not (type in SIZES and a.length.is_const and a.length.const == len(a.items) == SIZES[type]):
+                raise self.err(f"@{name}: Blender has no array attributes; store one value (a[i]) or keep the "
+                               f"array in a variable")
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
-        if name == "P" and self.domain != "POINT":
-            raise self.err("@P can only be written when the wrangle runs over Points")
-        self.attrs[name] = self.conv(val, type)
+        if name == "P" and self.domain not in ("POINT", "INSTANCE"):
+            raise self.err("@P can only be written when the wrangle runs over Points (or Instances)")
+        if name == "N" and self.domain not in ("POINT", "FACE", "CORNER"):
+            raise self.err("@N (custom normals) can be written on Points, Faces or Corners")
+        if fresh and val.type != type and val.type in PREFIXES:  # @a = @P: a new attribute is a float
+            raise self.err(f"@{name} is a {type}; write {PREFIXES[val.type]}@{name} to store a {val.type}")
+        val = self.conv(val, type)
+        if self.frames:  # inside a call: only where the call itself runs
+            live = self.logic("and", live, self.frames[-1]["live"])
+        if not (live.is_const and live.const):
+            val = self.select(live, val, self.attrs.get(name) or self.read_original(name, type))
+        self.attrs[name] = val
         if name not in self.written:
             self.written.append(name)
+
+    # -- the script's own functions ---------------------------------------------
+    # A call runs the function's body right there (inlined), in its own variables,
+    # reading the script's variables as they are at the call. `return` sets the
+    # hidden `$ret` / `$returned` variables like `break` sets its flag, so an early
+    # return under a per-element `if` works. Recursion works when it ends while
+    # compiling (its condition is known then).
+
+    def call_user(self, name, arg_nodes, want_value=True, multi=False):
+        d = self.funcs[name]
+        line = self.line
+        values = self._bind_args(d, name, arg_nodes)
+        self.line = line
+        self.calls += 1
+        if self.calls > MAX_CALLS:
+            raise self.err(f"more than {MAX_CALLS} function calls (a recursion that grows too fast?)")
+        if len(self.frames) >= MAX_CALL_DEPTH:
+            raise self.err(f"{name}() calls itself too deeply: recursion has to end while compiling, so its "
+                           f"condition can't depend on attributes or inputs (use a while loop instead)")
+        args = [values[p] for p, _ in d.params]
+        # one closure per argument types, and per which arguments differ per element
+        key = (name, tuple(v.type for v in args), tuple(_is_field(v) for v in args))
+        recursive = any(f["name"] == name for f in self.frames)
+        if want_value and not multi and not recursive and not all(v.is_const for v in args) \
+                and not any(v.type == "array" for v in args):  # a Closure can't carry an array: inline
+            self.call_counts[key] = self.call_counts.get(key, 0) + 1
+            if key in self.closure_keys:
+                out = self._find_closure(d, key)
+                if out is not None:
+                    self.line = line
+                    return self.node("closure_call", out.params["ret"], tuple(args), closure=out)
+        live = self._live() if not self.frames else self.logic("and", self._live(), self.frames[-1]["live"])
+        result, returned, has_value = self._run_body(d, values, live)
+        self.line = line
+        if not want_value:
+            return None
+        result = self._result(d, name, result, returned, has_value)
+        if isinstance(result, list) != multi:
+            raise self.err(f"{name}() returns {len(result)} values: unpack them, e.g. a, b = {name}(...)"
+                           if isinstance(result, list) else f"{name}() returns one value, not several")
+        return result
+
+    def _bind_args(self, d, name, arg_nodes):
+        names = [p for p, _ in d.params]
+        pos = [a for a in arg_nodes if a.kind != "kwarg"]
+        if len(pos) > len(names):
+            raise self.err(f"{name}() takes {len(names)} argument{'s' * (len(names) != 1)}, got {len(pos)}")
+        values = {p: self.eval(a) for p, a in zip(names, pos)}
+        for a in arg_nodes:
+            if a.kind == "kwarg":
+                self.line = a.line
+                if a.name not in names:
+                    raise self.err(f"{name}() has no parameter '{a.name}'")
+                if a.name in values:
+                    raise self.err(f"{name}() got two values for '{a.name}'")
+                values[a.name] = self.eval(a.value)
+        for p, default in d.params:
+            if p not in values:
+                if default is None:
+                    raise self.err(f"{name}() is missing the argument '{p}'")
+                caller = self.vars
+                if self.frames:  # a default sees the script's variables, not the caller's
+                    self.vars = self.frames[0]["globals"]
+                values[p] = self.eval(default)
+                self.vars = caller
+        return values
+
+    def _run_body(self, d, values, live):
+        """Run a function body in its own variables: (return value, $returned, returns a value)."""
+        caller = (self.vars, self.loops, self.half_set, self.loop_only)
+        self.frames.append({"name": d.name, "live": live, "value": False,
+                            "globals": self.frames[0]["globals"] if self.frames else self.vars})
+        self.vars = dict(values, **{"$returned": Val("bool", False), "$ret": NOT_RETURNED})
+        arity = _tuple_arity(d.body)
+        for n in range(arity):  # return a, b: one hidden variable per value
+            self.vars[f"$ret{n}"] = NOT_RETURNED
+        self.loops, self.half_set, self.loop_only = [], {}, {}
+        self.exec(d.body)
+        result, returned = self.vars["$ret"], self.vars["$returned"]
+        if arity:
+            result = [self.vars[f"$ret{n}"] for n in range(arity)]
+        frame = self.frames.pop()
+        self.vars, self.loops, self.half_set, self.loop_only = caller
+        return result, returned, frame["value"]
+
+    def _result(self, d, name, result, returned, has_value):
+        if not has_value:
+            raise self.err(f"{name}() doesn't return a value")
+        if not (returned.is_const and returned.const) and not _always_returns(d.body):
+            raise self.err(f"{name}() doesn't return a value on every path (add a return at the end)")
+        return result
+
+    def _find_closure(self, d, key):
+        """A closure for this call: one built before whose body read the same
+        script variables and attribute values as they are now, else a new one.
+        None: the function has to be inlined."""
+        for deps, out in self.closures.get(key, []):
+            if all((self.frames[0]["globals"] if self.frames else self.vars).get(n) is v if kind == "var"
+                   else self.attrs.get(n) is v for kind, n, v in deps):
+                return out
+        deps, out = self._closure(d, key)
+        if deps is None:  # can't be a closure: inline every call of it
+            return None
+        self.closures.setdefault(key, []).append((deps, out))
+        return out
+
+    def _closure(self, d, key):
+        """Build the function body once, in a Closure zone, for these argument
+        types: (what it read from outside, closure_out IRNode), or (None, None)
+        when it has to be inlined (it writes attributes or runs a chunked loop,
+        which need the geometry)."""
+        name, types, fields = key
+        if self._makes_geometry(d.body):  # its records need the geometry: inline every call
+            return None, None
+        line = self.line
+        saved = self._snapshot()
+        zone_in = IRNode("closure_in", {"items": types, "fields": fields}, (), d.line)
+        values = {p: Val(t, node=zone_in, out=k) for k, ((p, _), t) in enumerate(zip(d.params, types))}
+        self.reading.append([])
+        result, returned, has_value = self._run_body(d, values, Val("bool", True))
+        deps = self.reading.pop()
+        self.line = line
+        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]) or isinstance(result, list) \
+                or len(self.geo_ops) != len(saved["geo_ops"]) or result.type == "array":
+            self._restore(saved)
+            return None, None
+        result = self._result(d, name, result, returned, has_value)
+        return deps, IRNode("closure_out", {"input": zone_in, "items": types, "ret": result.type, "name": name},
+                            (result,), d.line)
 
     # -- evaluation --------------------------------------------------------
     def eval(self, e):
@@ -803,6 +2733,16 @@ class Compiler:
             return Val("int" if isinstance(e.value, int) else "float", e.value)
         if k == "bool":
             return Val("bool", e.value)
+        if k == "val":  # an already computed value, see call_val()
+            return e.val
+        if k == "tuple":
+            raise self.err("several values in brackets are only for: x in (a, b), for x in (a, b), a, b = ... "
+                           "(a vector needs three components: (x, y, z); a quaternion four)")
+        if k == "swizzle":  # v.zyx; two components give a vector with z = 0
+            v = self.eval(e.obj)
+            self.line = e.line
+            comps = [self.member(v, c) for c in e.comps]
+            return self.combine(comps + [Val("float", 0.0)] * (len(comps) == 2))
         if k == "str":
             raise self.err("text can only be used as a name inside chf(), chi(), chv() or chb()")
         if k == "var":
@@ -813,43 +2753,109 @@ class Compiler:
                 return self.read_opinput(int(m.group(1)), m.group(2), e.type)
             if e.name in COUNT_ATTRS:
                 return self.count(0, COUNT_ATTRS[e.name])
+            self.note_storage(e)
             return self.read_attr(e.name, self.attr_type(e.name, e.type))
         if k == "member":
             v = self.eval(e.obj)
             self.line = e.line
             return self.member(v, e.comp)
+        if k == "index":
+            v = self.eval(e.obj)
+            if v.type == "array":
+                i = self.conv(self.eval(e.index), "int")
+                self.line = e.line
+                return self.arr_get(v.const, i)
+            if v.type in ("matrix", "row"):
+                raise self.err("a matrix's indexes have to be constant numbers: m[3][0]")
+            n = self.size(v)
+            i = self.component_index(e, n)
+            if i.is_const:
+                return self.member(v, i.const)
+            comps = [self.member(v, c) for c in range(n)]
+            result = comps[0]
+            for c in range(1, n):
+                result = self.select(self.compare("==", i, Val("int", c)), comps[c], result)
+            return result
         if k == "call":
             return self.call(e.name, e.args)
         if k == "unop":
             a = self.eval(e.a)
             self.line = e.line
             if e.op == "-":
-                return self.negate(a)  # else: not
-            a = self.conv(a, "bool")
-            return Val("bool", not a.const) if a.is_const else self.node("bmath", "bool", (a,), op="NOT")
+                return self.negate(a)
+            if e.op == "~":
+                return self.bitop("~", a, a)
+            return self.not_(a)
         if k == "ternary":
             cond = self.conv(self.eval(e.cond), "bool")
-            a, b = self.eval(e.a), self.eval(e.b)
+            a = self._eval_where(e.a, cond)  # addpoint() in a branch only runs where it is picked
+            b = self._eval_where(e.b, self.not_(cond))
             self.line = e.line
             return self.select(cond, a, b)
+        if k == "binop" and e.op in ("in", "not in") and e.b.kind not in ("tuple", "call"):
+            seq = self.eval(e.b)
+            if seq.type == "array":  # x in a: any used slot equals x
+                a = self.eval(e.a)
+                found = self.compare(">=", self.arr_find(seq.const, a), Val("int", 0))
+                return self.not_(found) if e.op == "not in" else found
+        if k == "binop" and e.op in ("in", "not in"):
+            a = self.eval(e.a)
+            items = self.items(e.b)
+            self.line = e.line
+            found = Val("bool", False)
+            for item in items:
+                found = self.logic("or", found, self.compare("==", a, item))
+            return self.not_(found) if e.op == "not in" else found
+        if k == "binop" and e.op in ("and", "or"):  # b runs only where a doesn't decide
+            a = self.eval(e.a)
+            ca = self.conv(a, "bool")
+            b = self._eval_where(e.b, ca if e.op == "and" else self.not_(ca))
+            self.line = e.line
+            return self.logic(e.op, a, b)
         if k == "binop":
             a, b = self.eval(e.a), self.eval(e.b)
             self.line = e.line
-            if e.op in ARITH:
+            if e.op in ARITH or e.op in ("&", "|", "^", "<<", ">>"):
                 return self.arith(e.op, a, b)
             if e.op in COMPARE:
                 return self.compare(e.op, a, b)
             return self.logic(e.op, a, b)
         raise self.err(f"cannot evaluate {k}")
 
+    def _eval_where(self, e, cond):
+        """eval(e) as if inside `if cond:`: calls in it that make elements or write
+        attributes (a function's, or an out argument) only act where `cond` holds."""
+        self.path.append(cond)
+        self.expr_conds.append(cond)
+        try:
+            return self.eval(e)
+        finally:
+            self.path.pop()
+            self.expr_conds.pop()
+
     def exec(self, s):
         self.line = s.line
         k = s.kind
+        if k != "def":
+            live = self._live()
+            if live.is_const and not live.const:  # after a constant break / continue / return
+                return
         if k in ("assign", "expr"):
             self.stmt_line = s.line
         if k == "block":
             for child in s.body:
                 self.exec(child)
+        elif k == "assign" and s.target.kind == "tuple":  # a, b = b, a: every value first, then the targets
+            n = len(s.target.items)
+            if s.value.kind == "call" and s.value.name in self.funcs:
+                vals = self.call_user(s.value.name, s.value.args, multi=True)
+            else:
+                vals = self.items(s.value)
+            self.line = s.line
+            if len(vals) != n:
+                raise self.err(f"{n} names but {len(vals)} values")
+            for t, v in zip(s.target.items, vals):
+                self.assign(t, v)
         elif k == "assign":
             val = self.eval(s.value)
             if s.op != "=":
@@ -859,13 +2865,47 @@ class Compiler:
                 val = self.conv(val, s.annot)
             self.assign(s.target, val)
         elif k == "expr":
-            self.eval(s.expr)
+            if s.expr.kind == "call" and s.expr.name in self.funcs:
+                self.call_user(s.expr.name, s.expr.args, want_value=False)
+            else:
+                self.eval(s.expr)
         elif k == "if":
             self.exec_if(s)
         elif k == "for":
             self.exec_for(s)
         elif k == "while":
             self.exec_while(s)
+        elif k in ("break", "continue"):
+            self.stmt_line = s.line
+            if not self.loops:
+                raise self.err(f"'{k}' can only be used inside a loop")
+            brk, cont = self.loops[-1]
+            self._raise_flags(brk if k == "break" else cont)
+        elif k == "return":
+            self.stmt_line = s.line
+            if not self.frames:
+                raise self.err("'return' can only be used inside a function (def)")
+            if s.value is not None and s.value.kind == "tuple":  # return a, b
+                vals = [self.eval(x) for x in s.value.items]
+                self.line = s.line
+                arity = self.frames[-1].get("arity")
+                if self.frames[-1]["value"] and arity != len(vals):
+                    raise self.err("every return of a function has to give the same number of values")
+                for n, val in enumerate(vals):
+                    self.assign(N("var", s.line, name=f"$ret{n}"), val)
+                self.frames[-1]["value"], self.frames[-1]["arity"] = True, len(vals)
+            elif s.value is not None:
+                if self.frames[-1].get("arity"):
+                    raise self.err("every return of a function has to give the same number of values")
+                val = self.eval(s.value)
+                self.line = s.line
+                self.assign(N("var", s.line, name="$ret"), val)
+                self.frames[-1]["value"] = True
+            self._raise_flags("$returned", *(brk for brk, _ in self.loops))  # and leaves every loop
+        elif k == "def":
+            if s.name in FUNCTION_NAMES or s.name in ("range", "set"):
+                raise self.err(f"'{s.name}' is a built-in function, pick another name")
+            self.funcs[s.name] = s
 
     def exec_if(self, s):
         self.stmt_line = s.line
@@ -877,11 +2917,14 @@ class Compiler:
             return
         # Run both branches from the same starting state, then merge with switches.
         base_vars, base_attrs = dict(self.vars), dict(self.attrs)
+        self.path.append(cond)
         self.exec(s.then)
+        self.path[-1] = self.not_(cond)
         then_vars, then_attrs = self.vars, self.attrs
         self.vars, self.attrs = dict(base_vars), base_attrs
         if s.orelse is not None:
             self.exec(s.orelse)
+        self.path.pop()
         self.line = self.stmt_line = s.line
         for name in set(then_vars) | set(self.vars):
             a, b = then_vars.get(name), self.vars.get(name)
@@ -896,49 +2939,430 @@ class Compiler:
             b = self.attrs.get(name) or self.read_original(name, type)
             self.attrs[name] = self.select(cond, a, b)
 
-    def loop_guard(self, count, s):
-        if count > MAX_LOOP_ITERATIONS:
-            raise BexError(f"the loop runs more than {MAX_LOOP_ITERATIONS} times", s.line)
+    # -- loops --------------------------------------------------------------
+    # A loop runs now (unrolled) when it is short or everything it changes stays
+    # constant. Otherwise it is one Repeat Zone whose items are the values the body
+    # changes, carried as fields, so attributes are still written once, after it.
+    # `break` / `continue` set hidden bool variables (one pair per loop); while
+    # one is set, assign() keeps the old values (_live), so `if` merging and zone
+    # items handle them like any other variable. A loop whose length differs per
+    # element runs the longest length, and each element stops changing once done.
 
-    def exec_for(self, s):
-        bounds = []
+    def _new_flags(self):
+        self.loop_count += 1
+        return f"$break{self.loop_count}", f"$continue{self.loop_count}"
+
+    def _live(self):
+        """Whether statements here run: no break / continue of an enclosing loop
+        (in this function) is set, and the function hasn't returned."""
+        live = Val("bool", True)
+        for name in [n for flags in self.loops for n in flags] + ["$returned"]:
+            f = self.vars.get(name)
+            if f is not None:
+                live = self.logic("and", live, self.not_(f))
+        return live
+
+    def _raise_flags(self, *names):
+        """break / continue / return: the flags are set wherever statements run now."""
+        live = self._live()
+        for name in names:
+            self.vars[name] = self.logic("or", self.vars.get(name, Val("bool", False)), live)
+
+    def _range(self, s):
+        args = []
         for arg in s.args:
             v = self.eval(arg)
-            if not v.is_const or v.type not in ("int", "bool"):
-                raise BexError("range() needs whole numbers known at compile time "
-                               "(not attributes or inputs)", s.line)
-            bounds.append(int(v.const))
-        if len(bounds) > 2 and bounds[2] == 0:
+            if v.type not in ("int", "bool"):
+                raise BexError("range() needs whole numbers", s.line)
+            args.append(self.conv(v, "int"))
+        self.line = self.stmt_line = s.line
+        if len(args) == 1:
+            args = [Val("int", 0)] + args
+        start, stop, step = (args + [Val("int", 1)])[:3]
+        if not step.is_const:
+            raise BexError("the range() step must be a fixed number", s.line)
+        if step.const == 0:
             raise BexError("range() step cannot be 0", s.line)
-        r = range(*bounds)
-        self.loop_guard(len(r), s)
-        for i in r:
-            self.vars[s.var] = Val("int", i)
-            self.half_set.pop(s.var, None)
-            self.exec(s.body)
+        return start, stop, step
+
+    def exec_for(self, s):
+        start, stop, step = self._range(s)
+        brk, cont = self._new_flags()
+        self.vars[brk] = Val("bool", False)
+        if start.is_const and stop.is_const:
+            r = range(start.const, stop.const, step.const)
+            if len(r) <= MAX_LOOP_ITERATIONS and self._unroll(s, list(r), brk, cont) is True:
+                self._end_loop(brk, cont)
+                return
+        # Iterations: ceil((stop - start) / step), at least 0
+        span = self.arith("-", stop, start) if step.const > 0 else self.arith("-", start, stop)
+        size = abs(step.const)
+        count = self.arith("//", self.arith("+", span, Val("int", size - 1)), Val("int", size))
+        count = self.fn2("MAXIMUM", max, count, Val("int", 0))
+        per_element = _is_field(count)
+        total = count
+        if per_element:  # run the longest; each element stops at its own count
+            if _uses_items(count):
+                raise BexError("a loop count that differs per element can't depend on values an outer "
+                               "loop changes (loop to a fixed maximum and skip with if)", s.line)
+            sel = self.group_sel if self.group_sel is not None else Val("bool", True)
+            total = self.conv(self.node("stat", "float", (self.conv(count, "float"), sel), domain=self.domain), "int")
+        names, _ = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        can_break = brk in names
+        if can_break:  # elements outside the if around it, or already returned, start stopped
+            self.vars[brk] = self._stopped_here()
+        carry = per_element or can_break  # the loop variable keeps its value when an element stops
+        chunked = can_break and self.zone_depth == 0 and not (total.is_const and total.const <= CHUNK_FIRST) \
+            and not self._makes_geometry(s.body)  # records can't wait on the geometry between chunks
+        if carry and s.var not in self.vars:
+            self.vars[s.var] = start
+
+        def begin(it):
+            self.vars[cont] = Val("bool", False)
+            if per_element or chunked:  # chunks can run past the count
+                done = self.not_(self.compare("<", it, count))
+                self.vars[brk] = self.logic("or", self.vars[brk], done)
+            value = self.arith("+", self.arith("*", it, step), start)
+            if carry:
+                self.assign(N("var", s.line, name=s.var), value)
+            else:
+                self.vars[s.var] = value
+                self.half_set.pop(s.var, None)
+
+        self._zone(s, total, brk, cont, begin, ((s.var,) if carry else ()) + ((brk,) if chunked else ()), chunked)
+        if not carry:  # Python keeps the loop variable at its last value (unchanged after no iterations)
+            last = self.arith("-", count, Val("int", 1))
+            value = self.arith("+", self.arith("*", last, step), start)
+            before = self.vars.get(s.var)
+            if before is not None:
+                value = self.select(self.compare(">", count, Val("int", 0)), value, before)
+            self.vars[s.var] = value
+        self._end_loop(brk, cont)
 
     def exec_while(self, s):
-        count = 0
-        while True:
-            cond = self.conv(self.eval(s.cond), "bool")
-            if not cond.is_const:
-                raise BexError("a while-loop condition must be known at compile time "
-                               "(it cannot depend on attributes or inputs)", s.line)
-            if not cond.const:
+        brk, cont = self._new_flags()
+        self.vars[brk] = Val("bool", False)
+        n = self._unroll(s, None, brk, cont)
+        if n is not True:
+            self.vars[brk] = self._stopped_here()
+            def begin(it):
+                self.vars[cont] = Val("bool", False)
+                cond = self.conv(self.eval(s.cond), "bool")
+                self.line = self.stmt_line = s.line
+                self.vars[brk] = self.logic("or", self.vars[brk], self.not_(cond))
+
+            # n: the exact count, when the condition was known each time but the body was not
+            makes = self._makes_geometry(s.body)
+            chunked = not n and self.zone_depth == 0 and not makes
+            count = n or (MAX_ZONE_ITERATIONS if chunked else WHILE_CAP)
+            if not n and not chunked:
+                self.warnings.append(f"line {s.line}: a while loop " + ("that makes elements" if makes else
+                                     "inside another loop") + f" stops after {WHILE_CAP} iterations")
+            self._zone(s, Val("int", count), brk, cont, begin, (brk,), chunked)
+        self._end_loop(brk, cont)
+
+    def _stopped_here(self):
+        """Where a loop starting now doesn't run at all: outside the `if` branches
+        around it, or after a break / continue / return (so a chunked loop can
+        skip those elements instead of running them to the cap)."""
+        here = self._live()
+        if self.frames:
+            here = self.logic("and", here, self.frames[-1]["live"])
+        for c in self.path:
+            here = self.logic("and", here, c)
+        return self.not_(here)
+
+    def _end_loop(self, brk, cont):
+        self.vars.pop(brk, None)
+        self.vars.pop(cont, None)
+
+    def _begin_unrolled(self, s, cont, value):
+        self.vars[cont] = Val("bool", False)
+        if s.kind == "for":
+            self.assign(N("var", s.line, name=s.var), Val("int", value))
+
+    def _unroll(self, s, values, brk, cont):
+        """Run the loop now: `values` are a for-loop's values; None for a while
+        loop, whose condition is checked before each iteration. The result is kept
+        (returns True) when everything the loop changes stays constant, or it ran
+        at most UNROLL_MAX times. Otherwise everything is undone, and it returns the
+        iteration count when that was known (a while loop with a constant
+        condition but a non-constant body), else False."""
+        saved = self._snapshot()
+        names, attrs = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        limit = GEO_UNROLL_MAX if self._makes_geometry(s.body) else UNROLL_MAX  # zones can't add elements
+        short = values is not None and len(values) <= limit
+        n, all_const = 0, True
+        for value in (values if values is not None else itertools.count()):
+            run = self.not_(self.vars[brk])
+            if s.kind == "while":
+                run = self.logic("and", run, self.conv(self.eval(s.cond), "bool"))
+                self.line = self.stmt_line = s.line
+                if not run.is_const:  # its end differs per element
+                    self._restore(saved)
+                    return False
+            if run.is_const and not run.const:
                 break
-            count += 1
-            self.loop_guard(count, s)
+            if n == MAX_LOOP_ITERATIONS:
+                if all_const:
+                    raise BexError(f"the loop runs more than {MAX_LOOP_ITERATIONS} times", s.line)
+                self._restore(saved)
+                return False
+            n += 1
+            self.loops.append((brk, cont))
+            self._begin_unrolled(s, cont, value)
             self.exec(s.body)
+            self.loops.pop()
+            if all_const:  # attributes: also those a called function wrote
+                changed = [self.vars.get(x) for x in names] + \
+                    [v for a, v in self.attrs.items() if saved["attrs"].get(a) is not v]
+                all_const = all(v is None or v.is_const for v in changed)
+            if not all_const and values is not None and not short:
+                self._restore(saved)
+                return False
+        if all_const or n <= limit:
+            return True
+        self._restore(saved)
+        return n
+
+    def _makes_geometry(self, s, seen=()):
+        """Statement `s` calls addpoint() & co., directly or through the script's functions."""
+        found = []
+
+        def walk(x):
+            if isinstance(x, N):
+                if x.kind == "call" and (x.name in GEO_FUNCS or (x.name in self.funcs and x.name not in seen and
+                                                               self._makes_geometry(self.funcs[x.name].body,
+                                                                                    seen + (x.name,)))):
+                    found.append(x)
+                for v in x.__dict__.values():
+                    walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x:
+                    walk(v)
+        walk(s)
+        return bool(found)
+
+    def _zone(self, s, count, brk, cont, begin, carry=(), chunked=False):
+        """One Repeat Zone running the loop body `count` times (one value, not a
+        field). `begin(it)` starts each iteration (it: the Iteration output).
+        Items: the variables (set before the loop) and attributes the body assigns,
+        plus `carry`. Their types widen, and they become fields, as the body needs.
+
+        `chunked` (a loop that can end early, `brk` carried): an outer zone runs
+        chunks of growing size, each an inner zone; between chunks the items are
+        stored on the geometry (hidden attributes), and once no element is still
+        running (`brk` unset) the remaining chunks are skipped. Blender's Repeat
+        Zone has no stop condition, so this is how a loop ends early."""
+        line = s.line
+        if count.is_const and count.const > MAX_ZONE_ITERATIONS:
+            raise BexError(f"the loop runs more than {MAX_ZONE_ITERATIONS} times", line)
+        count = self.fn2("MINIMUM", min, count, Val("int", MAX_ZONE_ITERATIONS))
+        names, attrs = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
+        names = (names | set(carry)) - {cont} - ({s.var} if s.kind == "for" and s.var not in carry else set())
+        local = [n for n in names if n not in self.vars]  # created inside the loop
+        items = [("var", n, self.vars[n]) for n in sorted(names) if n in self.vars]
+        for name, prefix in attrs.items():
+            if name in READ_ONLY or OPINPUT_RE.match(name):
+                continue  # assign() reports it while running the body
+            items.append(("attr", name, self.read_attr(name, self.attr_type(name, prefix))))
+        geo = self._makes_geometry(s.body) and not self.zone_depth
+        if geo:  # the next point / primitive numbers change from pass to pass
+            for kind in ("point", "poly", "polyline", "vertex"):
+                if kind not in self.geo_counts:
+                    self.geo_counts[kind] = self.geo_start(kind)
+                items.append(("count", kind, self.geo_counts[kind]))
+        # An item's type: a Val type, or "array:<element type>:<slots>" for an array,
+        # which is carried as one zone item per slot plus its length (_flat_types).
+        types = [_enc(v) for _, _, v in items]
+        fields = [_field_any(v) for _, _, v in items]
+        temp_base = f"{TEMP_PREFIX}{self.loop_count}_"  # chunked: hidden attribute names, one per flat item
+        saved = self._snapshot()
+        accs = {}  # key -> (kind, info, line) of the GeoOps whose records a geometry item collects
+        while True:
+            flat_types = [ft for t in types for ft in _flat_types(t)]
+            flat_fields = [f for t, f in zip(types, fields) for _ in _flat_types(t)]
+            temp = [f"{temp_base}{k}" for k in range(len(flat_types))]
+            starts = tuple(x for (_, _, v), t in zip(items, types) for x in self._to_flat(v, t))
+            if chunked:
+                flat_fields = [True] * len(flat_types)  # read back from the geometry
+                chunks = 1
+                longest = count.const if count.is_const else MAX_ZONE_ITERATIONS
+                while CHUNK_FIRST * (CHUNK_GROWTH ** chunks - 1) / (CHUNK_GROWTH - 1) < longest:
+                    chunks += 1
+                chunk = IRNode("chunk", {"names": tuple(temp), "items": tuple(flat_types), "count": chunks,
+                                         "domain": self.domain}, starts, line)
+                size, offset = Val("int", node=chunk, out=0), Val("int", node=chunk, out=1)
+                starts = tuple(self.node("attr", t, name=n, dtype=t) for n, t in zip(temp, flat_types))
+                zone = IRNode("repeat_in", {"items": tuple(flat_types), "fields": tuple(flat_fields)},
+                              (size,) + starts, line)
+                it = self.arith("+", offset, Val("int", node=zone, out=0))
+            else:
+                zone = IRNode("repeat_in", {"items": tuple(flat_types), "fields": tuple(flat_fields)},
+                              (count,) + starts, line)
+                it = Val("int", node=zone, out=0)
+            current = {}  # geometry items: the records collected so far
+            at = 1
+            for (kind, name, start), t in zip(items, types):
+                n = len(_flat_types(t))
+                v = self._from_flat(t, [Val(ft, node=zone, out=at + j) for j, ft in enumerate(_flat_types(t))])
+                at += n
+                if start is NOT_RETURNED and t == "bool":  # its type is learnt from the first pass's returns
+                    v = NOT_RETURNED
+                if kind == "acc":
+                    current[name] = v
+                else:
+                    self._item_store(kind)[name] = v
+            self.loops.append((brk, cont))
+            self.zone_depth += 1
+            if geo:
+                self.zone_ops.append([])
+            begin(it)
+            self.exec(s.body)
+            self.zone_depth -= 1
+            self.loops.pop()
+            new_accs = []
+            if geo:  # this pass's records join the ones before
+                seen = {}
+                for op in self.zone_ops.pop():
+                    key = op.kind if op.kind in ("addpoint", "vertex") else f"{op.kind}{seen.setdefault(op.kind, 0)}"
+                    if op.kind not in ("addpoint", "vertex"):
+                        seen[op.kind] += 1
+                    keys = tuple(op.values)
+                    recs = IRNode("records", {"keys": keys, "types": tuple(op.values[k].type for k in keys),
+                                              "domain": self.domain}, (op.mask,) + tuple(op.values[k] for k in keys),
+                                  op.line)
+                    if key not in current:
+                        new_accs.append(key)
+                        current[key] = Val("geometry", "empty")
+                    accs.setdefault(key, (op.kind, op.info, op.line))
+                    current[key] = Val("geometry", node=IRNode("geojoin", {}, (current[key], Val("geometry", node=recs)),
+                                                               op.line))
+            finals = [current.get(name) if kind == "acc" else self._item_store(kind).get(name)
+                      for kind, name, _ in items]
+            # e.g. x = 0 before the loop and x += 0.5 inside: carry a float
+            wider = [self._wider(f, t) for f, t in zip(finals, types)]
+            varying = [d or (f is not None and _field_any(f)) for f, d in zip(finals, fields)]
+            carried = {name for kind, name, _ in items if kind == "attr"}
+            missed = [a for a, v in self.attrs.items() if a not in carried and saved["attrs"].get(a) is not v]
+            if wider == types and varying == fields and not missed and not new_accs:
+                break
+            types, fields = wider, varying
+            missed = [(a, self.attr_types[a]) for a in missed]
+            self._restore(saved)
+            for key in new_accs:  # records made in the loop: a geometry item collects them
+                items.append(("acc", key, Val("geometry", "empty")))
+                types.append("geometry")
+                fields.append(False)
+            for name, type in missed:  # written by a function the body calls
+                v = self.read_attr(name, self.attr_type(name, type))
+                items.append(("attr", name, v))
+                types.append(v.type)
+                fields.append(True)
+            saved = self._snapshot()
+        self.line = self.stmt_line = line
+        flat_finals = tuple(x for f, t in zip(finals, types) for x in self._to_flat(f, t))
+        out = IRNode("repeat_out", {"zone": zone}, flat_finals, line)
+        at = 0
+        for (kind, name, _), t in zip(items, types):
+            fts = _flat_types(t)
+            if chunked:  # the values the chunks left on the geometry
+                parts = [self.node("attr", ft, name=temp[at + j], dtype=ft) for j, ft in enumerate(fts)]
+            else:
+                parts = [Val(ft, node=out, out=at + j) for j, ft in enumerate(fts)]
+            at += len(fts)
+            val = self._from_flat(t, parts)
+            if kind == "acc":
+                op_kind, info, op_line = accs[name]
+                self.geo_ops.append(GeoOp(op_kind, Val("bool", True), {}, info, op_line, records=val))
+            else:
+                self._item_store(kind)[name] = val
+        if chunked:
+            offsets = itertools.accumulate([0] + [len(_flat_types(t)) for t in types])
+            running = next(o for o, (kind, name, _) in zip(offsets, items) if name == brk)
+            sel = self.group_sel if self.group_sel is not None else Val("bool", True)
+            self.preludes.append(IRNode("chunk_end", {"chunk": chunk, "flag": running},
+                                        tuple(Val(t, node=out, out=k) for k, t in enumerate(flat_types)) + (sel,),
+                                        line))
+        for name in local:  # its value would come from inside the zone
+            self.vars.pop(name, None)
+            self.loop_only[name] = line
+        return out
+
+    def _to_flat(self, v, t):
+        """A loop item's value as its zone items (an array: its slots, then its length)."""
+        if not t.startswith("array:"):
+            return [self._neutral(t) if v is NOT_RETURNED else self.conv(v, t)]
+        _, et, cap = t.split(":")
+        if v is NOT_RETURNED:
+            v = self.empty_array(et)
+        if v.type != "array":
+            raise self.err("a variable can't change between an array and a single value in a loop")
+        a = v.const
+        return self.padded(a, int(cap), et)[:int(cap)] + [a.length]
+
+    def _from_flat(self, t, parts):
+        if not t.startswith("array:"):
+            return parts[0]
+        return self.make_arr(t.split(":")[1], parts[:-1], parts[-1])
+
+    def _wider(self, f, t):
+        """The item type a loop needs after a pass that ended with `f`."""
+        if f is None or f is NOT_RETURNED:
+            return t
+        if f.type == "array":
+            a = f.const
+            if t.startswith("array:"):
+                _, et, cap = t.split(":")
+                et, cap = self.array_type([et, a.type]), int(cap)
+                return f"array:{et}:{cap if len(a.items) <= cap else max(len(a.items), ARRAY_ZONE_CAP)}"
+            return _enc(f) if t == "bool" else t  # bool: a function's return value, learnt now
+        return f.type if RANK[f.type] > RANK.get(t, 99) else t
+
+    def _item_store(self, kind):
+        """Where a Repeat Zone item lives: variables, attributes, or the next element numbers."""
+        return {"var": self.vars, "attr": self.attrs, "count": self.geo_counts}[kind]
+
+    _STATE = ("vars", "half_set", "loop_only", "attrs", "attr_types", "written", "params", "ramps",
+              "reads", "pending", "inputs", "cse", "preludes", "closures", "call_counts", "calls",
+              "loop_count", "warnings", "geo_ops", "geo_counts", "prim_kinds", "limits")
+
+    def _snapshot(self):
+        """Copies of everything running statements can change (see _restore)."""
+        return {k: _copy(getattr(self, k)) for k in self._STATE}
+
+    def _restore(self, saved):
+        for k, v in saved.items():
+            setattr(self, k, _copy(v))
 
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
                        ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
-                       reads=list(self.reads), inputs=sorted(self.inputs))
+                       reads=list(self.reads), inputs=sorted(self.inputs), preludes=list(self.preludes),
+                       geo_ops=list(self.geo_ops), limits=dict(self.limits))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
                 prog.writes.append((name, type, val))
+        if self.domain == "INSTANCE":
+            self._instance_transform(prog)
         return prog
+
+    def _instance_transform(self, prog):
+        """On instances, @P, @orient, @scale and @transform are parts of one instance_transform."""
+        parts = {n: v for n, _, v in prog.writes if n in INSTANCE_ATTRS or n == "P"}
+        if not parts:
+            return
+        first = next(k for k, (n, _, _) in enumerate(prog.writes) if n in parts)
+        m = parts.get("transform") or self.read_original("transform", "matrix")
+        if set(parts) - {"transform"}:
+            sep = lambda k, t: self.gnode(t, "FunctionNodeSeparateTransform",  # noqa: E731
+                                          ("Translation", "Rotation", "Scale"), k, (m,), ("Transform",))
+            m = self.trs(parts.get("P") or sep(0, "vector"), parts.get("orient") or sep(1, "quaternion"),
+                         parts.get("scale") or sep(2, "vector"))
+        rest = [w for w in prog.writes if w[0] not in parts]
+        rest.insert(min(first, len(rest)), ("instance_transform", "matrix", m))
+        prog.writes[:] = rest
 
     # -- write plan ---------------------------------------------------------
     # Every written value means "computed from the incoming geometry". The write
@@ -950,8 +3374,13 @@ class Compiler:
         written = {name for name, _, _ in prog.writes}
         for name, type, val in prog.writes:
             conds = [] if group is None else [group]
-            val = self._peel_selection(name, type, val, conds)
-            store = Store(name, type, val, conds=conds)
+            if name == "N":  # Set Mesh Normal has no Selection: keep the old normal outside the Group
+                if group is not None:
+                    val = self.select(group, val, self.read_original("N", "vector"))
+                conds = []
+            else:
+                val = self._peel_selection(name, type, val, conds)
+            store = Store(name, type, val, conds=conds, storage=self.storage.get(name))
             if name == "P" and "position" not in written:
                 off = self._position_offset(val)
                 if off is not None:
@@ -991,37 +3420,40 @@ class Compiler:
 
     def _position_offset(self, val):
         """The offset when `val` is the position plus something (`@P += x`,
-        `@P.z -= 1`), so Set Position's Offset input does the adding."""
+        `@P.z -= 1`, also repeated: `(@P.z + a) + b`), so Set Position's Offset
+        input does the adding."""
         if val.is_const:
             return None
-        n, pos = val.node, self.read_original("P", "vector")
-        self.stmt_line = n.line
-        if n.kind == "vmath" and n.params.get("op") in ("ADD", "SUBTRACT"):
-            a, b = n.inputs
-            if _same(a, pos):
-                return b if n.params["op"] == "ADD" else self.negate(b)
-            if _same(b, pos) and n.params["op"] == "ADD":
-                return a
-            return None
-        if n.kind != "combine":
+        pos = self.read_original("P", "vector")
+        self.stmt_line = val.node.line
+        if val.node.kind == "vmath":
+            return self._strip_base(val, lambda v: _same(v, pos), "vmath", Val("vector", (0.0, 0.0, 0.0)))
+        if val.node.kind != "combine":
             return None
         parts = []
-        for i, c in enumerate(n.inputs):
-            if _is_component(c, pos, i):
-                parts.append(Val("float", 0.0))
-            elif not c.is_const and c.node.kind == "math" and c.node.params.get("op") in ("ADD", "SUBTRACT"):
-                a, b = c.node.inputs
-                self.stmt_line = c.node.line
-                if _is_component(a, pos, i):
-                    parts.append(b if c.node.params["op"] == "ADD" else self.negate(b))
-                elif _is_component(b, pos, i) and c.node.params["op"] == "ADD":
-                    parts.append(a)
-                else:
-                    return None
-            else:
+        for i, c in enumerate(val.node.inputs):
+            off = self._strip_base(c, lambda v, i=i: _is_component(v, pos, i), "math", Val("float", 0.0))
+            if off is None:
                 return None
-        self.stmt_line = n.line
+            parts.append(off)
+        self.stmt_line = val.node.line
         return self.combine(parts)
+
+    def _strip_base(self, v, is_base, kind, zero):
+        """`v` as base + offset through a chain of ADD / SUBTRACT nodes of `kind`:
+        the offset, or None when `v` isn't the base plus something."""
+        if is_base(v):
+            return zero
+        if v.is_const or v.node.kind != kind or v.node.params.get("op") not in ("ADD", "SUBTRACT"):
+            return None
+        a, b = v.node.inputs
+        add = v.node.params["op"] == "ADD"
+        self.stmt_line = v.node.line
+        off = self._strip_base(a, is_base, kind, zero)
+        if off is not None:
+            return self.arith("+" if add else "-", off, b)
+        off = self._strip_base(b, is_base, kind, zero) if add else None
+        return None if off is None else self.arith("+", off, a)
 
     def _and_all(self, conds):
         sel = None
@@ -1032,10 +3464,249 @@ class Compiler:
         return sel
 
 
+def _copy(x):
+    if isinstance(x, dict):  # ramps hold sets, closures hold lists
+        return {k: set(v) if isinstance(v, set) else list(v) if isinstance(v, list) else v for k, v in x.items()}
+    if isinstance(x, list):
+        return list(x)
+    return x  # counters
+
+
+def _assigned(body, brk=None, cont=None, outer=()):
+    """Names a loop body assigns: ({variable}, {attribute: prefix type}). A
+    `break` / `continue` of this loop assigns its flag `brk` / `cont`; a `return`
+    also the break flags `outer` of the loops around it (in the same function)."""
+    names, attrs = set(), {}
+
+    def target(t):
+        if t.kind == "tuple":
+            for item in t.items:
+                target(item)
+            return
+        while t.kind in ("member", "index"):
+            t = t.obj
+        if t.kind == "var":
+            names.add(t.name)
+        elif t.kind == "attr":
+            attrs.setdefault(t.name, t.type)
+
+    def walk(s, inner):
+        if s is None:
+            return
+        for t in _call_targets(s):  # translate(m, ...), setcomp(v, ...), out arguments
+            target(t)
+        k = s.kind
+        if k == "assign":
+            target(s.target)
+        elif k == "return":
+            names.update(("$ret", "$returned", *outer))
+            if s.value is not None and s.value.kind == "tuple":
+                names.update(f"$ret{n}" for n in range(len(s.value.items)))
+            if brk:
+                names.add(brk)
+        elif k == "break" and not inner:
+            names.add(brk)
+        elif k == "continue" and not inner:
+            names.add(cont)
+        elif k == "for":
+            names.add(s.var)
+            walk(s.body, True)
+        elif k == "while":
+            walk(s.body, True)
+        elif k == "if":
+            walk(s.then, inner)
+            walk(s.orelse, inner)
+        elif k == "block":
+            for c in s.body:
+                walk(c, inner)
+
+    walk(body, False)
+    names.discard(None)
+    return names, attrs
+
+
+# nearpoints(): every point of the input is checked; the `k` nearest within the radius
+# are kept in order (an unrolled insertion step per point). {t} prefixes hidden names.
+_NEARPOINTS = """
+{t}idx = array({minus})
+{t}dst = array({radii})
+{t}n = 0
+for {t}j in range(npoints({n})):
+    {t}d = distance2({t}q, point({n}, "P", {t}j))
+    if {t}d <= {t}r and {t}d < {t}dst[{last}]:
+        {t}dst[{last}] = {t}d
+        {t}idx[{last}] = {t}j
+        {t}n += 1
+{swaps}"""
+_NEARPOINTS_SWAP = """        if {t}dst[{a}] < {t}dst[{b}]:
+            {t}dst[{a}], {t}dst[{b}] = {t}dst[{b}], {t}dst[{a}]
+            {t}idx[{a}], {t}idx[{b}] = {t}idx[{b}], {t}idx[{a}]
+"""
+
+
+def _set_lines(x, line):
+    """Every AST node in `x` reports `line` (code the compiler writes for a call)."""
+    if isinstance(x, (list, tuple)):
+        for v in x:
+            _set_lines(v, line)
+    elif isinstance(x, N):
+        x.line = line
+        for v in x.__dict__.values():
+            _set_lines(v, line)
+
+
+# Built-ins that assign one of their arguments: name -> which (a slice of the arguments)
+_ARG_TARGETS = {"translate": slice(0, 1), "rotate": slice(0, 1), "scale": slice(0, 1), "setcomp": slice(0, 1),
+                "wnoise": slice(1, 4), "append": slice(0, 1), "push": slice(0, 1), "pop": slice(0, 1),
+                "insert": slice(0, 1), "removeindex": slice(0, 1), "resize": slice(0, 1)}
+
+
+def _call_targets(s):
+    """Variables and attributes the calls in statement `s` assign through their
+    arguments (not inside nested statements, which `_assigned` walks itself)."""
+    found = []
+
+    def visit(x):
+        if isinstance(x, (list, tuple)):
+            for v in x:
+                visit(v)
+            return
+        if not isinstance(x, N):
+            return
+        if x.kind == "call":
+            args = [a for a in x.args if a.kind != "kwarg"]
+            if x.name in _ARG_TARGETS:
+                found.extend(args[_ARG_TARGETS[x.name]])
+            elif x.name == "xyzdist" and len(args) == 3 or x.name == "intersect" and len(args) == 4:
+                found.append(args[-1])
+        for key, v in x.__dict__.items():
+            if key not in ("body", "then", "orelse"):
+                visit(v)
+    visit(s)
+    return [t for t in found if t.kind in ("var", "attr", "member", "index")]
+
+
+def _enc(v):
+    """A loop item's type: the Val's, or "array:<element type>:<slots>"."""
+    return f"array:{v.const.type}:{len(v.const.items)}" if v.type == "array" else v.type
+
+
+def _flat_types(t):
+    if t.startswith("array:"):
+        _, et, cap = t.split(":")
+        return [et] * int(cap) + ["int"]
+    return [t]
+
+
+def _field_any(v):
+    """`v` differs per element (an array: any slot or its length). Geometry never does."""
+    if v.type == "array":
+        return any(_is_field(x) for x in v.const.items + (v.const.length,))
+    return bool(_is_field(v)) and v.type != "geometry"
+
+
+def _tuple_arity(s):
+    """How many values `return a, b, ...` gives in this function body (0: none such)."""
+    if s is None:
+        return 0
+    if s.kind == "return":
+        return len(s.value.items) if s.value is not None and s.value.kind == "tuple" else 0
+    for child in (getattr(s, "body", None) if s.kind in ("block",) else
+                  [s.then, s.orelse] if s.kind == "if" else [s.body] if s.kind in ("for", "while") else []) or []:
+        n = _tuple_arity(child)
+        if n:
+            return n
+    return 0
+
+
+def _always_returns(s):
+    """Every path through statement `s` ends in a return (judged from the code)."""
+    if s is None:
+        return False
+    if s.kind == "return":
+        return True
+    if s.kind == "block":
+        return bool(s.body) and _always_returns(s.body[-1])
+    if s.kind == "if":
+        return _always_returns(s.then) and _always_returns(s.orelse)
+    if s.kind == "while":  # `while True:` left only by return
+        return s.cond.kind == "bool" and s.cond.value and not _breaks(s.body)
+    return False
+
+
+def _breaks(s):
+    """Statement `s` has a `break` of the loop it sits in (not of a loop inside it)."""
+    if s is None or s.kind in ("for", "while"):
+        return False
+    if s.kind == "break":
+        return True
+    if s.kind == "if":
+        return _breaks(s.then) or _breaks(s.orelse)
+    return s.kind == "block" and any(_breaks(c) for c in s.body)
+
+
+def _negates(a, b):
+    """`a` is NOT `b`."""
+    return not a.is_const and a.node.kind == "bmath" and a.node.params.get("op") == "NOT" \
+        and _same(a.node.inputs[0], b)
+
+
+def _walk_outputs(val, visit):
+    """Walk the (node, output) pairs `val` depends on. `visit(node, out)` returns
+    True to stop with True, False to skip the node's inputs, or None to go on."""
+    seen, stack = set(), [(val.node, val.out)]
+    while stack:
+        n, out = stack.pop()
+        if n is None or (id(n), out) in seen:
+            continue
+        seen.add((id(n), out))
+        r = visit(n, out)
+        if r is True:
+            return True
+        if r is False:
+            continue
+        if n.kind == "closure_call":  # and the function body
+            stack.append((n.params["closure"], 0))
+        # Sample Index: the sampled value is read on the other geometry, only the index matters here
+        stack.extend((v.node, v.out) for v in (n.inputs[1:] if n.kind == "sample" else n.inputs))
+    return False
+
+
+def _is_field(val):
+    """Whether `val` can differ per element (a Repeat Zone count has to be one value)."""
+    def visit(n, out):
+        k = n.kind
+        if "src" in n.params and k == "node":  # evaluated on another input, inside a node reading it
+            return False
+        if k == "node" and n.params.get("field"):
+            return True
+        if k == "attr" and "src" not in n.params or k == "input" and n.params["name"] != "time":
+            return True
+        if k == "repeat_in":
+            if out == 0:  # Iteration: depends only on the count
+                return _is_field(n.inputs[0]) or False
+            return n.params["fields"][out - 1] or False
+        if k == "repeat_out":
+            return n.params["zone"].params["fields"][out] or False
+        if k in ("stat", "count"):  # one value measured over the geometry
+            return False
+        if k == "closure_in":  # an argument: as the calls pass it (closures are per field-ness)
+            return n.params["fields"][out] or False
+        return None
+    return _walk_outputs(val, visit)
+
+
+def _uses_items(val):
+    """Whether `val` reads an item of a Repeat Zone it sits in."""
+    return _walk_outputs(val, lambda n, out: (out > 0 or None) if n.kind == "repeat_in" else
+                         (False if n.kind == "repeat_out" else None))
+
+
 def _typed_name(text):
     """`"v@vel"` -> ("vel", "vector"); `"P"` or `"@P"` -> ("P", None)."""
     prefix, _, name = text.strip().rpartition("@")
-    return name.strip(), _PREFIX_TYPES.get(prefix.strip())
+    name = name.strip()
+    return ALIASES.get(name, name), _PREFIX_TYPES.get(prefix.strip())
 
 
 def _same(a, b):
@@ -1053,8 +3724,12 @@ def _changes(name):
 
 
 # What each built-in input node reads from the geometry.
-_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"},
-                "spline_parameter": {"P", "position"}}
+_INSTANCE_READS = {"instance_transform", "P", "position"}
+_INPUT_READS = {"position": {"P", "position", "instance_transform"}, "normal": {"P", "position", "N"}, "id": {"id"},
+                "instance_rotation": _INSTANCE_READS, "instance_scale": _INSTANCE_READS,
+                "instance_transform": _INSTANCE_READS,
+                "spline_parameter": {"P", "position"}, "tangent": {"P", "position"},
+                "face_area": {"P", "position"}, "edge_angle": {"P", "position"}}
 
 
 def _reads(val):
@@ -1066,12 +3741,16 @@ def _reads(val):
         if n is None or id(n) in seen:
             continue
         seen.add(id(n))
-        if "src" in n.params:  # evaluated on another input, not on this geometry
+        if "src" in n.params or n.kind == "stat":  # evaluated on another input / the incoming geometry
             continue
         if n.kind == "attr":
             found.add(n.params["name"])
         elif n.kind == "input":
             found |= _INPUT_READS.get(n.params["name"], set())
+        elif n.kind == "repeat_out":  # zero iterations pass the starting values through
+            stack.append(n.params["zone"])
+        elif n.kind == "closure_call":  # what the function body reads
+            stack.append(n.params["closure"])
         stack.extend(v.node for v in n.inputs)
     return found
 
@@ -1091,7 +3770,7 @@ def _mark_groups(e):
     return e
 
 
-def compile_source(src, domain="POINT", pending_line=None, known_params=(), group=""):
+def compile_source(src, domain="POINT", pending_line=None, known_params=(), group="", input_types=None):
     """`pending_line` (1-based) and `known_params`: see Compiler.
 
     `group`: which elements the script writes (Houdini's group field): a pattern
@@ -1099,7 +3778,16 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
     `@P.y > 0`. A bare name is a bool attribute.
     It is read from the incoming geometry, before the script runs.
     """
-    c = Compiler(domain, pending_line, known_params)
+    c, prog = _compile(src, domain, pending_line, known_params, group, frozenset(), input_types)
+    shared = frozenset(k for k, n in c.call_counts.items() if n > 1)
+    if shared:  # functions called more than once: built once each, as Closures
+        c, prog = _compile(src, domain, pending_line, known_params, group, shared, input_types)
+    return prog
+
+
+def _compile(src, domain, pending_line, known_params, group, closure_keys, input_types=None):
+    c = Compiler(domain, pending_line, known_params, input_types)
+    c.closure_keys = closure_keys
     selection, warnings = None, []
     if group.strip():
         types = dict(c.attr_types)
@@ -1110,17 +3798,19 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
             # Like Houdini: a group that doesn't make sense selects nothing, it doesn't
             # break the node (the node shows a warning). Start over so nothing
             # half-compiled from it remains.
-            c = Compiler(domain, pending_line, known_params)
+            c = Compiler(domain, pending_line, known_params, input_types)
+            c.closure_keys = closure_keys
             selection = Val("bool", False)
             warnings.append(f"group: {e.msg} (selects nothing)")
         # Types the Group guessed (`top` is a bool) don't bind the script.
         c.bare_attributes, c.pending_line, c.attr_types = False, pending_line, types
         if selection.is_const and selection.const:
             selection = None  # always true: every element
+    c.group_sel = selection
     for stmt in parse(src):
         c.exec(stmt)
     prog = c.program()
     prog.source = src.splitlines()
-    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings
+    prog.group, prog.group_source, prog.warnings = selection, group.strip(), warnings + c.warnings
     c.plan_stores(prog, selection)
-    return prog
+    return c, prog

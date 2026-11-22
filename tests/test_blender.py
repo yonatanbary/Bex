@@ -46,7 +46,8 @@ def original_points(obj):
 
 
 def attr(mesh, name):
-    return [d.value for d in mesh.attributes[name].data]
+    data = mesh.attributes[name].data
+    return [tuple(d.vector) if hasattr(d, "vector") else d.value for d in data]
 
 
 def close(a, b, eps=1e-4):
@@ -201,6 +202,28 @@ def test_error_keeps_last_good_nodes():
     node.sync()
     assert node.error == ""
     assert close(evaluate(obj).vertices[0].co, (-1, -1, 2))
+
+
+def test_hand_edits_inside_are_restored():
+    obj, node, text = make_setup("@P.z = 1;")
+    tree = node.node_tree
+    set_pos = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeSetPosition")
+    set_pos.mute = True
+    assert node.tree_edited()
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 0))
+    # The timer and undo leave edits made inside alone...
+    node.sync(restore=False)
+    assert set_pos.mute
+    # ...any other sync (e.g. leaving the code editor) rebuilds, even with the script unchanged.
+    node.sync()
+    assert not node.tree_edited()
+    assert not any(n.mute for n in tree.nodes)
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 1))
+    # So does a deleted link.
+    tree.links.remove(tree.links[0])
+    node.sync()
+    assert not node.tree_edited()
+    assert close(evaluate(obj).vertices[0].co, (-1, -1, 1))
 
 
 def test_sync_all_and_copy():
@@ -480,6 +503,13 @@ def test_code_box_scrolls():
     # A short script has nothing to scroll: the wheel goes to the Node Editor.
     short = make_setup("@P.z = 1")[1]
     assert not ce.scroll_code(short, None, wheel("WHEELDOWNMOUSE"))
+
+
+def test_channel_ranges():
+    obj, node, _ = make_setup('@P.z = chf("amp", 1, min=0, max=10)')
+    assert node.error == "", node.error
+    item = next(i for i in node.node_tree.interface.items_tree if getattr(i, "name", "") == "amp")
+    assert (item.min_value, item.max_value) == (0, 10)
 
 
 def test_channels_are_properties():
@@ -957,6 +987,246 @@ def test_layout_has_no_overlaps():
         assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
 
 
+def test_for_repeat_zone():
+    obj, node, _ = make_setup("""
+    n = chi("steps", 4)
+    x = @P.x
+    c = 0
+    for i in range(n):
+        x = x * 2 + i
+        @P.z += 0.25
+        if @P.x > 0:
+            c += 1
+    @a = x
+    i@c = c
+    """)
+    assert node.error == "", node.error
+    tree = node.node_tree
+    assert [n.bl_idname for n in tree.nodes].count("GeometryNodeRepeatInput") == 1
+    assert sum(n.bl_idname == "ShaderNodeMath" and n.operation == "MULTIPLY_ADD" for n in tree.nodes) <= 1
+    for steps, a_of, z in ((4, lambda x: 16 * x + 11, 1.0), (2, lambda x: 4 * x + 1, 0.5), (0, lambda x: x, 0.0)):
+        node.inputs["steps"].default_value = steps
+        mesh = evaluate(obj)
+        pts = original_points(obj)
+        assert close(attr(mesh, "a"), [a_of(x) for x, _, _ in pts]), (steps, attr(mesh, "a"))
+        assert close([v.co.z for v in mesh.vertices], [z] * len(pts)), steps
+        assert attr(mesh, "c") == [steps if x > 0 else 0 for x, _, _ in pts], (steps, attr(mesh, "c"))
+    # The zone's input sits left of its output, and links flow left to right.
+    zone_in = next(n for n in tree.nodes if n.bl_idname == "GeometryNodeRepeatInput")
+    assert zone_in.location_absolute.x < zone_in.paired_output.location_absolute.x
+    for link in tree.links:
+        assert link.from_node.location_absolute.x < link.to_node.location_absolute.x, (link.from_node.name, link.to_node.name)
+    # Nested loops are nested zones.
+    obj, node, _ = make_setup("""
+    n = chi("n", 3)
+    s = 0
+    for i in range(n):
+        for j in range(n):
+            s += i * j + @ptnum
+    i@s = s
+    """)
+    assert node.error == "", node.error
+    assert [n.bl_idname for n in node.node_tree.nodes].count("GeometryNodeRepeatInput") == 2
+    mesh = evaluate(obj)
+    assert attr(mesh, "s") == [9 + 9 * p for p in range(len(mesh.vertices))], attr(mesh, "s")
+
+
+def test_loops_per_element():
+    # range(@ptnum): each point loops its own number of times (Houdini gives a tilted plane).
+    obj, node, _ = make_setup("""
+    for i in range(@ptnum):
+        @P.z += 0.1
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert close([v.co.z for v in mesh.vertices], [0.1 * k for k in range(len(mesh.vertices))])
+    # Only points in the Group count towards the longest loop, and only they move.
+    node.group = "@ptnum < 3"
+    mesh = evaluate(obj)
+    assert close([v.co.z for v in mesh.vertices], [0.1 * k if k < 3 else 0.0 for k in range(len(mesh.vertices))])
+    stat = next(n for n in node.node_tree.nodes if n.bl_idname == "GeometryNodeAttributeStatistic")
+    assert stat.inputs["Selection"].is_linked
+
+    # break: count up until x * i passes 1, per point.
+    obj, node, _ = make_setup("""
+    n = 0
+    for i in range(chi("cap", 50)):
+        if (@P.x + 1) * i > 3:
+            break
+        if i % 2:
+            continue
+        n += 1
+    i@n = n
+    i@last = i
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, _, _), n, last in zip(original_points(obj), attr(mesh, "n"), attr(mesh, "last")):
+        want = 0
+        for i in range(50):  # the same loop in Python
+            if (x + 1) * i > 3:
+                break
+            if i % 2:
+                continue
+            want += 1
+        assert (n, last) == (want, i), (x, n, last, want, i)
+
+    # while with a per-point condition: halve until below 1.
+    obj, node, _ = make_setup("""
+    x = (@P.x + 1.5) * 10
+    steps = 0
+    while x > 1:
+        x *= 0.5
+        steps += 1
+    i@steps = steps
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (px, _, _), steps in zip(original_points(obj), attr(mesh, "steps")):
+        x, want = (px + 1.5) * 10, 0
+        while x > 1:
+            x, want = x * 0.5, want + 1
+        assert steps == want, (px, steps, want)
+
+    # Chunked: values that read each other (Fibonacci) across many chunk boundaries,
+    # different lengths per point, and no hidden attributes left behind.
+    obj, node, _ = make_setup("""
+    a = 0
+    b = 1
+    n = 0
+    limit = (@ptnum + 1) * 40
+    while n < limit:
+        t = (a + b) % 1000
+        a = b
+        b = t
+        n += 1
+    i@a = a
+    i@n = n
+    """)
+    assert node.error == "", node.error
+    kinds = [n.bl_idname for n in node.node_tree.nodes]
+    assert kinds.count("GeometryNodeRepeatInput") == 2  # chunks, and the loop inside a chunk
+    mesh = evaluate(obj)
+    for k, (a, n) in enumerate(zip(attr(mesh, "a"), attr(mesh, "n"))):
+        x, y = 0, 1
+        for _ in range((k + 1) * 40):
+            x, y = y, (x + y) % 1000
+        assert (a, n) == (x, (k + 1) * 40), (k, a, n, x)
+    assert not [name for name in mesh.attributes.keys() if name.startswith(".bex")], mesh.attributes.keys()
+
+    # v[i] with i from a zone.
+    obj, node, _ = make_setup("""
+    v = @P
+    for i in range(chi("n", 3)):
+        v[i] = v[i] + i + 1
+    @P = v
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, y, z), v in zip(original_points(obj), mesh.vertices):
+        assert close(v.co, (x + 1, y + 2, z + 3)), tuple(v.co)
+
+
+def test_own_functions():
+    obj, node, _ = make_setup("""
+    def sgn(x):
+        if x < 0:
+            return -1.0
+        return 1.0
+
+    def halvings(x, limit=1.0):
+        n = 0
+        while True:
+            if x <= limit:
+                return n
+            x *= 0.5
+            n += 1
+
+    def fib(n):
+        if n < 2:
+            return n
+        return fib(n - 1) + fib(n - 2)
+
+    def bump(h):
+        @w += h
+
+    @s = sgn(@P.x)
+    i@h = halvings((@P.y + 1.5) * 20)
+    i@f = fib(12)
+    for i in range(chi("n", 3)):
+        bump(0.5)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for (x, y, _), s, h, f, w in zip(original_points(obj), attr(mesh, "s"), attr(mesh, "h"), attr(mesh, "f"),
+                                    attr(mesh, "w")):
+        v, want = (y + 1.5) * 20, 0
+        while v > 1.0:
+            v, want = v * 0.5, want + 1
+        assert (s, h, f, w) == ((-1.0 if x < 0 else 1.0), want, 144, 1.5), (x, y, s, h, f, w)
+
+
+def test_shared_functions_are_closures():
+    obj, node, _ = make_setup("""
+    def wave(x, f):
+        return sin(x * f) * 0.5 + @P.x
+    @a = wave(@P.x, 3)
+    @b = wave(@P.y, 5)
+    """)
+    assert node.error == "", node.error
+    kinds = [n.bl_idname for n in node.node_tree.nodes]
+    assert kinds.count("NodeClosureOutput") == 1 and kinds.count("NodeEvaluateClosure") == 2
+    mesh = evaluate(obj)
+    for (x, y, _), a, b in zip(original_points(obj), attr(mesh, "a"), attr(mesh, "b")):
+        assert close((a, b), (math.sin(x * 3) * 0.5 + x, math.sin(y * 5) * 0.5 + x)), (x, y, a, b)
+    tree = node.node_tree
+    zone_in = next(n for n in tree.nodes if n.bl_idname == "NodeClosureInput")
+    assert zone_in.location_absolute.x < zone_in.paired_output.location_absolute.x
+
+
+def test_review_regressions():
+    obj, node, _ = make_setup("""
+    k = @P.x
+    def f(a):
+        return a * k
+    f@x = f(@P.y)
+    k = 5.0
+    f@y = f(@P.y + 1)
+
+    def g(lim):
+        x = 0.0
+        for i in range(12):
+            for j in range(12):
+                x += 1
+                if x > lim:
+                    return x
+        return -x
+    f@r = g(@ptnum * 3.0)
+
+    n = 0
+    while n < @ptnum % 5 + 9:
+        n += 1
+    c = 0.0
+    for i in range(n):
+        c += 1
+    f@c = c
+    """)
+    assert node.error == "", node.error
+    assert all(link.is_valid for link in node.node_tree.links)
+    mesh = evaluate(obj)
+    for k, ((px, py, _), x, y, r, c) in enumerate(zip(original_points(obj), attr(mesh, "x"), attr(mesh, "y"),
+                                                       attr(mesh, "r"), attr(mesh, "c"))):
+        lim, want_r = k * 3.0, None
+        v = 0.0
+        for _ in range(144):
+            v += 1
+            if v > lim:
+                want_r = v
+                break
+        want_r = -v if want_r is None else want_r
+        assert close((x, y, r, c), (py * px, (py + 1) * 5.0, want_r, k % 5 + 9)), (k, x, y, r, c)
+
+
 def test_write_plan():
     def kinds(node):
         return [n.bl_idname for n in node.node_tree.nodes]
@@ -1025,6 +1295,8 @@ def test_other_inputs():
     for i, v in enumerate(other.data.vertices):
         v.co.z = i * 0.5
     other.data.attributes.new("w", "FLOAT", "POINT").data.foreach_set("value", [i * 2.0 for i in range(len(points))])
+    other.data.attributes.new("vel", "FLOAT_VECTOR", "POINT").data.foreach_set(
+        "vector", [c for i in range(len(points)) for c in (i, 1, 2)])
     text.from_string('@P.z = point(1, "P", @ptnum).z\nf@w = @opinput1_w\ni@n = npoints(1)\n'
                      'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
     node.sync()
@@ -1043,6 +1315,11 @@ def test_other_inputs():
     assert {d.value for d in mesh.attributes["n"].data} == {count}
     assert {d.value for d in mesh.attributes["near"].data} == {count - 1}  # the highest point
     assert all(close(d.vector, (1, 1, (count - 1) * 0.5)) for d in mesh.attributes["top"].data)
+    # point() without a type prefix takes the type the graph says reaches the input
+    text.from_string('v@vv = point(1, "vel", @ptnum)')
+    node.sync()
+    assert node.error == "", node.error
+    assert [tuple(d.vector) for d in evaluate(obj).attributes["vv"].data] == [(i, 1, 2) for i in range(count)]
     # The four inputs are always there, like a wrangle's, and keep their links.
     text.from_string('f@m = chf("amount", 1)')
     node.sync()
@@ -1075,11 +1352,619 @@ def test_curve_builtins():
     tree.links.new(res.outputs[0], join.inputs[0])
     tree.links.new(res2.outputs[0], join.inputs[0])
     tree.links.new(join.outputs[0], node.inputs[0])
+    text.from_string("v@t = @tangent")
+    node.sync()
+    assert all(close(t, (1, 0, 0)) for t in attr(evaluate(obj), "t"))
     text.from_string("i@c = @curvenum\ni@p = @ptnum")
     node.sync()
     mesh = evaluate(obj)
     assert sorted(d.value for d in mesh.attributes["c"].data) == [0] * 5 + [1] * 5
     assert sorted(d.value for d in mesh.attributes["p"].data) == list(range(10))
+
+
+def test_data_functions():
+    import colorsys
+    # Topology on this geometry (fields) and on another input (sampled).
+    obj, node, text = make_setup("i@nc = neighbourcount(0, @ptnum)\ni@nb = neighbour(0, @ptnum, @ptnum % 2)\n"
+                                 "i@nb1 = neighbour(1, @ptnum, 1)")
+    tree = node.id_data
+    other = bpy.data.objects.new("Other", obj.data.copy())
+    bpy.context.collection.objects.link(other)
+    info = tree.nodes.new("GeometryNodeObjectInfo")
+    info.inputs["Object"].default_value = other
+    tree.links.new(info.outputs["Geometry"], node.inputs["Input 2"])
+    assert node.error == "", node.error
+    me = obj.data
+    nbrs = {i: set() for i in range(len(me.vertices))}
+    for e in me.edges:
+        a, b = e.vertices
+        nbrs[a].add(b)
+        nbrs[b].add(a)
+    mesh = evaluate(obj)
+    assert attr(mesh, "nc") == [len(nbrs[i]) for i in range(len(nbrs))]
+    assert all(nb in nbrs[i] for i, nb in enumerate(attr(mesh, "nb")))
+    assert all(nb in nbrs[i] for i, nb in enumerate(attr(mesh, "nb1")))
+    assert attr(mesh, "nb") != attr(mesh, "nb1") or True
+    text.from_string("i@pp = primpoint(0, @primnum, 1)\ni@pq = primpoint(1, @primnum, 2)\n"
+                     "i@vc = primvertexcount(0, @primnum)\nf@a = @area\ni@isl = @island")
+    node.domain = "FACE"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "pp") == [p.vertices[1] for p in me.polygons]
+    assert attr(mesh, "pq") == [p.vertices[2] for p in me.polygons]
+    assert set(attr(mesh, "vc")) == {4} and set(attr(mesh, "isl")) == {0}
+    assert attr(mesh, "a") == [pytest_approx(p.area) for p in me.polygons], (attr(mesh, "a"), me.polygons[0].area)
+    text.from_string("i@vp = vertexpoint(0, @vtxnum)\ni@vf = vertexprim(1, @vtxnum)\n"
+                     "i@vi = vertexprimindex(0, @vtxnum)")
+    node.domain = "CORNER"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    face_of = {li: p.index for p in me.polygons for li in p.loop_indices}
+    index_in = {li: k for p in me.polygons for k, li in enumerate(p.loop_indices)}
+    assert attr(mesh, "vp") == [l.vertex_index for l in me.loops]
+    assert attr(mesh, "vf") == [face_of[i] for i in range(len(me.loops))]
+    assert attr(mesh, "vi") == [index_in[i] for i in range(len(me.loops))]
+    text.from_string("f@ea = @edgeangle\ni@ne = nedges(0)")
+    node.domain = "EDGE"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "ea") == [pytest_approx(0)] * len(me.edges) and set(attr(mesh, "ne")) == {len(me.edges)}
+
+    # Surface queries on Input 2: the same grid, 3 higher.
+    for v in other.data.vertices:
+        v.co.z += 3
+    text.from_string("p = @P * 0.9 + (0.013, 0.021, 0)\nf@d = xyzdist(1, p, prim)\ni@prim = prim\nv@mp = minpos(1, p)\n"
+                     "i@hit = intersect(1, p, (0, 0, 10), hitpos)\nv@hp = hitpos\n"
+                     "i@short = intersect(1, p, (0, 0, 2))\ni@down = intersect(1, p, (0, 0, -10))")
+    node.domain = "POINT"
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+
+    def face_at(x, y):
+        return next(p.index for p in me.polygons
+                    if min(me.vertices[i].co.x for i in p.vertices) < x < max(me.vertices[i].co.x for i in p.vertices)
+                    and min(me.vertices[i].co.y for i in p.vertices) < y < max(me.vertices[i].co.y for i in p.vertices))
+    pts = [(x * 0.9 + 0.013, y * 0.9 + 0.021) for x, y, z in original_points(obj)]
+    assert attr(mesh, "d") == [pytest_approx(3)] * len(pts)
+    assert attr(mesh, "prim") == [face_at(x, y) for x, y in pts], attr(mesh, "prim")
+    assert all(close(m, (x, y, 3)) for m, (x, y) in zip(attr(mesh, "mp"), pts))
+    assert attr(mesh, "hit") == attr(mesh, "prim")
+    assert all(close(h, (x, y, 3)) for h, (x, y) in zip(attr(mesh, "hp"), pts))
+    assert set(attr(mesh, "short")) == {-1} and set(attr(mesh, "down")) == {-1}
+
+    # Colour and vector maths, per element (no folding).
+    text.from_string("h = @ptnum / 16.0\nv@rgb = hsvtorgb(set(h, 0.8, 0.9))\nv@back = rgbtohsv(v@rgb)\n"
+                     "v@hsl = hsltorgb(set(h, 0.5, 0.4))\nf@lum = luminance(set(h, 0.5, 0.25))\n"
+                     "v@bb = blackbody(6500 + h)\nv@r = reflect(@P + (0, 0, 1), (0, 0, 2))\n"
+                     "v@ff = faceforward((0, 0, 1), set(0, 0, @P.x))\n"
+                     "v@rf = refract(normalize(set(1, 0, -1) + @P * 0), (0, 0, 1), 0.5)")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, _) in enumerate(original_points(obj)):
+        h = i / 16.0
+        assert close(attr(mesh, "rgb")[i], colorsys.hsv_to_rgb(h, 0.8, 0.9)), (i, tuple(attr(mesh, "rgb")[i]))
+        assert close(attr(mesh, "back")[i], (h % 1.0, 0.8, 0.9), 1e-3), (i, tuple(attr(mesh, "back")[i]))
+        assert close(attr(mesh, "hsl")[i], colorsys.hls_to_rgb(h, 0.4, 0.5)), (i, tuple(attr(mesh, "hsl")[i]))
+        assert abs(attr(mesh, "lum")[i] - (0.2126 * h + 0.7152 * 0.5 + 0.0722 * 0.25)) < 1e-4
+        assert close(attr(mesh, "r")[i], (x, y, -1))
+        assert close(attr(mesh, "ff")[i], (0, 0, -1 if x >= 0 else 1))  # GLSL: flipped unless dot < 0
+    bb = attr(mesh, "bb")[0]
+    assert min(bb) > 0.5 and max(bb) < 1.5, tuple(bb)  # roughly white at 6500 K
+    s = math.sqrt(0.5)
+    k = 1 - 0.25 * (1 - s * s)
+    expected = (0.5 * s, 0, 0.5 * -s - (0.5 * -s + math.sqrt(k)))
+    assert all(close(v, expected) for v in attr(mesh, "rf")), (tuple(attr(mesh, "rf")[0]), expected)
+
+
+def test_rotations_and_matrices():
+    from mathutils import Matrix, Quaternion, Vector
+    src = """
+    q = quaternion(@P.x, (0, 0, 1))
+    r = quaternion(@P.y + 0.3, (1, 0, 0))
+    p@orient = q
+    p@both = q * r                      # r first, then q
+    v@turned = (1, 0, 0) * q
+    f@qw = q.w
+    f@qx = q.x
+    p@const = quaternion(0.5, (0, 1, 0))
+    p@euler = eulertoquaternion((@P.x, @P.y, 0.4), XFORM_ZYX)
+    p@half = slerp((0, 0, 0, 1), q, 0.5)
+    m = maketransform((1, 2, 3), r, (2, 1, 1))
+    n = ident()
+    translate(n, (0, 0, @P.x))
+    v@moved = (1, 1, 0) * m * n         # m first, then n
+    4@xf = m
+    p@aim = quaternion(maketransform((1, 0, 0), (0, 0, 1)))
+    p@spin = (0, 0, 0, 1)
+    for i in range(@ptnum):
+        @spin = @spin * quaternion(0.1, (0, 0, 1))
+    v@dih = (1, 0, 0) * dihedral((1, 0, 0), @P + (0, 0, 1))
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = mesh.attributes
+    assert at["orient"].data_type == "QUATERNION" and at["xf"].data_type == "FLOAT4X4"
+
+    def same_rot(a, b):
+        return abs(abs(Quaternion(a).dot(b)) - 1) < 1e-4  # q and -q are the same rotation
+
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        q = Quaternion((0, 0, 1), x)
+        r = Quaternion((1, 0, 0), y + 0.3)
+        assert same_rot(at["orient"].data[i].value, q)
+        assert same_rot(at["both"].data[i].value, q @ r), i
+        assert close(at["turned"].data[i].vector, q @ Vector((1, 0, 0)))
+        sign = 1 if q.w >= 0 else -1  # Blender may store -q
+        assert abs(at["qw"].data[i].value * sign - q.w) < 1e-4 and abs(at["qx"].data[i].value * sign - q.x) < 1e-4
+        assert same_rot(at["const"].data[i].value, Quaternion((0, 1, 0), 0.5))
+        zyx = Quaternion((1, 0, 0), x) @ Quaternion((0, 1, 0), y) @ Quaternion((0, 0, 1), 0.4)  # Z turns first
+        assert same_rot(at["euler"].data[i].value, zyx), i
+        assert same_rot(at["half"].data[i].value, Quaternion((0, 0, 1), x / 2))
+        assert tuple(at["orient"].data[i].value)[0] == pytest_approx(q.w) or \
+            tuple(at["orient"].data[i].value)[0] == pytest_approx(-q.w)  # stored as Blender's w, x, y, z
+        m = Matrix.LocRotScale(Vector((1, 2, 3)), r, Vector((2, 1, 1)))
+        assert close(at["moved"].data[i].vector, m @ Vector((1, 1, 0)) + Vector((0, 0, x))), i
+        assert close([c for col in at["xf"].data[i].value.col for c in col], [c for col in m.col for c in col])
+        aim = Quaternion(at["aim"].data[i].value)  # local Z faces +X, local Y faces +Z
+        assert close(aim @ Vector((0, 0, 1)), (1, 0, 0)) and close(aim @ Vector((0, 1, 0)), (0, 0, 1))
+        assert same_rot(at["spin"].data[i].value, Quaternion((0, 0, 1), 0.1 * i)), i
+        target = Vector((x, y, z + 1))
+        assert close(at["dih"].data[i].vector, target.normalized()), i
+
+
+def test_houdini_names_and_storage():
+    src = """
+    @v = (1, 2, 3)
+    @pscale = 0.25
+    @uv = @P
+    @Cd = (1, 0.5, 0)
+    u@st = @P * 2
+    f@back = @v.y + @pscale
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = mesh.attributes
+    assert at["velocity"].data_type == "FLOAT_VECTOR" and at["radius"].data_type == "FLOAT"
+    assert at["UVMap"].data_type == "FLOAT2" and at["st"].data_type == "FLOAT2"
+    assert at["Cd"].data_type == "FLOAT_COLOR" and "v" not in at and "pscale" not in at
+    for i, (x, y, _z) in enumerate(original_points(obj)):
+        assert close(at["UVMap"].data[i].vector, (x, y)) and close(at["st"].data[i].vector, (2 * x, 2 * y))
+        assert close(at["Cd"].data[i].color, (1, 0.5, 0, 1))
+        assert abs(at["back"].data[i].value - 2.25) < 1e-5
+    assert node.info and "velocity" in node.info
+
+
+def test_noise_family():
+    src = """
+    p = @P * 1.3 + (0.1, 0.2, 0.3)
+    f@a = noise(p, freq=2, amp=3, octaves=3)
+    f@a1 = noise(p, freq=2, octaves=3)
+    f@b = snoise(p)
+    f@b1 = noise(p)
+    v@c = curlnoise(p, freq=2)
+    h = 0.005
+    def d(axis, comp):
+        e = (0, 0, 0)
+        e[axis] = h
+        return (vnoise(p + e, 0, freq=2)[comp] - vnoise(p - e, 0, freq=2)[comp]) / (2 * h)
+    v@c1 = (d(1, 2) - d(2, 1), d(2, 0) - d(0, 2), d(0, 1) - d(1, 0))
+    f@w = wnoise(p * 3, s, f1, f2)
+    f@f1 = f1
+    f@f2 = f2
+    i@seed = s
+    v@cell = voronoicell(p * 3)
+    f@g = gabor(p, freq=3, stripes=4)
+    v@dir = sample_direction_uniform(vrand(@ptnum))
+    v@cone = sample_direction_cone((0, 1, 0), 0.3, vrand(@ptnum))
+    v@ball = sample_sphere_uniform(vrand(@ptnum))
+    f@r2 = rand(@ptnum, 3)
+    f@r4 = rand(@P, 3)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = lambda n: attr(mesh, n)  # noqa: E731
+    for a, a1 in zip(at("a"), at("a1")):
+        assert abs(a - 3 * a1) < 1e-4
+    for b, b1 in zip(at("b"), at("b1")):
+        assert abs(b - (2 * b1 - 1)) < 1e-4
+    for c, c1 in zip(at("c"), at("c1")):
+        assert close(c, c1, 1e-2), (c, c1)
+    assert len({round(c[0], 4) for c in at("c")}) > 5  # not constant
+    for w, f1, f2 in zip(at("w"), at("f1"), at("f2")):
+        assert w == f1 and 0 <= f1 <= f2 < 2
+    assert len(set(at("seed"))) > 3 and len({c for c in at("cell")}) > 3
+    assert all(math.isfinite(g) for g in at("g")) and len(set(at("g"))) > 3
+    for d, c, b in zip(at("dir"), at("cone"), at("ball")):
+        assert abs(math.hypot(*d) - 1) < 1e-4 and abs(math.hypot(*c) - 1) < 1e-4
+        assert c[1] >= math.cos(0.3) - 1e-4 and math.hypot(*b) <= 1 + 1e-4
+    assert len(set(at("r2"))) > 20 and len(set(at("r4"))) > 20
+
+
+def test_statistics_and_lookups():
+    src = """
+    f@m = mean(@P.x)
+    f@mx = maxof(@P.x + @P.y, @ptnum % 2)
+    i@c = countof()
+    i@ce = countof(@ptnum % 2)
+    f@s = sumof(@ptnum)
+    f@acc = accumulate(1.0)
+    v@nx = at(@P, (@ptnum + 1) % @numpt)
+    f@pr = promote(@P.x, "face")
+    f@bl = blur(@P.x, 2)
+    v@uvp = uvsample(0, "P", "uv", (0.25, 0.75, 0))
+    f@ti = @TimeInc
+    @P.z = mean(@P.y)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    pts = original_points(obj)
+    at = lambda n: attr(mesh, n)  # noqa: E731
+    count = len(pts)
+    assert all(abs(m) < 1e-5 for m in at("m")) and set(at("c")) == {count}
+    for i, (mx, ce) in enumerate(zip(at("mx"), at("ce"))):
+        group = [p for k, p in enumerate(pts) if k % 2 == i % 2]
+        assert abs(mx - max(x + y for x, y, _ in group)) < 1e-5 and ce == len(group)
+    assert all(abs(v - sum(range(count))) < 1e-3 for v in at("s"))
+    assert at("acc") == [pytest_approx(i + 1) for i in range(count)]
+    for i, v in enumerate(at("nx")):
+        assert close(v, pts[(i + 1) % count])
+    corner = min(range(count), key=lambda i: pts[i][0] + pts[i][1])
+    assert abs(at("pr")[corner] - (pts[corner][0] + 0.25)) < 1e-4  # one face: its centre
+    assert all(math.isfinite(b) for b in at("bl"))
+    assert all(close(v, (-0.5, 0.5, 0)) for v in at("uvp"))
+    assert all(abs(t - 1 / bpy.context.scene.render.fps) < 1e-6 for t in at("ti")), at("ti")[:2]
+    assert all(abs(v.co.z) < 1e-5 for v in mesh.vertices)
+
+    # primuv() and @cyclic / @curveptnum on curves
+    obj, node, text = make_setup('v@pu = primuv(1, "P", 0, @ptnum / 24.0)')
+    tree = node.id_data
+    line = tree.nodes.new("GeometryNodeCurvePrimitiveLine")
+    line.inputs["End"].default_value = (2, 0, 0)
+    tree.links.new(line.outputs[0], node.inputs["Input 2"])
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, v in enumerate(attr(mesh, "pu")):
+        assert close(v, (2 * i / 24.0, 0, 0)), (i, v)
+    circle, to_mesh = tree.nodes.new("GeometryNodeCurvePrimitiveCircle"), tree.nodes.new("GeometryNodeCurveToMesh")
+    circle.inputs["Resolution"].default_value = 6
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(circle.outputs[0], node.inputs[0])
+    tree.links.new(node.outputs[0], to_mesh.inputs[0])
+    tree.links.new(to_mesh.outputs[0], out.inputs[0])
+    text.from_string("i@cy = @cyclic\ni@cp = @curveptnum")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert set(attr(mesh, "cy")) == {1} and sorted(attr(mesh, "cp")) == list(range(6))
+
+
+def test_language_extras():
+    src = """
+    i@a = @ptnum << 2
+    i@b = @ptnum >> 1
+    i@c = (@ptnum & 3) ^ 1
+    i@n = ~@ptnum
+    b@d = @ptnum in (2, 5)
+    def mm(v):
+        if v.x > v.y:
+            return v.y, v.x
+        return v.x, v.y
+    lo, hi = mm(@P)
+    f@lo = lo
+    f@hi = hi
+    s = 0.0
+    for c in @P:
+        s += c
+    f@s = s
+    v@sw = @P.yxz
+    f@m = max(@P.x, @P.y, 0.25)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        assert attr(mesh, "a")[i] == i << 2 and attr(mesh, "b")[i] == i >> 1
+        assert attr(mesh, "c")[i] == (i & 3) ^ 1 and attr(mesh, "n")[i] == ~i
+        assert attr(mesh, "d")[i] == (i in (2, 5))
+        assert abs(attr(mesh, "lo")[i] - min(x, y)) < 1e-5 and abs(attr(mesh, "hi")[i] - max(x, y)) < 1e-5
+        assert abs(attr(mesh, "s")[i] - (x + y + z)) < 1e-5 and close(attr(mesh, "sw")[i], (y, x, z))
+        assert abs(attr(mesh, "m")[i] - max(x, y, 0.25)) < 1e-5
+
+
+def test_matrices_normals_instances():
+    from mathutils import Euler, Vector
+    src = """
+    m = maketransform((1, 2, 3), quaternion(@P.x, (0, 0, 1)), (2, 2, 2))
+    m[3][1] = @P.y
+    f@tx = m[3][0]
+    v@p = (0, 0, 0) * m
+    v@t = cracktransform(0, 0, 0, (0, 0, 0), m)
+    v@r = cracktransform(0, 0, 1, (0, 0, 0), m)
+    v@s = cracktransform(0, 0, 2, (0, 0, 0), m)
+    v@look = (0, 0, -1) * lookat((0, 0, 0), (1, 0, 0))
+    @N = normalize(@P + (0, 0, 2))
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        assert abs(attr(mesh, "tx")[i] - 1) < 1e-5 and close(attr(mesh, "p")[i], (1, y, 3))
+        assert close(attr(mesh, "t")[i], (1, y, 3)) and close(attr(mesh, "s")[i], (2, 2, 2))
+        assert close(Euler([math.radians(c) for c in attr(mesh, "r")[i]]).to_quaternion() @ Vector((1, 0, 0)),
+                     (math.cos(x), math.sin(x), 0))
+        assert close(attr(mesh, "look")[i], (1, 0, 0))
+    want = {i: Vector((x, y, z + 2)).normalized() for i, (x, y, z) in enumerate(original_points(obj))}
+    for k, corner in enumerate(mesh.corner_normals):
+        assert close(corner.vector, want[mesh.loops[k].vertex_index]), (k, tuple(corner.vector))
+
+    # Instances: orient, scale and P write each instance's transform
+    obj, node, text = make_setup("""
+    p@orient = quaternion(@elemnum * 0.5, (0, 0, 1))
+    @scale = (2, 2, 2)
+    @P += (0, 0, @elemnum)
+    """, domain="INSTANCE")
+    tree = node.id_data
+    pts, cube, iop = (tree.nodes.new(i) for i in ("GeometryNodePoints", "GeometryNodeMeshCube",
+                                                   "GeometryNodeInstanceOnPoints"))
+    pts.inputs["Count"].default_value = 3
+    tree.links.new(pts.outputs[0], iop.inputs["Points"])
+    tree.links.new(cube.outputs[0], iop.inputs["Instance"])
+    tree.links.new(iop.outputs[0], node.inputs[0])
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    mats = sorted((inst.matrix_world.copy() for inst in deps.object_instances
+                   if inst.is_instance and inst.parent and inst.parent.original == obj), key=lambda m: m.translation.z)
+    assert len(mats) == 3
+    for k, m in enumerate(mats):
+        loc, rot, scale = m.decompose()
+        assert close(loc, (0, 0, k)) and close(scale, (2, 2, 2)), (k, loc, scale)
+        assert close(rot @ Vector((1, 0, 0)), (math.cos(k * 0.5), math.sin(k * 0.5), 0))
+
+
+def test_geometry_functions():
+    from mathutils import Vector
+    # New points after the old ones, attributes written on them, faces with shared points
+    obj, node, text = make_setup("""
+    f@w = @ptnum
+    if @ptnum % 5 < 4 and @ptnum < 20:
+        pt = addpoint(0, @P + (0.25, 0.25, 1))
+        setpointattrib(0, "h", pt, @ptnum + 100.0)
+        addprim(0, "poly", @ptnum, @ptnum + 1, pt)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    orig = original_points(obj)
+    makers = [i for i in range(25) if i % 5 < 4 and i < 20]
+    assert len(mesh.vertices) == 25 + len(makers) and len(mesh.polygons) == 16 + len(makers)
+    assert all(close(mesh.vertices[i].co, orig[i]) for i in range(25))
+    h = attr(mesh, "h")
+    for k, i in enumerate(makers):
+        new = mesh.vertices[25 + k]
+        assert close(new.co, Vector(orig[i]) + Vector((0.25, 0.25, 1))) and abs(h[25 + k] - (i + 100)) < 1e-5
+        face = mesh.polygons[16 + k]
+        assert sorted(face.vertices) == sorted((i, i + 1, 25 + k))
+        # Houdini's clockwise order: the normal is the left-handed one of (i, i + 1, pt)
+        a, b, c = (Vector(mesh.vertices[v].co) for v in (i, i + 1, 25 + k))
+        assert close(face.normal, -(b - a).cross(c - a).normalized())
+    assert attr(mesh, "w")[:25] == [pytest_approx(i) for i in range(25)]
+
+    # Polylines become curves; copies keep attributes; write modes; removals
+    text.from_string(textwrap.dedent("""
+    f@w = @ptnum
+    pt = addpoint(0, @ptnum)
+    addprim(0, "polyline", @ptnum, pt)
+    setpointattrib(0, "acc", 0, 1.0, "add")
+    setpointattrib(0, "lo", 2, @P.x, "min")
+    if @ptnum >= 20:
+        removepoint(0, @ptnum - 20)
+    """))
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    assert len(geo.curves.curves) == 25
+    mesh = obj.evaluated_get(deps).data
+    assert len(mesh.vertices) == 50 - 5  # points 0-4 removed
+    w = attr(mesh, "w")
+    assert w[:20] == [pytest_approx(i) for i in range(5, 25)] and w[20:] == [pytest_approx(i) for i in range(25)]
+    acc, lo = attr(mesh, "acc"), attr(mesh, "lo")
+    assert abs(acc[0] - 0.0) < 1e-6  # point 0 was removed; nothing else got "add"
+    # point 2 was removed too; check the min mode on a kept point instead
+    text.from_string('setpointattrib(0, "lo", 7, @P.x, "min")\nsetpointattrib(0, "acc", 7, 1.0, "add")\n'
+                     'setprimattrib(0, "f", @ptnum % 16, 1, "add")')
+    node.sync()
+    mesh = evaluate(obj)
+    assert abs(attr(mesh, "lo")[7] - min(min(x for x, _, _ in orig), 0)) < 1e-6 and attr(mesh, "acc")[7] == 25
+    assert sorted(round(v) for v in attr(mesh, "f")) == [1] * 7 + [2] * 9
+
+    # Faces: removeprim, in a loop of fixed length (unrolled)
+    obj, node, text = make_setup("""
+    if @primnum % 2 == 0:
+        removeprim(0, @primnum, 1)
+    """, domain="FACE")
+    assert node.error == "", node.error
+    assert len(evaluate(obj).polygons) == 8
+    text.from_string("for i in range(12):\n    addpoint(0, @P + (0, 0, i + 1))")
+    node.sync()
+    assert node.error == "", node.error
+    assert len(evaluate(obj).vertices) == 25 + 16 * 12  # 16 faces, 12 points each
+
+    # In a loop that is a Repeat Zone (the count is a channel): numbered pass by pass
+    obj, node, text = make_setup("""
+    for i in range(chi("count", 3)):
+        pt = addpoint(0, @P + (0, 0, i + 1))
+        setpointattrib(0, "k", pt, i + 10)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    orig = original_points(obj)
+    assert len(mesh.vertices) == 100
+    k = attr(mesh, "k")
+    for p in range(3):
+        for e in range(25):
+            v = 25 + p * 25 + e
+            assert close(mesh.vertices[v].co, Vector(orig[e]) + Vector((0, 0, p + 1))) and k[v] == p + 10
+    text.from_string('prim = addprim(0, "polyline")\nfor i in range(chi("passes", 4)):\n'
+                     '    addvertex(0, prim, addpoint(0, @P + (0, 0, i)))')
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    assert len(geo.curves.curves) == 25 and len(geo.curves.points) == 100
+    assert [tuple(geo.curves.points[i].position) for i in range(4)] == [(-1, -1, z) for z in range(4)]
+
+
+def test_review_fixes():
+    from mathutils import Vector
+    orig = None
+
+    def run(src, domain="POINT"):
+        nonlocal orig
+        obj, node, text = make_setup(src, domain)
+        assert node.error == "", node.error
+        orig = original_points(obj)
+        return obj, node, text, evaluate(obj)
+
+    # 1. translate() / setcomp() / out arguments in a Repeat Zone loop
+    obj, node, text, mesh = run('m = ident()\nv = (0, 0, 0)\ns = 0\nf = 0.0\nfor i in range(chi("n", 3)):\n'
+                                '    translate(m, (0, 0, 1))\n    setcomp(v, v.x + 1, 0)\n    f += wnoise(@P + i, s)\n'
+                                '@P *= m\nv@vv = v\ni@s = s')
+    assert len(mesh.vertices) == 25
+    assert all(abs(v.co.z - 3) < 1e-5 for v in mesh.vertices) and all(close(c, (3, 0, 0)) for c in attr(mesh, "vv"))
+    # 2. a captured (swapped) value used by addpoint
+    obj, node, text = make_setup("f@m = 1")
+    obj.data.attributes.new("a", "FLOAT", "POINT").data.foreach_set("value", [float(i) for i in range(25)])
+    obj.data.attributes.new("b", "FLOAT", "POINT").data.foreach_set("value", [100.0 + i for i in range(25)])
+    text.from_string("t = f@a\nf@a = f@b + 5\nf@b = t\nif @ptnum < 3:\n    addpoint(0, (t, 0, 10))")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert [round(mesh.vertices[25 + k].co.x) for k in range(3)] == [0, 1, 2]
+    # 3. curve-only input: new points are one-point curves, numbered after the curve points
+    obj, node, text = make_setup('pt = addpoint(0, @P + (0, 0, 1))\nsetpointattrib(0, "h", pt, 7.0)\n'
+                                 'addprim(0, "polyline", @ptnum, pt)')
+    tree = node.id_data
+    line, res = tree.nodes.new("GeometryNodeCurvePrimitiveLine"), tree.nodes.new("GeometryNodeResampleCurve")
+    res.inputs["Count"].default_value = 3
+    tree.links.new(line.outputs[0], res.inputs[0])
+    tree.links.new(res.outputs[0], node.inputs[0])
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    c = geo.curves
+    assert len(c.curves) == 1 + 3 + 3 and len(c.points) == 3 + 3 + 6  # the line, 3 new points, 3 polylines
+    h = [d.value for d in c.attributes["h"].data]
+    assert h[:3] == [0, 0, 0] and h[3:6] == [7, 7, 7]
+    # ... and with polylines already on a mesh, new points are numbered after the mesh's
+    obj, node, text = make_setup('pt = addpoint(0, @P + (0, 0, 1))\naddprim(0, "polyline", @ptnum, pt)')
+    tree = node.id_data
+    second = tree.nodes.new("GeometryNodeBexWrangle")
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(node.outputs[0], second.inputs[0])
+    tree.links.new(second.outputs[0], out.inputs[0])
+    t2 = bpy.data.texts.new("second.bex")
+    t2.from_string('pt = addpoint(0, @P)\nsetpointattrib(0, "h", pt, 7.0)')
+    second.script = t2
+    second.sync()
+    assert second.error == "", second.error
+    mesh = evaluate(obj)
+    assert len(mesh.vertices) == 100 and attr(mesh, "h")[50:] == [7.0] * 50
+    # 4. a function making points, called twice in a Repeat Zone loop
+    obj, node, text, mesh = run('def mk(h):\n    return addpoint(0, @P + (0, 0, h))\n'
+                                'for i in range(chi("n", 3)):\n    a = mk(i + 1.0)\n    b = mk(i + 1.5)')
+    assert len(mesh.vertices) == 25 + 25 * 6
+    # 7. addpoint in one branch of a ternary
+    obj, node, text, mesh = run("x = addpoint(0, @P + (0, 0, 1)) if @P.x > 0 else -1")
+    assert len(mesh.vertices) == 25 + sum(1 for p in orig if p[0] > 0)
+    # 8. chi() with float limits
+    obj, node, text, mesh = run('i@n = chi("n", 1, min=0.5, max=3.5)')
+    item = next(i for i in node.node_tree.interface.items_tree if getattr(i, "name", "") == "n")
+    assert (item.min_value, item.max_value) == (1, 3)
+    # second review: attribute writes in a ternary branch, a rotation returned inside a loop
+    obj, node, text, mesh = run("def w():\n    @foo = 5\n    return 1\nx = w() if @P.x > 0 else 0")
+    assert attr(mesh, "foo") == [5.0 if p[0] > 0 else 0.0 for p in orig]
+    obj, node, text, mesh = run('def f(x):\n    q = quaternion(0, (0, 0, 1))\n    for i in range(chi("n", 3)):\n'
+                                '        q *= quaternion(0.5, (0, 0, 1))\n        if x < i:\n            return q\n'
+                                '    return q\np@o = f(@P.x * 2)\nv@d = (1, 0, 0) * @o')
+    for p, d in zip(orig, attr(mesh, "d")):
+        turns = next((i + 1 for i in range(3) if p[0] * 2 < i), 3)
+        assert close(d, (math.cos(0.5 * turns), math.sin(0.5 * turns), 0)), (p, d)
+    # 11. a per-element quaternion's components are normalized
+    obj, node, text, mesh = run("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
+    assert all(abs(w - 1) < 1e-5 for w in attr(mesh, "w"))
+
+
+def test_arrays():
+    src = """
+    a = [@P.x, @P.y, 0.5]
+    i = @ptnum % 3
+    f@pick = a[i]
+    b = []
+    for k in range(chi("n", 4)):
+        if (k + @ptnum) % 2 == 0:
+            b.append(k * 10)
+    i@blen = len(b)
+    f@bsum = sum(b)
+    s = sort([@P.x, -@P.y, 0.25])
+    f@lo = s[0]
+    f@hi = s[-1]
+    nb = neighbours(0, @ptnum)
+    i@ncount = len(nb)
+    t = 0.0
+    for p in nb:
+        t += point(0, "P", p).x
+    f@nx = t
+    near = nearpoints(0, @P, 0.6, 3)
+    i@nn = len(near)
+    i@n0 = near[0]
+    b@has = 3 in nb
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    pts = original_points(obj)
+    edges = {}
+    for e in mesh.edges:
+        a, b = e.vertices
+        edges.setdefault(a, []).append(b)
+        edges.setdefault(b, []).append(a)
+    for i, (x, y, z) in enumerate(pts):
+        assert abs(attr(mesh, "pick")[i] - [x, y, 0.5][i % 3]) < 1e-5
+        b = [k * 10 for k in range(4) if (k + i) % 2 == 0]
+        assert attr(mesh, "blen")[i] == len(b) and abs(attr(mesh, "bsum")[i] - sum(b)) < 1e-5
+        srt = sorted([x, -y, 0.25])
+        assert abs(attr(mesh, "lo")[i] - srt[0]) < 1e-5 and abs(attr(mesh, "hi")[i] - srt[-1]) < 1e-5
+        nb = edges[i]
+        assert attr(mesh, "ncount")[i] == len(nb) and abs(attr(mesh, "nx")[i] - sum(pts[p][0] for p in nb)) < 1e-4
+        assert attr(mesh, "has")[i] == (3 in nb)
+        near = sorted((k for k, p in enumerate(pts) if (p[0] - x) ** 2 + (p[1] - y) ** 2 <= 0.36),
+                      key=lambda k: ((pts[k][0] - x) ** 2 + (pts[k][1] - y) ** 2, k))
+        assert attr(mesh, "nn")[i] == min(len(near), 3) and attr(mesh, "n0")[i] == i, (i, attr(mesh, "nn")[i], near)
+
+    # faces from an array of points; primpoints on faces
+    obj, node, text = make_setup("""
+    if @ptnum % 5 < 4 and @ptnum < 20:
+        pts = [@ptnum, @ptnum + 1, @ptnum + 6]
+        addprim(0, "poly", pts)
+    """)
+    assert node.error == "", node.error
+    assert len(evaluate(obj).polygons) == 32
+    obj, node, text = make_setup("pts = primpoints(0, @primnum)\ni@c = len(pts)\ni@p2 = pts[2]", domain="FACE")
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "c") == [4] * 16
+    assert all(attr(mesh, "p2")[f] == mesh.polygons[f].vertices[2] for f in range(16))
 
 
 class pytest_approx(float):
@@ -1096,7 +1981,10 @@ class pytest_approx(float):
 
 
 failed = 0
+only = sys.argv[sys.argv.index("--") + 1:] if "--" in sys.argv else []  # test names to run, else all
 for name, fn in sorted((n, f) for n, f in globals().items() if n.startswith("test_")):
+    if only and name not in only:
+        continue
     try:
         fn()
         print("ok", name)

@@ -5,6 +5,7 @@ The selection runs between ``anchor`` and ``cursor`` when ``anchor`` is set.
 ``version`` increments on every content change.
 """
 
+PAIRS = {"(": ")", "[": "]", '"': '"', "'": "'"}  # typed together, like VS Code
 INDENT = "    "
 HISTORY_LIMIT = 200
 
@@ -135,12 +136,53 @@ class TextBuffer:
             prev = self.lines[row][col - 1:col]
             if prev and (is_word_char(prev) or prev in ")]}\"'"):
                 self._group = None  # a space after a word or value starts a new undo step
+        if len(s) == 1 and self._auto_pair(s, typing):
+            return
         self._begin_edit("type" if typing else None)
         self._delete_selection()
         self._insert_raw(s)
         if s == ":":
             self._dedent_else(self.cursor[0])
         self._changed()
+
+    def _auto_pair(self, s, typing):
+        """Brackets and quotes like VS Code: an opening one adds its closing one
+        (or wraps the selection), typing a closing one just steps over it.
+        True when it handled `s`."""
+        row, col = self.cursor
+        line = self.lines[row]
+        after, before = line[col:col + 1], line[col - 1:col] if col else ""
+        if typing and s in PAIRS.values() and after == s and (s not in "\"'" or self._open_quote(line, col, s)):
+            self._group = None
+            self.cursor = (row, col + 1)
+            self.anchor = None
+            return True
+        if s not in PAIRS:
+            return False
+        if self.has_selection:  # wrap a selection on one line
+            (r0, c0), (r1, c1) = self.selection_range()
+            if r0 != r1:
+                return False
+            self._begin_edit()
+            inner = self.lines[r0][c0:c1]
+            self.lines[r0] = self.lines[r0][:c0] + s + inner + PAIRS[s] + self.lines[r0][c1:]
+            self.anchor, self.cursor = (r0, c0 + 1), (r0, c1 + 1)
+            self._changed()
+            return True
+        if not typing or (after and not after.isspace() and after not in ")]}:,"):
+            return False
+        if s in "\"'" and (is_word_char(before) or before == s or line[:col].count(s) % 2):
+            return False  # it closes a string, or sits after a word (an apostrophe)
+        self._begin_edit("type")
+        self._insert_raw(s + PAIRS[s])
+        self.cursor = (row, col + 1)
+        self._changed()
+        return True
+
+    @staticmethod
+    def _open_quote(line, col, q):
+        """The quote at `col` closes a string opened before it on the line."""
+        return line[:col].count(q) % 2 == 1
 
     def _dedent_else(self, row):
         """Typing the ':' of `else:` / `elif ...:` lines it up with its `if`, like VS Code."""
@@ -189,6 +231,13 @@ class TextBuffer:
             self._changed()
             return
         row, col = self.cursor
+        line = self.lines[row]
+        if not word and col and PAIRS.get(line[col - 1:col]) == line[col:col + 1] != "":  # (|) -> |
+            self._begin_edit()
+            self.lines[row] = line[:col - 1] + line[col + 1:]
+            self.cursor = (row, col - 1)
+            self._changed()
+            return
         if word:
             target = self._word_left(self.cursor)
         elif col > 0 and not self.lines[row][:col].strip(" "):
