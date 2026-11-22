@@ -9,11 +9,11 @@ import traceback
 import bpy
 from bpy.app.handlers import persistent
 
-from . import builder, code_editor, library, presets, ramp_widget
+from . import builder, code_editor, library, presets, ramp_widget, upstream
 from .lang import BexError, compile_source
 
 # Bump when the generated node layout changes, so existing nodes recompile.
-COMPILER_VERSION = 24
+COMPILER_VERSION = 25
 WATCH_INTERVAL = 1.0   # Text Editor / file check, only while a script is open or on disk
 TYPING_IDLE = 2.0      # Text Editor: a line counts as finished after this pause
 SAVED_LIMIT = 64       # remembered values of removed inputs, per node
@@ -159,6 +159,10 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
     def update(self):
         # Links changed: an input that was just unlinked goes back to being a property.
         self.hide_channel_sockets()
+        # What reaches Input 2-4 types point(1, "name", i): recompile soon (not inside this callback).
+        if self.script and not self.is_up_to_date():
+            tree, name = self.id_data.name, self.name
+            bpy.app.timers.register(lambda: _sync_later(tree, name), first_interval=0.0)
 
     def hide_channel_sockets(self):
         """ch*() values are properties drawn on the node, not inputs: their sockets
@@ -197,8 +201,15 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
             names = []
         return [n for n in names if self.bex_ramps.get(n) is not None]
 
-    def _key(self, src):
-        digest = hashlib.md5(f"{self.group}\0{src}".encode()).hexdigest()
+    def input_types(self, fresh=False):
+        """{n: {attribute: type}} the node graph says reaches Input 2-4 (upstream.py's guess)."""
+        geos = [s for s in self.inputs if s.type == "GEOMETRY"]
+        return {n: dict(upstream.incoming_attributes(self, n, fresh)) for n in range(1, len(geos))
+                if geos[n].is_linked}
+
+    def _key(self, src, fresh=False):
+        types = json.dumps(self.input_types(fresh), sort_keys=True) if self.inputs else ""
+        digest = hashlib.md5(f"{self.group}\0{src}\0{types}".encode()).hexdigest()
         return f"{COMPILER_VERSION}|{self.domain}|{digest}"
 
     def is_up_to_date(self):
@@ -221,7 +232,7 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         the timer and undo, so they never undo what someone is doing inside.
         """
         src = self.script.as_string() if self.script else ""
-        key = self._key(src)
+        key = self._key(src, fresh=True)
         if restore and self.tree_edited():
             force = True
         if pending_line is None and key == self.compiled_key and not force and self.node_tree:
@@ -229,7 +240,8 @@ class BexWrangleNode(bpy.types.GeometryNodeCustomGroup):
         name = self.script.name if self.script else "(no script)"
         try:
             known = [s.name for s in self.channels()] + [r.name for r in self.bex_ramps]
-            program = compile_source(src, self.domain, pending_line, known, group=self.group)
+            program = compile_source(src, self.domain, pending_line, known, group=self.group,
+                                     input_types=self.input_types(fresh=True))
             if program.pending:
                 key += "|pending"
             if key == self.compiled_key and not force and self.node_tree:
@@ -351,6 +363,14 @@ def wrangle_nodes():
         for node in tree.nodes:
             if node.bl_idname == BexWrangleNode.bl_idname:
                 yield node
+
+
+def _sync_later(tree_name, node_name):
+    tree = bpy.data.node_groups.get(tree_name)
+    node = tree.nodes.get(node_name) if tree else None
+    if node is not None and node.bl_idname == BexWrangleNode.bl_idname:
+        node.sync()
+    return None  # run once
 
 
 def sync_all(force=False, restore=True):

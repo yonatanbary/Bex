@@ -622,8 +622,11 @@ SIGNATURES = {
 
 
 class Compiler:
-    def __init__(self, domain="POINT", pending_line=None, known_params=()):
+    def __init__(self, domain="POINT", pending_line=None, known_params=(), input_types=None):
         self.domain = domain
+        # {input number: {attribute: type}}: what the node graph says reaches inputs 1-3,
+        # used for point(1, "name", i) and @opinput1_name without a type prefix
+        self.input_types = input_types or {}
         # A ch*() on `pending_line` (the line being typed) whose name is not in
         # `known_params` compiles as its default constant instead of creating
         # an input, so half-typed names don't add and remove sockets.
@@ -1181,8 +1184,15 @@ class Compiler:
         if not name:
             raise self.err(f"{fn}() needs an attribute name")
         if type is None:
-            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+            type = self.input_attr_type(n, name)
         return self.sample(n, name, type, self.eval(args[2]), SAMPLE_FUNCS[fn])
+
+    def input_attr_type(self, n, name):
+        """The type of an attribute read from input `n` without a prefix: a built-in's,
+        else the guess from the node graph (input_types), else a known name's, else float."""
+        if name in BUILTINS:
+            return BUILTINS[name][0]
+        return self.input_types.get(n, {}).get(name) or KNOWN_TYPES.get(name, "float")
 
     def count(self, n, domain):
         return self.node("count", "int", (), input=n, domain=domain)
@@ -1459,7 +1469,7 @@ class Compiler:
         name, type = _typed_name(args[1].value)
         name = ALIASES.get(name, name)
         if type is None:
-            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+            type = self.input_attr_type(n, name)
         value = self.read_input(n, name, type)
         if fn == "primuv":
             curve, u = self.conv(self.eval(args[2]), "int"), self.eval(args[3])
@@ -1613,7 +1623,7 @@ class Compiler:
             raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
         self.input_number(Val("int", n), f"@opinput{n}")
         name = ALIASES.get(name, name)
-        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or KNOWN_TYPES.get(name, "float")
+        type = BUILTINS[name][0] if name in BUILTINS else prefix_type or self.input_attr_type(n, name)
         index = self.read_original("index", "int")
         return self.sample(n, name, type, index, self.domain)
 
@@ -3125,7 +3135,7 @@ def _mark_groups(e):
     return e
 
 
-def compile_source(src, domain="POINT", pending_line=None, known_params=(), group=""):
+def compile_source(src, domain="POINT", pending_line=None, known_params=(), group="", input_types=None):
     """`pending_line` (1-based) and `known_params`: see Compiler.
 
     `group`: which elements the script writes (Houdini's group field): a pattern
@@ -3133,15 +3143,15 @@ def compile_source(src, domain="POINT", pending_line=None, known_params=(), grou
     `@P.y > 0`. A bare name is a bool attribute.
     It is read from the incoming geometry, before the script runs.
     """
-    c, prog = _compile(src, domain, pending_line, known_params, group, frozenset())
+    c, prog = _compile(src, domain, pending_line, known_params, group, frozenset(), input_types)
     shared = frozenset(k for k, n in c.call_counts.items() if n > 1)
     if shared:  # functions called more than once: built once each, as Closures
-        c, prog = _compile(src, domain, pending_line, known_params, group, shared)
+        c, prog = _compile(src, domain, pending_line, known_params, group, shared, input_types)
     return prog
 
 
-def _compile(src, domain, pending_line, known_params, group, closure_keys):
-    c = Compiler(domain, pending_line, known_params)
+def _compile(src, domain, pending_line, known_params, group, closure_keys, input_types=None):
+    c = Compiler(domain, pending_line, known_params, input_types)
     c.closure_keys = closure_keys
     selection, warnings = None, []
     if group.strip():
@@ -3153,7 +3163,7 @@ def _compile(src, domain, pending_line, known_params, group, closure_keys):
             # Like Houdini: a group that doesn't make sense selects nothing, it doesn't
             # break the node (the node shows a warning). Start over so nothing
             # half-compiled from it remains.
-            c = Compiler(domain, pending_line, known_params)
+            c = Compiler(domain, pending_line, known_params, input_types)
             c.closure_keys = closure_keys
             selection = Val("bool", False)
             warnings.append(f"group: {e.msg} (selects nothing)")

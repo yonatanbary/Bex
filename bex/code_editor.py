@@ -759,6 +759,10 @@ def info_lines(node):
         return "  ".join(_attr_label(n, t) for n, t in pairs) or "–"
 
     incoming = names(incoming_attributes(node))
+    geos = [s for s in node.inputs if s.type == "GEOMETRY"]
+    for n in range(1, len(geos)):  # the other inputs, when something is plugged in
+        if geos[n].is_linked:
+            incoming += f"   ·  {n}: " + names(incoming_attributes(node, n))
     reads = names(info.get("reads", []))
     writes = names(info.get("writes", []))
     count = info.get("nodes")

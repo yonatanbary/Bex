@@ -1288,6 +1288,8 @@ def test_other_inputs():
     for i, v in enumerate(other.data.vertices):
         v.co.z = i * 0.5
     other.data.attributes.new("w", "FLOAT", "POINT").data.foreach_set("value", [i * 2.0 for i in range(len(points))])
+    other.data.attributes.new("vel", "FLOAT_VECTOR", "POINT").data.foreach_set(
+        "vector", [c for i in range(len(points)) for c in (i, 1, 2)])
     text.from_string('@P.z = point(1, "P", @ptnum).z\nf@w = @opinput1_w\ni@n = npoints(1)\n'
                      'i@near = nearpoint(1, @P + (0, 0, 100))\nv@top = getbbox_max(1)')
     node.sync()
@@ -1306,6 +1308,11 @@ def test_other_inputs():
     assert {d.value for d in mesh.attributes["n"].data} == {count}
     assert {d.value for d in mesh.attributes["near"].data} == {count - 1}  # the highest point
     assert all(close(d.vector, (1, 1, (count - 1) * 0.5)) for d in mesh.attributes["top"].data)
+    # point() without a type prefix takes the type the graph says reaches the input
+    text.from_string('v@vv = point(1, "vel", @ptnum)')
+    node.sync()
+    assert node.error == "", node.error
+    assert [tuple(d.vector) for d in evaluate(obj).attributes["vv"].data] == [(i, 1, 2) for i in range(count)]
     # The four inputs are always there, like a wrangle's, and keep their links.
     text.from_string('f@m = chf("amount", 1)')
     node.sync()

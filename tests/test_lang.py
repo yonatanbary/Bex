@@ -899,6 +899,15 @@ def test_geometry_functions():
     fails('setpointattrib(0, "ptnum", 0, 1)', "can't write")
 
 
+def test_input_types_from_the_graph():
+    src = 'v@a = point(1, "vel", 0)\nv@b = @opinput2_dir\nf@c = point(1, "other", 0)'
+    prog = compile_source(src, input_types={1: {"vel": "vector"}, 2: {"dir": "vector"}})
+    assert [t for _n, t, _v in prog.writes] == ["vector", "vector", "float"]
+    w = {n: v for n, _t, v in prog.writes}
+    assert w["a"].node.params["dtype"] == "vector"
+    assert writes('v@a = point(1, "vel", 0)')["a"].node.params["dtype"] == "float"  # no guess: a float
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
