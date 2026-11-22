@@ -1663,6 +1663,57 @@ def test_language_extras():
         assert abs(attr(mesh, "m")[i] - max(x, y, 0.25)) < 1e-5
 
 
+def test_matrices_normals_instances():
+    from mathutils import Euler, Vector
+    src = """
+    m = maketransform((1, 2, 3), quaternion(@P.x, (0, 0, 1)), (2, 2, 2))
+    m[3][1] = @P.y
+    f@tx = m[3][0]
+    v@p = (0, 0, 0) * m
+    v@t = cracktransform(0, 0, 0, (0, 0, 0), m)
+    v@r = cracktransform(0, 0, 1, (0, 0, 0), m)
+    v@s = cracktransform(0, 0, 2, (0, 0, 0), m)
+    v@look = (0, 0, -1) * lookat((0, 0, 0), (1, 0, 0))
+    @N = normalize(@P + (0, 0, 2))
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        assert abs(attr(mesh, "tx")[i] - 1) < 1e-5 and close(attr(mesh, "p")[i], (1, y, 3))
+        assert close(attr(mesh, "t")[i], (1, y, 3)) and close(attr(mesh, "s")[i], (2, 2, 2))
+        assert close(Euler([math.radians(c) for c in attr(mesh, "r")[i]]).to_quaternion() @ Vector((1, 0, 0)),
+                     (math.cos(x), math.sin(x), 0))
+        assert close(attr(mesh, "look")[i], (1, 0, 0))
+    want = {i: Vector((x, y, z + 2)).normalized() for i, (x, y, z) in enumerate(original_points(obj))}
+    for k, corner in enumerate(mesh.corner_normals):
+        assert close(corner.vector, want[mesh.loops[k].vertex_index]), (k, tuple(corner.vector))
+
+    # Instances: orient, scale and P write each instance's transform
+    obj, node, text = make_setup("""
+    p@orient = quaternion(@elemnum * 0.5, (0, 0, 1))
+    @scale = (2, 2, 2)
+    @P += (0, 0, @elemnum)
+    """, domain="INSTANCE")
+    tree = node.id_data
+    pts, cube, iop = (tree.nodes.new(i) for i in ("GeometryNodePoints", "GeometryNodeMeshCube",
+                                                   "GeometryNodeInstanceOnPoints"))
+    pts.inputs["Count"].default_value = 3
+    tree.links.new(pts.outputs[0], iop.inputs["Points"])
+    tree.links.new(cube.outputs[0], iop.inputs["Instance"])
+    tree.links.new(iop.outputs[0], node.inputs[0])
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    mats = sorted((inst.matrix_world.copy() for inst in deps.object_instances
+                   if inst.is_instance and inst.parent and inst.parent.original == obj), key=lambda m: m.translation.z)
+    assert len(mats) == 3
+    for k, m in enumerate(mats):
+        loc, rot, scale = m.decompose()
+        assert close(loc, (0, 0, k)) and close(scale, (2, 2, 2)), (k, loc, scale)
+        assert close(rot @ Vector((1, 0, 0)), (math.cos(k * 0.5), math.sin(k * 0.5), 0))
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

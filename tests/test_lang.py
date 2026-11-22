@@ -424,7 +424,7 @@ def test_errors():
     fails("@a = 1 2", "end of the line", 1)
     fails("@a = 1\n@b = foo(2)", "unknown function", 2)
     fails("@a = @P", "write v@a to store a vector")
-    fails("@N = (0, 0, 1)", "read-only")
+    fails("@ptnum = 1", "read-only")
     fails("@P = (0, 0, 1)", "Points", domain="FACE")
     fails("v@a = 1; f@a = 2", "cannot be used as float")
     fails("@a = 1 $ 2", "unexpected character")
@@ -849,6 +849,26 @@ def test_language_extras():
     fails("f@a = 1.5 & 2", "works on whole numbers")
     fails("a, b += 1", "needs a single target")
     fails("1, 2", "do nothing")
+
+
+def test_matrix_elements_and_instances():
+    w = writes("m = maketransform((1, 2, 3), quaternion(0, (0, 0, 1)))\nf@tx = m[3][0]\nm[3][1] = 5\n"
+               "v@p = (0, 0, 0) * m\nf@g = getcomp(m, 3, 2)\nv = (1, 2, 3)\nsetcomp(v, 9, 1)\nv@v2 = v")
+    assert w["tx"].const == 1.0 and w["p"].const == (1, 5, 3) and w["g"].const == 3.0 and w["v2"].const == (1, 9, 3)
+    w = writes("f@a = 4@m[3][0]\n@m[0][0] = 2")
+    assert w["a"].node.params["idname"] == "FunctionNodeSeparateMatrix" and w["a"].out == 12
+    assert w["m"].node.params["idname"] == "FunctionNodeCombineMatrix"
+    fails("m = ident()\nf@a = m[1]", "row of a matrix")
+    fails("m = ident()\nf@a = m[-5][0]", "component index")
+    fails("v@a = cracktransform(1, 0, 0, (0, 0, 0), ident())", "trs = 0")
+    # instances: orient / scale / P are one instance_transform
+    prog = compile_source("p@orient = quaternion(@elemnum, (0, 0, 1))\n@scale = (2, 2, 2)\nf@w = 1", "INSTANCE")
+    assert [n for n, _t, _v in prog.writes] == ["instance_transform", "w"]
+    w = writes("f@a = @orient.w", domain="INSTANCE")
+    assert w["a"].node.inputs[0].node.params["name"] == "instance_rotation"
+    w = writes("@N = (0, 0, 1)", domain="FACE")
+    assert set(w) == {"N"}
+    fails("@N = (0, 0, 1)", "custom normals", domain="EDGE")
 
 
 if __name__ == "__main__":

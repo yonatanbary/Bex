@@ -27,6 +27,9 @@ INPUT_NODES = {
     "mesh_island": "GeometryNodeInputMeshIsland",
     "edge_angle": "GeometryNodeInputMeshEdgeAngle",
     "spline_cyclic": "GeometryNodeInputSplineCyclic",
+    "instance_rotation": "GeometryNodeInputInstanceRotation",
+    "instance_scale": "GeometryNodeInputInstanceScale",
+    "instance_transform": "GeometryNodeInstanceTransform",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
 RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node evaluating that ramp
@@ -539,6 +542,14 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         geo = cap.outputs["Geometry"]
 
     for st in program.stores:
+        if st.name == "N":  # custom normals
+            n = new("GeometryNodeSetMeshNormal")
+            n.mode = "FREE"
+            n.domain = domain
+            connect(st.value, n.inputs["Custom Normal"])
+            links.new(geo, n.inputs["Mesh"])
+            geo = n.outputs["Mesh"]
+            continue
         if st.name == "P":
             n = new("GeometryNodeSetPosition")
             if st.offset:
@@ -628,6 +639,7 @@ BUTTON_ROWS = {
     "ShaderNodeTexWhiteNoise": 1,
     "ShaderNodeTexVoronoi": 4,
     "ShaderNodeTexGabor": 1,
+    "GeometryNodeSetMeshNormal": 2,
     "GeometryNodeInputNamedAttribute": 1,
     "GeometryNodeStoreNamedAttribute": 2,
     "GeometryNodeCaptureAttribute": 1,

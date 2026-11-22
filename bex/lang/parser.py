@@ -222,7 +222,9 @@ class Parser:
         return N("tuple", e.line, items=items)
 
     def _check_lvalue(self, e):
-        target = e.obj if e.kind in ("member", "index") else e
+        target = e
+        while target.kind in ("member", "index"):  # v.x, m[3][0]
+            target = target.obj
         if target.kind not in ("var", "attr"):
             raise BexError("can only assign to a variable, an @attribute or one of its components", e.line)
 

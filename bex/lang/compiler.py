@@ -136,7 +136,7 @@ INDEX_HINTS = {
 
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
-READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
+READ_ONLY = {"ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
              "curveu", "curvelength", "tangent", "area", "island", "edgeangle", "cyclic", "curveptnum",
              "TimeInc"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "UVMap": "vector",
@@ -301,7 +301,7 @@ ARITH = {
     "%": ("FLOORED_MODULO", _floor_mod),
     "**": ("POWER", _safe_pow),
 }
-CONSTANTS = {"E": math.e, "M_E": math.e, "PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
+CONSTANTS = {"XFORM_SRT": 0, "E": math.e, "M_E": math.e, "PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
              # rotation orders, as in VEX (eulertoquaternion(r, XFORM_ZYX)): the first axis turns first
              "XFORM_XYZ": 0, "XFORM_XZY": 1, "XFORM_YXZ": 2, "XFORM_YZX": 3, "XFORM_ZXY": 4, "XFORM_ZYX": 5}
 EULER_ORDERS = ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX")
@@ -344,7 +344,11 @@ NODE_OUTS = {
 # Quaternion and matrix functions (Compiler.transform_call)
 TRANSFORM_FUNCS = ("quaternion", "eulertoquaternion", "quaterniontoeuler", "qrotate", "qmultiply", "qinvert",
                    "slerp", "dihedral", "ident", "maketransform", "invert", "transpose", "determinant",
-                   "translate", "rotate", "scale")
+                   "translate", "rotate", "scale", "lookat", "cracktransform")
+MATRIX_OUTS = tuple(f"Column {c} Row {r}" for c in range(1, 5) for r in range(1, 5))  # Separate Matrix
+# On the Instance domain these read and write the instance's own transform (instance_transform)
+INSTANCE_ATTRS = {"orient": ("quaternion", "instance_rotation"), "scale": ("vector", "instance_scale"),
+                  "transform": ("matrix", "instance_transform")}
 # Noise (Compiler.noise_call). name -> Noise Texture type; every one takes the NOISE_OPTS keywords.
 NOISE_FUNCS = {"noise": "FBM", "vnoise": "FBM", "snoise": "FBM", "flownoise": "FBM",
                "ridgednoise": "RIDGED_MULTIFRACTAL", "hybridnoise": "HYBRID_MULTIFRACTAL",
@@ -392,7 +396,7 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
-    "countof", "blur", "at", "promote", "primuv", "uvsample", "isnan", "isfinite", "len",
+    "countof", "blur", "at", "promote", "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
 }) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
@@ -493,6 +497,11 @@ SIGNATURES = {
     "translate": (("m", "offset"), "Moves the matrix variable m by offset, after what it does."),
     "rotate": (("m", "angle", "axis"), "Turns the matrix variable m, after what it does."),
     "scale": (("m", "size"), "Scales the matrix variable m, after what it does."),
+    "lookat": (("from", "to", "[up]"), "Rotation matrix turning -Z to look from one point at another."),
+    "cracktransform": (("trs", "xyz", "c", "pivot", "m"),
+                       "Part of a matrix: c = 0 translation, 1 rotation (degrees), 2 scale. trs, xyz, pivot: 0."),
+    "getcomp": (("v", "i", "[j]"), "Component i of a vector, or element [i][j] of a matrix."),
+    "setcomp": (("v", "value", "i", "[j]"), "Sets component i of the vector variable v (or [i][j] of a matrix)."),
     # Noise and random
     "noise": (("position", "[time]"), "Smooth noise, about 0 to 1. Options: freq=, offset=, amp=, octaves=, "
                                      "rough=, lacunarity=, distortion=."),
@@ -631,6 +640,8 @@ class Compiler:
 
     def conv(self, v, type):
         """Implicit conversion. Node outputs rely on Blender's link conversion."""
+        if v.type == "row":
+            raise self.err("m[i] is a row of a matrix: pick one element with m[i][j]")
         if v.type == type:
             return v
         if v.type in OPAQUE or type in OPAQUE:
@@ -794,6 +805,20 @@ class Compiler:
         return SIZES[v.type]
 
     def member(self, v, i):
+        if v.type == "matrix":  # m[i] is half of m[i][j]: a "row" until the second index
+            if not -4 <= i < 4:
+                raise self.err("a matrix has rows 0 to 3: m[i][j]")
+            return Val("row", (v, i % 4))
+        if v.type == "row":  # VEX's m[i][j] is Blender's column i, row j (VEX puts translation in row 3)
+            m, r = v.const
+            if not -4 <= i < 4:
+                raise self.err("a matrix has columns 0 to 3: m[i][j]")
+            k = r * 4 + i % 4
+            if m.is_const:
+                return Val("float", m.const[k])
+            if m.node.kind == "node" and m.node.params["idname"] == "FunctionNodeCombineMatrix":
+                return m.node.inputs[k]
+            return self.gnode("float", "FunctionNodeSeparateMatrix", MATRIX_OUTS, k, (m,), ("Matrix",))
         n = self.size(v)
         if not -n <= i < n:
             raise self.err(f"a {v.type} has components 0 to {n - 1}" + (" (.x .y .z)" if n == 3 else ""))
@@ -808,6 +833,13 @@ class Compiler:
         if v.node.kind == "combine":
             return v.node.inputs[i]
         return self.node("separate", "float", (v,), out=i)
+
+    def combine_matrix(self, elems):
+        """A matrix from 16 floats, column by column (Blender's order)."""
+        elems = [self.conv(e, "float") for e in elems]
+        if all(e.is_const for e in elems):
+            return Val("matrix", tuple(e.const for e in elems))
+        return self.gnode("matrix", "FunctionNodeCombineMatrix", ("Matrix",), 0, elems, tuple(range(16)))
 
     def combine(self, comps):
         """A vector from three numbers, or a quaternion from four (x, y, z, w)."""
@@ -981,6 +1013,29 @@ class Compiler:
             rot = self.gnode("quaternion", "FunctionNodeAxesToRotation", ("Rotation",), 0, (z, y),
                              ("Primary Axis", "Secondary Axis"), props=(("primary_axis", "Z"), ("secondary_axis", "Y")))
             return self.trs(a[2] if len(a) == 3 else Val("vector", (0.0, 0.0, 0.0)), rot, Val("vector", (1.0, 1.0, 1.0)))
+        if name == "lookat":  # VEX: the rotation that points -Z from `from` towards `to`, Y towards up
+            want(2, 3)
+            back = self.arith("-", self.conv(a[0], "vector"), self.conv(a[1], "vector"))
+            up = self.conv(a[2], "vector") if len(a) == 3 else Val("vector", (0.0, 1.0, 0.0))
+            rot = self.gnode("quaternion", "FunctionNodeAxesToRotation", ("Rotation",), 0, (back, up),
+                             ("Primary Axis", "Secondary Axis"), props=(("primary_axis", "Z"), ("secondary_axis", "Y")))
+            return self.trs(Val("vector", (0.0, 0.0, 0.0)), rot, Val("vector", (1.0, 1.0, 1.0)))
+        if name == "cracktransform":
+            want(5)
+            trs, xyz, c, pivot = a[:4]
+            if not (trs.is_const and trs.const == 0 and xyz.is_const and xyz.const == 0):
+                raise self.err("cracktransform() only reads Blender's order: trs = 0 (XFORM_SRT), xyz = 0 (XFORM_XYZ)")
+            if not (pivot.is_const and not any(pivot.const if pivot.type == "vector" else [pivot.const])):
+                raise self.err("cracktransform()'s pivot has to be (0, 0, 0)")
+            if not (c.is_const and c.const in (0, 1, 2)):
+                raise self.err("cracktransform()'s c is 0 (translation), 1 (rotation in degrees) or 2 (scale)")
+            m = self.mat(a[4], name)
+            if c.const != 1:
+                return self.gnode("vector", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"),
+                                  c.const, (m,), ("Transform",))
+            q = self.gnode("quaternion", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"), 1,
+                           (m,), ("Transform",))
+            return self.arith("*", self.call_val("quaterniontoeuler", q), Val("float", 180 / math.pi))
         if name == "invert":
             want(1)
             return self.gnode("matrix", "FunctionNodeInvertMatrix", ("Matrix", "Invertible"), 0, (self.mat(a[0], name),),
@@ -1439,6 +1494,18 @@ class Compiler:
             return self.wnoise(arg_nodes, kw)
         if name in ("primuv", "uvsample"):
             return self.surface_sample(name, arg_nodes)
+        if name == "setcomp":  # setcomp(v, value, i, [j]): v[i] = value, v[i][j] = value
+            if len(arg_nodes) not in (3, 4) or arg_nodes[0].kind not in ("var", "attr"):
+                raise self.err("setcomp() takes a variable, a value and one or two constant indexes")
+            target = arg_nodes[0]
+            for i in arg_nodes[2:]:
+                k = self.eval(i)
+                if not (k.is_const and k.type == "int"):
+                    raise self.err("setcomp()'s indexes have to be whole-number constants")
+                target = N("member", i.line, obj=target, comp=k.const)
+            val = self.eval(arg_nodes[1])
+            self.assign(target, val)
+            return val
         if name == "promote":
             if len(arg_nodes) != 2 or arg_nodes[1].kind != "str" or arg_nodes[1].value.lower() not in DOMAIN_NAMES:
                 raise self.err('promote() takes a value and a domain in quotes: "point", "edge", "face", '
@@ -1481,6 +1548,15 @@ class Compiler:
             for x in a[1:]:
                 result = self.fn2(*MATH2[name], result, x)
             return result
+        if name == "getcomp":
+            want(2, 3)
+            idx = [x for x in a[1:]]
+            if not all(i.is_const and i.type == "int" for i in idx):
+                raise BexError("getcomp()'s indexes have to be whole-number constants", line)
+            v = a[0]
+            for i in idx:
+                v = self.member(v, i.const)
+            return self.conv(v, "float")
         if name in ("isnan", "isfinite"):
             want(1)
             x = self.conv(a[0], "float")
@@ -1730,6 +1806,8 @@ class Compiler:
             if found is None:
                 raise self.err(INDEX_HINTS[name].format(d=self.domain.lower() + "s"))
             return self.node("input", "int", (), out=found[1], name=found[0])
+        if self.domain == "INSTANCE" and name in INSTANCE_ATTRS:
+            return self.node("input", INSTANCE_ATTRS[name][0], (), out=0, name=INSTANCE_ATTRS[name][1])
         if name == "TimeInc":  # seconds / frame; at frame 0 assume 24 frames a second
             seconds, frame = self.node("input", "float", (), out=0, name="time"), \
                 self.node("input", "float", (), out=1, name="time")
@@ -1795,6 +1873,14 @@ class Compiler:
         if target.kind == "member":
             cur = self.eval(target.obj)
             self.line = target.line
+            if cur.type == "row":  # m[i][j] = x
+                m, r = cur.const
+                self.member(cur, target.comp)
+                elems = [self.member(Val("row", (m, k // 4)), k % 4) for k in range(16)]
+                elems[r * 4 + target.comp % 4] = self.conv(val, "float")
+                return self.assign(target.obj.obj, self.combine_matrix(elems))
+            if cur.type == "matrix":
+                raise self.err("m[i] is a row of a matrix: set one element with m[i][j] = value")
             comps = [self.member(cur, i) for i in range(self.size(cur))]
             self.member(cur, target.comp)  # checks the component exists
             comps[target.comp % len(comps)] = self.conv(val, "float")
@@ -1816,8 +1902,10 @@ class Compiler:
         type = self.attr_type(name, target.type)
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
-        if name == "P" and self.domain != "POINT":
-            raise self.err("@P can only be written when the wrangle runs over Points")
+        if name == "P" and self.domain not in ("POINT", "INSTANCE"):
+            raise self.err("@P can only be written when the wrangle runs over Points (or Instances)")
+        if name == "N" and self.domain not in ("POINT", "FACE", "CORNER"):
+            raise self.err("@N (custom normals) can be written on Points, Faces or Corners")
         if fresh and val.type != type and val.type in PREFIXES:  # @a = @P: a new attribute is a float
             raise self.err(f"@{name} is a {type}; write {PREFIXES[val.type]}@{name} to store a {val.type}")
         val = self.conv(val, type)
@@ -2430,7 +2518,25 @@ class Compiler:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
                 prog.writes.append((name, type, val))
+        if self.domain == "INSTANCE":
+            self._instance_transform(prog)
         return prog
+
+    def _instance_transform(self, prog):
+        """On instances, @P, @orient, @scale and @transform are parts of one instance_transform."""
+        parts = {n: v for n, _, v in prog.writes if n in INSTANCE_ATTRS or n == "P"}
+        if not parts:
+            return
+        first = next(k for k, (n, _, _) in enumerate(prog.writes) if n in parts)
+        m = parts.get("transform") or self.read_original("transform", "matrix")
+        if set(parts) - {"transform"}:
+            sep = lambda k, t: self.gnode(t, "FunctionNodeSeparateTransform",  # noqa: E731
+                                          ("Translation", "Rotation", "Scale"), k, (m,), ("Transform",))
+            m = self.trs(parts.get("P") or sep(0, "vector"), parts.get("orient") or sep(1, "quaternion"),
+                         parts.get("scale") or sep(2, "vector"))
+        rest = [w for w in prog.writes if w[0] not in parts]
+        rest.insert(min(first, len(rest)), ("instance_transform", "matrix", m))
+        prog.writes[:] = rest
 
     # -- write plan ---------------------------------------------------------
     # Every written value means "computed from the incoming geometry". The write
@@ -2442,7 +2548,12 @@ class Compiler:
         written = {name for name, _, _ in prog.writes}
         for name, type, val in prog.writes:
             conds = [] if group is None else [group]
-            val = self._peel_selection(name, type, val, conds)
+            if name == "N":  # Set Mesh Normal has no Selection: keep the old normal outside the Group
+                if group is not None:
+                    val = self.select(group, val, self.read_original("N", "vector"))
+                conds = []
+            else:
+                val = self._peel_selection(name, type, val, conds)
             store = Store(name, type, val, conds=conds, storage=self.storage.get(name))
             if name == "P" and "position" not in written:
                 off = self._position_offset(val)
@@ -2705,7 +2816,10 @@ def _changes(name):
 
 
 # What each built-in input node reads from the geometry.
-_INPUT_READS = {"position": {"P", "position"}, "normal": {"P", "position"}, "id": {"id"},
+_INSTANCE_READS = {"instance_transform", "P", "position"}
+_INPUT_READS = {"position": {"P", "position", "instance_transform"}, "normal": {"P", "position", "N"}, "id": {"id"},
+                "instance_rotation": _INSTANCE_READS, "instance_scale": _INSTANCE_READS,
+                "instance_transform": _INSTANCE_READS,
                 "spline_parameter": {"P", "position"}, "tangent": {"P", "position"},
                 "face_area": {"P", "position"}, "edge_angle": {"P", "position"}}
 
