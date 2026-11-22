@@ -230,6 +230,10 @@ VMATH1 = {"ABSOLUTE": "ABSOLUTE", "FLOOR": "FLOOR", "CEIL": "CEIL", "ROUND": "RO
 VMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM", "POWER": "POWER", "SNAP": "SNAP"}
 IMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM"}
 
+# A function's return value before any `return`: never used where it is still this,
+# so it merges with (and starts a loop item of) any type. Compared by identity.
+NOT_RETURNED = Val("bool", False)
+
 # -- quaternions (x, y, z, w) and matrices (16 floats, column by column) for constant folding
 _IDENTITY = tuple(float(c == r) for c in range(4) for r in range(4))
 
@@ -655,6 +659,7 @@ class Compiler:
         self.geo_ops = []  # GeoOp, in call order
         self.geo_counts = {}  # "point" / "poly" / "polyline" / "vertex" -> the next number (an int Val)
         self.zone_ops = []  # per Repeat Zone that makes elements: the GeoOps of the pass being run
+        self.expr_conds = []  # conditions of the ternary branches / and-or sides being evaluated
         self.prim_kinds = {}  # (IRNode, out) of a number addprim() gave -> "poly" / "polyline"
         self.reading = []  # per closure being built: what its body read from outside (see _closure)
         self.warnings = []
@@ -790,6 +795,9 @@ class Compiler:
     def compare(self, op, a, b):
         bop, fn = COMPARE[op]
         for x in (a, b):
+            if x.type == "row":
+                self.conv(x, "float")  # explains m[i][j]
+        for x in (a, b):
             if x.type in OPAQUE:
                 raise self.err(f"'{op}' cannot compare {x.type}s")
         if "vector" in (a.type, b.type):
@@ -832,14 +840,14 @@ class Compiler:
 
     def select(self, cond, a, b):
         """cond ? a : b"""
-        if a.type != b.type and (a.type in OPAQUE or b.type in OPAQUE):
-            # a function's return value starts as a placeholder False: where it is
-            # still that, nothing was returned and the value is never used
-            for x, y in ((a, b), (b, a)):
-                if y.is_const and y.type == "bool" and y.const is False and x.type in OPAQUE:
-                    filler = Val(x.type, (0.0, 0.0, 0.0, 1.0) if x.type == "quaternion" else _IDENTITY)
-                    a, b = (x, filler) if x is a else (filler, x)
-                    break
+        for x in (a, b):
+            if x.type == "row":
+                self.conv(x, "float")  # explains m[i][j]
+        # where a function hasn't returned yet its value is never used: any neutral value will do
+        if a is NOT_RETURNED and b.type != "bool":
+            a = self._neutral(b.type)
+        elif b is NOT_RETURNED and a.type != "bool":
+            b = self._neutral(a.type)
         t = a.type if RANK[a.type] >= RANK[b.type] else b.type
         a, b = self.conv(a, t), self.conv(b, t)
         if cond.is_const:
@@ -847,6 +855,11 @@ class Compiler:
         if a == b:
             return a
         return self.node("switch", t, (cond, b, a), dtype=t)
+
+    @staticmethod
+    def _neutral(t):
+        return Val(t, {"quaternion": (0.0, 0.0, 0.0, 1.0), "matrix": _IDENTITY, "vector": (0.0, 0.0, 0.0),
+                       "float": 0.0, "int": 0, "bool": False}[t])
 
     def size(self, v):
         """How many components `v` has (a vector 3, a quaternion 4)."""
@@ -1400,7 +1413,7 @@ class Compiler:
             self.line = line
             ptype = self._prim_kind(prim)
             made = set(self.prim_kinds.values())
-            if ptype is None and len(made) == 1:  # the number went through an if or a loop: the one kind made
+            if ptype is None and len(made) == 1 and not prim.is_const:  # through an if or a loop: the one kind made
                 ptype = next(iter(made))
             if ptype is None:
                 raise self.err("addvertex() adds to a primitive this script made with addprim(); when the "
@@ -1663,11 +1676,13 @@ class Compiler:
         if kw and args and args[0].kind == "str":
             label = args[0].value.strip()
             lo, hi = (kw[k].const if k in kw else None for k in ("min", "max"))
+            if lo is not None and hi is not None and lo > hi:
+                raise self.err(f"{name}(): min= is larger than max=")
             if type == "int":  # an int slider takes whole-number limits
                 lo = math.ceil(lo) if lo is not None else None
                 hi = math.floor(hi) if hi is not None else None
-            if lo is not None and hi is not None and lo > hi:
-                raise self.err(f"{name}(): min= is larger than max=")
+                if lo is not None and hi is not None and lo > hi:
+                    raise self.err(f"{name}(): there is no whole number between min= and max=")
             self.limits[label] = (lo, hi)
         if not args or args[0].kind != "str":
             raise self.err(f'{name}() needs a name in quotes, e.g. {name}("amount")')
@@ -2122,6 +2137,8 @@ class Compiler:
     def assign(self, target, val):
         if target.kind == "index":
             cur = self.eval(target.obj)
+            if cur.type in ("matrix", "row"):
+                raise self.err("a matrix's indexes have to be constant numbers: m[3][0] = value")
             n = self.size(cur)
             i = self.component_index(target, n)
             if i.is_const:
@@ -2145,6 +2162,8 @@ class Compiler:
             comps[target.comp % len(comps)] = self.conv(val, "float")
             return self.assign(target.obj, self.combine(comps))
         live = self._live()
+        for c in self.expr_conds:  # inside `a if c else b`: only where this branch is picked
+            live = self.logic("and", live, c)
         if target.kind == "var":
             old = self.vars.get(target.name)
             if old is not None and not (live.is_const and live.const):
@@ -2246,10 +2265,10 @@ class Compiler:
         caller = (self.vars, self.loops, self.half_set, self.loop_only)
         self.frames.append({"name": d.name, "live": live, "value": False,
                             "globals": self.frames[0]["globals"] if self.frames else self.vars})
-        self.vars = dict(values, **{"$returned": Val("bool", False), "$ret": Val("bool", False)})
+        self.vars = dict(values, **{"$returned": Val("bool", False), "$ret": NOT_RETURNED})
         arity = _tuple_arity(d.body)
         for n in range(arity):  # return a, b: one hidden variable per value
-            self.vars[f"$ret{n}"] = Val("bool", False)
+            self.vars[f"$ret{n}"] = NOT_RETURNED
         self.loops, self.half_set, self.loop_only = [], {}, {}
         self.exec(d.body)
         result, returned = self.vars["$ret"], self.vars["$returned"]
@@ -2392,12 +2411,15 @@ class Compiler:
         raise self.err(f"cannot evaluate {k}")
 
     def _eval_where(self, e, cond):
-        """eval(e) as if inside `if cond:` (for the calls in it that make elements)."""
+        """eval(e) as if inside `if cond:`: calls in it that make elements or write
+        attributes (a function's, or an out argument) only act where `cond` holds."""
         self.path.append(cond)
+        self.expr_conds.append(cond)
         try:
             return self.eval(e)
         finally:
             self.path.pop()
+            self.expr_conds.pop()
 
     def exec(self, s):
         self.line = s.line
@@ -2744,7 +2766,8 @@ class Compiler:
         saved = self._snapshot()
         accs = {}  # key -> (kind, info, line) of the GeoOps whose records a geometry item collects
         while True:
-            starts = tuple(self.conv(v, t) for (_, _, v), t in zip(items, types))
+            starts = tuple(self._neutral(t) if v is NOT_RETURNED else self.conv(v, t)
+                           for (_, _, v), t in zip(items, types))
             if chunked:
                 fields = [True] * len(items)  # read back from the geometry
                 chunks = 1
@@ -2761,8 +2784,10 @@ class Compiler:
                 zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (count,) + starts, line)
                 it = Val("int", node=zone, out=0)
             current = {}  # geometry items: the records collected so far
-            for k, ((kind, name, _), t) in enumerate(zip(items, types)):
+            for k, ((kind, name, start), t) in enumerate(zip(items, types)):
                 v = Val(t, node=zone, out=k + 1)
+                if start is NOT_RETURNED and t == "bool":  # its type is learnt from the first pass's returns
+                    v = NOT_RETURNED
                 if kind == "acc":
                     current[name] = v
                 else:

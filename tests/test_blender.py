@@ -1891,6 +1891,15 @@ def test_review_fixes():
     obj, node, text, mesh = run('i@n = chi("n", 1, min=0.5, max=3.5)')
     item = next(i for i in node.node_tree.interface.items_tree if getattr(i, "name", "") == "n")
     assert (item.min_value, item.max_value) == (1, 3)
+    # second review: attribute writes in a ternary branch, a rotation returned inside a loop
+    obj, node, text, mesh = run("def w():\n    @foo = 5\n    return 1\nx = w() if @P.x > 0 else 0")
+    assert attr(mesh, "foo") == [5.0 if p[0] > 0 else 0.0 for p in orig]
+    obj, node, text, mesh = run('def f(x):\n    q = quaternion(0, (0, 0, 1))\n    for i in range(chi("n", 3)):\n'
+                                '        q *= quaternion(0.5, (0, 0, 1))\n        if x < i:\n            return q\n'
+                                '    return q\np@o = f(@P.x * 2)\nv@d = (1, 0, 0) * @o')
+    for p, d in zip(orig, attr(mesh, "d")):
+        turns = next((i + 1 for i in range(3) if p[0] * 2 < i), 3)
+        assert close(d, (math.cos(0.5 * turns), math.sin(0.5 * turns), 0)), (p, d)
     # 11. a per-element quaternion's components are normalized
     obj, node, text, mesh = run("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
     assert all(abs(w - 1) < 1e-5 for w in attr(mesh, "w"))

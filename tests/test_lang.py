@@ -961,6 +961,21 @@ def test_review_fixes():
     assert w["b"].node.params["dtype"] == "vector"
 
 
+def test_second_review_fixes():
+    w = writes('def f(x):\n    q = quaternion(0, (0, 1, 0))\n    for i in range(chi("n", 3)):\n'
+               '        q *= quaternion(0.1, (0, 1, 0))\n        if x < i:\n            return q\n    return q\n'
+               'p@o = f(@P.x)')
+    assert w["o"].type == "quaternion"
+    w = writes("def w():\n    @foo = 5\n    return 1\nx = w() if @P.x > 0 else 0")
+    assert w["foo"].node.kind == "switch"  # only where the branch is picked
+    fails("p@o = p@orient if @P.x > 0 else False", "cannot use a bool as quaternion")
+    fails("m = ident()\nr = m[0]\nif @P.x > 0:\n    r = m[1]\n@a = r[0]", "row of a matrix")
+    fails("m = ident()\nb@a = m[0] == m[1]", "row of a matrix")
+    fails("m = ident()\ni = 1\nm[0][i] = 1", "indexes have to be constant")
+    fails('i@n = chi("n", 5, min=0.5, max=0.7)', "no whole number")
+    fails('addprim(0, "polyline")\naddvertex(0, 3, @ptnum)', "made with addprim()")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
