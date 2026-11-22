@@ -887,7 +887,9 @@ def test_geometry_functions():
     assert len(prog.geo_ops) == 20  # unrolled
     prog = compile_source("addpoint(0, @P)", group="@P.x > 0")
     assert prog.geo_ops[0].mask.node.kind == "compare"
-    fails('for i in range(chi("n")):\n    addpoint(0, @P)', "Repeat Zone")
+    prog = compile_source('for i in range(chi("n")):\n    pt = addpoint(0, @P)\n    setpointattrib(0, "k", pt, i)')
+    assert [(op.kind, op.records is not None) for op in prog.geo_ops] == [("addpoint", True), ("set", True)]
+    fails('for j in range(chi("m")):\n    for i in range(chi("n")):\n        addpoint(0, @P)', "inside another loop")
     fails("addpoint(1, @P)", "first argument is the geometry")
     fails("addvertex(0, 3, @ptnum)", "pass the number addprim() gave")
     fails('setdetailattrib(0, "x", 1)', "no detail attributes")

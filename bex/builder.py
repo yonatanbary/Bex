@@ -9,7 +9,7 @@ SOCKET_IDNAME = {"float": "NodeSocketFloat", "int": "NodeSocketInt", "vector": "
                  "quaternion": "NodeSocketRotation", "matrix": "NodeSocketMatrix"}
 ATTR_TYPE = {"float": "FLOAT", "int": "INT", "vector": "FLOAT_VECTOR", "bool": "BOOLEAN", "quaternion": "QUATERNION",
              "matrix": "FLOAT4X4"}
-SOCKET_TYPE = {"float": "FLOAT", "int": "INT", "vector": "VECTOR", "bool": "BOOLEAN", "quaternion": "ROTATION",
+SOCKET_TYPE = {"geometry": "GEOMETRY", "float": "FLOAT", "int": "INT", "vector": "VECTOR", "bool": "BOOLEAN", "quaternion": "ROTATION",
                "matrix": "MATRIX"}
 
 INPUT_NODES = {
@@ -175,6 +175,8 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
     zones = {}  # repeat_in IRNode -> its Repeat Output node
 
     def connect(val, sock):
+        if val.is_const and val.type == "geometry":  # empty: an unlinked geometry socket
+            return
         if val.is_const and val.type == "matrix":  # a matrix socket has no value of its own
             n = new("FunctionNodeCombineMatrix")
             for s, c in zip(n.inputs, val.const):
@@ -422,6 +424,14 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             for k, v in enumerate(ins):
                 connect(v, ev.inputs[k + 1])
             return [ev.outputs[0]]
+        if kind == "records":  # one Repeat Zone pass of a GeoOp
+            return [make_records(ins[0], dict(zip(p["keys"], ins[1:])), p["domain"])]
+        if kind == "geojoin":
+            n = new("GeometryNodeJoinGeometry")
+            for v in reversed(ins):
+                if not v.is_const:
+                    connect(v, n.inputs[0])
+            return [n.outputs[0]]
         if kind == "chunk":
             raise RuntimeError("BEX builder: a chunked loop is built by its chunk_end (Program.preludes)")
         if kind == "repeat_out":
@@ -658,18 +668,25 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         main, rest = split_points(geo)
         return join([fn(main), rest])
 
-    def records(op):
-        """One point per element where the call ran, holding the call's values."""
-        line_stack.append(op.line)
-        geo = points(size(geometry(0), domain))
-        for key, val in list(op.values.items()) + ([("mask", op.mask)] if not op.mask.is_const else []):
-            v = val if val.is_const else sample(geometry(0), val.type, val, index(), domain)
+    def make_records(mask, values, dom):
+        """One point per element of `dom` where `mask` is true, holding `values`."""
+        geo = points(size(geometry(0), dom))
+        for key, val in list(values.items()) + ([("mask", mask)] if not mask.is_const else []):
+            v = val if val.is_const else sample(geometry(0), val.type, val, index(), dom)
             geo = g_store(geo, key, val.type, v)
-        if not op.mask.is_const:
+        if not mask.is_const:
             no = new("FunctionNodeBooleanMath")
             no.operation = "NOT"
             links.new(g_read("mask", "bool"), no.inputs[0])
             geo = delete(geo, "POINT", no.outputs[0])
+        return geo
+
+    def records(op):
+        """The call's records: one point per element where it ran (every pass, from a Repeat Zone)."""
+        if op.records is not None:
+            return realize(op.records.node)[op.records.out]
+        line_stack.append(op.line)
+        geo = make_records(op.mask, op.values, domain)
         line_stack.pop()
         return geo
 
@@ -779,17 +796,13 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         # New points, in call order, after the existing ones (vertices when there is a mesh).
         adds = kinds("addpoint")
         if adds:
-            chunks = []
-            for op in adds:
-                recs = records(op)
-                if op.info["src"]:
-                    chunks.append(to_points(pick(split_points(geo)[0], recs, "src", [])))
-                else:
-                    n = new("GeometryNodeSetPosition")
-                    links.new(recs, n.inputs["Geometry"])
-                    links.new(g_read("pos", "vector"), n.inputs["Position"])
-                    chunks.append(n.outputs[0])
-            fresh = join(chunks)
+            recs = g_store(join([records(op) for op in adds]), "n", "int", index())  # n: the order they're numbered in
+            at = new("GeometryNodeSetPosition")
+            links.new(delete(recs, "POINT", int_compare(g_read("src", "int"), "GREATER_EQUAL", 0)), at.inputs["Geometry"])
+            links.new(g_read("pos", "vector"), at.inputs["Position"])
+            copies = pick(split_points(geo)[0], delete(recs, "POINT", int_compare(g_read("src", "int"), "LESS_THAN", 0)),
+                          "src", [("n", "int")])  # addpoint(0, ptnum): a copy of that point
+            fresh = sort(join([at.outputs[0], to_points(copies)]), weight=g_read("n", "int"))
             has_mesh = new("GeometryNodeAttributeDomainSize")
             has_mesh.component = "MESH"
             links.new(geo, has_mesh.inputs[0])
@@ -804,8 +817,7 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         # New primitives from their corners: copies of the points they use.
         corners = kinds("vertex")
         if corners:
-            recs = join([g_store(records(op), "ty", "int", Val("int", int(op.info["ptype"] == "polyline")))
-                         for op in corners])
+            recs = join([records(op) for op in corners])
             copies = to_points(pick(split_points(geo)[0], recs, "pt", [("prim", "int"), ("ty", "int")]))
             types = {op.info["ptype"] for op in corners}
             if "poly" in types:

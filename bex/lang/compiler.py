@@ -25,7 +25,7 @@ TEMP_PREFIX = ".bex"  # hidden attributes a chunked loop keeps its values in; re
 CHUNK_FIRST, CHUNK_GROWTH = 32, 1.5
 MAX_CALL_DEPTH = 50  # nested calls of your own functions (recursion has to end while compiling)
 MAX_CALLS = 10_000  # calls of your own functions in one script  # chunk k of a loop that can end early runs floor(32 * 1.5^k) times
-RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5}
+RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5, "geometry": 9}
 # Types that never convert to or from another (a quaternion is a Blender Rotation, a matrix a 4x4 Matrix).
 OPAQUE = ("quaternion", "matrix")
 SIZES = {"vector": 3, "quaternion": 4}
@@ -88,8 +88,9 @@ class GeoOp:
     kind: str  # addpoint | vertex | remove | set
     mask: Val
     values: dict  # name -> Val: pos or src (addpoint), prim + pt (vertex), target (+ value for set)
-    info: dict  # addpoint: src; vertex: ptype (poly / polyline); remove: domain, mode; set: domain, name, type, mode
+    info: dict  # vertex: ptype (poly / polyline); remove: domain, mode; set: domain, name, type, mode, storage
     line: int = 0
+    records: Val = None  # made in a Repeat Zone: the records of every pass (a geometry Val), instead of values
 
 
 @dataclass
@@ -648,6 +649,7 @@ class Compiler:
         self.path = []  # conditions of the `if` branches being run (a loop starts stopped outside them)
         self.geo_ops = []  # GeoOp, in call order
         self.geo_counts = {}  # "point" / "poly" / "polyline" / "vertex" -> the next number (an int Val)
+        self.zone_ops = []  # per Repeat Zone that makes elements: the GeoOps of the pass being run
         self.prim_kinds = {}  # (IRNode, out) of a number addprim() gave -> "poly" / "polyline"
         self.reading = []  # per closure being built: what its body read from outside (see _closure)
         self.warnings = []
@@ -1329,9 +1331,9 @@ class Compiler:
                            "or read a statistic with mean() / sumof()")
         if fn == "setvertexattrib":
             raise self.err("setvertexattrib() isn't available; run over Corners and write @name instead")
-        if self.zone_depth:
-            raise self.err(f"{fn}() can't run inside a loop that becomes a Repeat Zone. Loops with a fixed "
-                           f"count of up to {GEO_UNROLL_MAX} passes work")
+        if self.zone_depth and (self.zone_depth > 1 or not self.zone_ops):
+            raise self.err(f"{fn}() can't run in a loop inside another loop that becomes a Repeat Zone "
+                           f"(loops of up to {GEO_UNROLL_MAX} passes with a fixed count are fine)")
         if not args:
             raise self.err(f"{fn}() takes: {usage[fn]}")
         geo = self.eval(args[0])
@@ -1346,12 +1348,12 @@ class Compiler:
                 raise self.err(f"{fn}() takes: {usage[fn]}")
             x = self.eval(args[1])
             if x.type == "vector":
-                values, info = {"pos": x}, {"src": False}
+                values, info = {"pos": x, "src": Val("int", -1)}, {}
             elif RANK.get(x.type, 9) <= 1:
-                values, info = {"src": self.conv(x, "int")}, {"src": True}
+                values, info = {"pos": Val("vector", (0.0, 0.0, 0.0)), "src": self.conv(x, "int")}, {}
             else:
                 raise self.err(f"addpoint() takes a position (a vector) or a point number, not a {x.type}")
-            self.geo_ops.append(GeoOp("addpoint", mask, values, info, line))
+            self.add_geo_op(GeoOp("addpoint", mask, values, info, line))
             return self.geo_number("point", mask)
         if fn == "addprim":
             if len(args) < 2 or args[1].kind != "str" or args[1].value not in PRIM_TYPES:
@@ -1361,7 +1363,8 @@ class Compiler:
             self.line = line
             prim = self.geo_number(ptype, mask)
             for pt in pts:
-                self.geo_ops.append(GeoOp("vertex", mask, {"prim": prim, "pt": pt}, {"ptype": ptype}, line))
+                self.add_geo_op(GeoOp("vertex", mask, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
+                                      {"ptype": ptype}, line))
                 self.geo_number("vertex", mask)
             if not prim.is_const:
                 self.prim_kinds[(prim.node, prim.out)] = ptype
@@ -1374,7 +1377,8 @@ class Compiler:
             ptype = self._prim_kind(prim)
             if ptype is None:
                 raise self.err("addvertex() adds to a primitive this script made: pass the number addprim() gave")
-            self.geo_ops.append(GeoOp("vertex", mask, {"prim": prim, "pt": pt}, {"ptype": ptype}, line))
+            self.add_geo_op(GeoOp("vertex", mask, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
+                                  {"ptype": ptype}, line))
             return self.geo_number("vertex", mask)
         if fn in ("removepoint", "removeprim"):
             if len(args) not in (2, 3):
@@ -1386,7 +1390,7 @@ class Compiler:
             self.line = line
             domain = "POINT" if fn == "removepoint" else self._prim_domain(target)
             mode = "ALL" if fn == "removepoint" or flag.const else "ONLY_FACE"
-            self.geo_ops.append(GeoOp("remove", mask, {"target": target}, {"domain": domain, "mode": mode}, line))
+            self.add_geo_op(GeoOp("remove", mask, {"target": target}, {"domain": domain, "mode": mode}, line))
             return Val("int", 0)
         # set*attrib / set*group
         group = fn.endswith("group")
@@ -1417,10 +1421,14 @@ class Compiler:
             if domain != "POINT":
                 raise self.err("only points have a position")
             name = "position"
-        self.geo_ops.append(GeoOp("set", mask, {"target": target, "value": value},
+        self.add_geo_op(GeoOp("set", mask, {"target": target, "value": value},
                                   {"domain": domain, "name": name, "type": type, "mode": mode,
                                    "storage": self.storage.get(name)}, line))
         return value
+
+    def add_geo_op(self, op):
+        """Program order, or, inside a Repeat Zone, this pass's ops (the zone collects their records)."""
+        (self.zone_ops[-1] if self.zone_depth else self.geo_ops).append(op)
 
     def _prim_kind(self, prim):
         return None if prim.is_const else self.prim_kinds.get((prim.node, prim.out))
@@ -2486,7 +2494,8 @@ class Compiler:
         if can_break:  # elements outside the if around it, or already returned, start stopped
             self.vars[brk] = self._stopped_here()
         carry = per_element or can_break  # the loop variable keeps its value when an element stops
-        chunked = can_break and self.zone_depth == 0 and not (total.is_const and total.const <= CHUNK_FIRST)
+        chunked = can_break and self.zone_depth == 0 and not (total.is_const and total.const <= CHUNK_FIRST) \
+            and not self._makes_geometry(s.body)  # records can't wait on the geometry between chunks
         if carry and s.var not in self.vars:
             self.vars[s.var] = start
 
@@ -2525,11 +2534,12 @@ class Compiler:
                 self.vars[brk] = self.logic("or", self.vars[brk], self.not_(cond))
 
             # n: the exact count, when the condition was known each time but the body was not
-            chunked = not n and self.zone_depth == 0
+            makes = self._makes_geometry(s.body)
+            chunked = not n and self.zone_depth == 0 and not makes
             count = n or (MAX_ZONE_ITERATIONS if chunked else WHILE_CAP)
             if not n and not chunked:
-                self.warnings.append(f"line {s.line}: a while loop inside another loop stops after "
-                                     f"{WHILE_CAP} iterations")
+                self.warnings.append(f"line {s.line}: a while loop " + ("that makes elements" if makes else
+                                     "inside another loop") + f" stops after {WHILE_CAP} iterations")
             self._zone(s, Val("int", count), brk, cont, begin, (brk,), chunked)
         self._end_loop(brk, cont)
 
@@ -2638,10 +2648,18 @@ class Compiler:
             if name in READ_ONLY or OPINPUT_RE.match(name):
                 continue  # assign() reports it while running the body
             items.append(("attr", name, self.read_attr(name, self.attr_type(name, prefix))))
+        geo = self._makes_geometry(s.body) and not self.zone_depth
+        if geo:  # the next point / primitive numbers change from pass to pass
+            for kind in ("point", "poly", "polyline", "vertex"):
+                if kind not in self.geo_counts:
+                    self.geo_counts[kind] = self.count(0, {"point": "POINT", "poly": "FACE", "polyline": "CURVE",
+                                                           "vertex": "CORNER"}[kind])
+                items.append(("count", kind, self.geo_counts[kind]))
         types = [v.type for _, _, v in items]
-        fields = [_is_field(v) for _, _, v in items]
+        fields = [_is_field(v) and v.type != "geometry" for _, _, v in items]
         temp = [f"{TEMP_PREFIX}{self.loop_count}_{k}" for k in range(len(items))]  # chunked: hidden attribute names
         saved = self._snapshot()
+        accs = {}  # key -> (kind, info, line) of the GeoOps whose records a geometry item collects
         while True:
             starts = tuple(self.conv(v, t) for (_, _, v), t in zip(items, types))
             if chunked:
@@ -2659,25 +2677,55 @@ class Compiler:
             else:
                 zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (count,) + starts, line)
                 it = Val("int", node=zone, out=0)
+            current = {}  # geometry items: the records collected so far
             for k, ((kind, name, _), t) in enumerate(zip(items, types)):
-                (self.vars if kind == "var" else self.attrs)[name] = Val(t, node=zone, out=k + 1)
+                v = Val(t, node=zone, out=k + 1)
+                if kind == "acc":
+                    current[name] = v
+                else:
+                    self._item_store(kind)[name] = v
             self.loops.append((brk, cont))
             self.zone_depth += 1
+            if geo:
+                self.zone_ops.append([])
             begin(it)
             self.exec(s.body)
             self.zone_depth -= 1
             self.loops.pop()
-            finals = [(self.vars if kind == "var" else self.attrs).get(name) for kind, name, _ in items]
+            new_accs = []
+            if geo:  # this pass's records join the ones before
+                seen = {}
+                for op in self.zone_ops.pop():
+                    key = op.kind if op.kind in ("addpoint", "vertex") else f"{op.kind}{seen.setdefault(op.kind, 0)}"
+                    if op.kind not in ("addpoint", "vertex"):
+                        seen[op.kind] += 1
+                    keys = tuple(op.values)
+                    recs = IRNode("records", {"keys": keys, "types": tuple(op.values[k].type for k in keys),
+                                              "domain": self.domain}, (op.mask,) + tuple(op.values[k] for k in keys),
+                                  op.line)
+                    if key not in current:
+                        new_accs.append(key)
+                        current[key] = Val("geometry", "empty")
+                    accs.setdefault(key, (op.kind, op.info, op.line))
+                    current[key] = Val("geometry", node=IRNode("geojoin", {}, (current[key], Val("geometry", node=recs)),
+                                                               op.line))
+            finals = [current.get(name) if kind == "acc" else self._item_store(kind).get(name)
+                      for kind, name, _ in items]
             # e.g. x = 0 before the loop and x += 0.5 inside: carry a float
             wider = [f.type if f is not None and RANK[f.type] > RANK[t] else t for f, t in zip(finals, types)]
-            varying = [d or (f is not None and _is_field(f)) for f, d in zip(finals, fields)]
+            varying = [d or (f is not None and _is_field(f) and f.type != "geometry") for f, d in zip(finals, fields)]
             carried = {name for kind, name, _ in items if kind == "attr"}
             missed = [a for a, v in self.attrs.items() if a not in carried and saved["attrs"].get(a) is not v]
-            if wider == types and varying == fields and not missed:
+            if wider == types and varying == fields and not missed and not new_accs:
                 break
             types, fields = wider, varying
             missed = [(a, self.attr_types[a]) for a in missed]
             self._restore(saved)
+            for key in new_accs:  # records made in the loop: a geometry item collects them
+                items.append(("acc", key, Val("geometry", "empty")))
+                types.append("geometry")
+                fields.append(False)
+                temp.append(f"{TEMP_PREFIX}{self.loop_count}_{len(temp)}")
             for name, type in missed:  # written by a function the body calls
                 v = self.read_attr(name, self.attr_type(name, type))
                 items.append(("attr", name, v))
@@ -2693,7 +2741,11 @@ class Compiler:
                 val = self.node("attr", t, name=temp[k], dtype=t)
             else:
                 val = Val(t, node=out, out=k)
-            (self.vars if kind == "var" else self.attrs)[name] = val
+            if kind == "acc":
+                op_kind, info, op_line = accs[name]
+                self.geo_ops.append(GeoOp(op_kind, Val("bool", True), {}, info, op_line, records=val))
+            else:
+                self._item_store(kind)[name] = val
         if chunked:
             running = next(k for k, (kind, name, _) in enumerate(items) if name == brk)
             sel = self.group_sel if self.group_sel is not None else Val("bool", True)
@@ -2703,6 +2755,10 @@ class Compiler:
             self.vars.pop(name, None)
             self.loop_only[name] = line
         return out
+
+    def _item_store(self, kind):
+        """Where a Repeat Zone item lives: variables, attributes, or the next element numbers."""
+        return {"var": self.vars, "attr": self.attrs, "count": self.geo_counts}[kind]
 
     _STATE = ("vars", "half_set", "loop_only", "attrs", "attr_types", "written", "params", "ramps",
               "reads", "pending", "inputs", "cse", "preludes", "closures", "call_counts", "calls",

@@ -1783,6 +1783,31 @@ def test_geometry_functions():
     assert node.error == "", node.error
     assert len(evaluate(obj).vertices) == 25 + 16 * 12  # 16 faces, 12 points each
 
+    # In a loop that is a Repeat Zone (the count is a channel): numbered pass by pass
+    obj, node, text = make_setup("""
+    for i in range(chi("count", 3)):
+        pt = addpoint(0, @P + (0, 0, i + 1))
+        setpointattrib(0, "k", pt, i + 10)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    orig = original_points(obj)
+    assert len(mesh.vertices) == 100
+    k = attr(mesh, "k")
+    for p in range(3):
+        for e in range(25):
+            v = 25 + p * 25 + e
+            assert close(mesh.vertices[v].co, Vector(orig[e]) + Vector((0, 0, p + 1))) and k[v] == p + 10
+    text.from_string('prim = addprim(0, "polyline")\nfor i in range(chi("passes", 4)):\n'
+                     '    addvertex(0, prim, addpoint(0, @P + (0, 0, i)))')
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    assert len(geo.curves.curves) == 25 and len(geo.curves.points) == 100
+    assert [tuple(geo.curves.points[i].position) for i in range(4)] == [(-1, -1, z) for z in range(4)]
+
 
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
