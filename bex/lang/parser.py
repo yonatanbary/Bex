@@ -131,7 +131,7 @@ class Parser:
         self.loop_count = getattr(self, "loop_count", 0) + 1
         i = N("var", t.line, name=f"$i{self.loop_count}")
         before = []
-        if seq.kind == "tuple" or (seq.kind == "call" and seq.name == "set"):
+        if seq.kind == "tuple" or (seq.kind == "call" and seq.name in ("set", "array")):
             items = seq.items if seq.kind == "tuple" else seq.args
             count, pick = N("num", t.line, value=len(items)), N("call", t.line, name="$pick", args=items + [i])
         else:  # a vector or quaternion: its components
@@ -309,6 +309,9 @@ class Parser:
                     comp = name.val
                 elif name.kind == "ident" and name.val in COMPONENTS:
                     comp = COMPONENTS[name.val]
+                elif name.kind == "ident" and self.at("("):  # a.append(x): append(a, x), like Python
+                    e = N("call", name.line, name=name.val, args=[e] + self.call_args())
+                    continue
                 elif name.kind == "ident" and SWIZZLE.fullmatch(name.val):
                     e = N("swizzle", line, obj=e, comps=[COMPONENTS[c] for c in name.val])
                     continue
@@ -322,8 +325,8 @@ class Parser:
                 lit = idx.a if idx.kind == "unop" and idx.op == "-" else idx
                 if lit.kind == "num":  # v[1], v[-1]: a fixed component (the compiler checks the size)
                     k = -lit.value if lit is not idx else lit.value
-                    if not isinstance(k, int) or not -4 <= k <= 3:
-                        raise BexError("component index must be 0, 1, 2 (3 for a quaternion), or negative", line)
+                    if not isinstance(k, int):
+                        raise BexError("an index is a whole number", line)
                     e = N("member", line, obj=e, comp=k)
                 else:  # v[i]: chosen when the script runs
                     e = N("index", line, obj=e, index=idx)
@@ -406,6 +409,8 @@ class Parser:
         if t.kind == "op" and t.val in ("(", "["):
             close = ")" if t.val == "(" else "]"
             self.next()
+            if t.val == "[" and self.accept("]"):
+                return N("call", t.line, name="array", args=[])  # []: an empty array
             items, comma = [self.expr()], False
             while self.accept(","):
                 comma = True
@@ -415,6 +420,8 @@ class Parser:
             self.expect(close)
             if t.val == "(" and len(items) == 1 and not comma:  # (1,) is a tuple, as in Python
                 return items[0]
+            if t.val == "[":  # [a, b, c]: an array (used as a vector where a vector is wanted)
+                return N("call", t.line, name="array", args=items)
             if len(items) not in (3, 4):  # only usable in `x in (...)`, `for x in (...)`, `a, b = (...)`
                 return N("tuple", t.line, items=items)
             return N("call", t.line, name="set", args=items)

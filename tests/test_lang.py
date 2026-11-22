@@ -859,7 +859,7 @@ def test_matrix_elements_and_instances():
     assert w["a"].node.params["idname"] == "FunctionNodeSeparateMatrix" and w["a"].out == 12
     assert w["m"].node.params["idname"] == "FunctionNodeCombineMatrix"
     fails("m = ident()\nf@a = m[1]", "row of a matrix")
-    fails("m = ident()\nf@a = m[-5][0]", "component index")
+    fails("m = ident()\nf@a = m[-5][0]", "rows 0 to 3")
     fails("v@a = cracktransform(1, 0, 0, (0, 0, 0), ident())", "trs = 0")
     # instances: orient / scale / P are one instance_transform
     prog = compile_source("p@orient = quaternion(@elemnum, (0, 0, 1))\n@scale = (2, 2, 2)\nf@w = 1", "INSTANCE")
@@ -974,6 +974,35 @@ def test_second_review_fixes():
     fails("m = ident()\ni = 1\nm[0][i] = 1", "indexes have to be constant")
     fails('i@n = chi("n", 5, min=0.5, max=0.7)', "no whole number")
     fails('addprim(0, "polyline")\naddvertex(0, 3, @ptnum)', "made with addprim()")
+
+
+def test_arrays():
+    w = writes("a = [1, 2, 3]\nf@x = a[1] + len(a) + a[-1]\nb = []\nb.append(2)\npush(b, 5.5)\nf@s = sum(b)\n"
+               "c = [3, 1, 2]\nb@h = 2 in c\ni@f = find(c, 1)\nf@m = sort(c)[0]\nf@r = reverse(c)[0]\n"
+               "d = [1, 2, 3]\nv = d.pop()\ninsert(d, 0, 9)\nremoveindex(d, 1)\nf@pv = v\nf@d0 = d[0]\n"
+               "i@dn = len(d)\nf@lo = min(c)\nf@av = avg(c)\nv@vec = [1, 2, 3]\nf@oob = a[7]\n"
+               "e = [1]\nresize(e, 3)\ni@en = len(e)\nf@e2 = e[2]")
+    assert w["x"].const == 8 and w["s"].const == 7.5 and w["h"].const is True and w["f"].const == 1
+    assert w["m"].const == 1 and w["r"].const == 2 and w["pv"].const == 3 and w["d0"].const == 9 and w["dn"].const == 2
+    assert w["lo"].const == 1 and abs(w["av"].const - 2) < 1e-9 and w["vec"].const == (1, 2, 3)
+    assert w["oob"].const == 0 and w["en"].const == 3 and w["e2"].const == 0
+    # per element: lengths that differ, a variable index (one Index Switch), loops
+    prog = compile_source("a = [1]\nif @P.x > 0:\n    a.append(7)\ni@n = len(a)\nb = [@P.x, @P.y]\n"
+                          "f@y = b[@ptnum % 2]\nc = []\nfor i in range(chi(\"k\", 5)):\n    c.append(i)\n"
+                          "f@cs = sum(c)\nt = 0\nfor x in a:\n    t += x\nf@t = t")
+    w = {n: v for n, _t, v in prog.writes}
+    assert w["n"].node.kind == "switch" and any(n.kind == "pick" for n in _ir_nodes(prog))
+    zone = next(n for n in _ir_nodes(prog) if n.kind == "repeat_in" and len(n.params["items"]) > 30)
+    assert len(zone.params["items"]) >= 33  # 32 slots and a length
+    w = writes("def mk(n):\n    r = []\n    for i in range(n):\n        r.append(i)\n    return r\nf@s = sum(mk(3))")
+    assert w["s"].const == 3
+    fails("f@a = [1, 2]", "no array attributes")
+    fails("a = [1, quaternion(0, (0, 0, 1))]", "holds one type")
+    fails("a = [[1], [2]]", "can't hold arrays")
+    fails("f@a = sum(1)", "works on an array")
+    fails("a = [1]\nb = a + 1", "cannot use an array")
+    fails('n = nearpoints(0, @P, 1, 100)', "at most 64")
+    fails('n = neighbours(0, @ptnum, max=0)', "above 0")
 
 
 if __name__ == "__main__":

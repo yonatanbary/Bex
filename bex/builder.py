@@ -435,6 +435,16 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             for k, v in enumerate(ins):
                 connect(v, ev.inputs[k + 1])
             return [ev.outputs[0]]
+        if kind == "pick":  # a[i]: Index Switch over the array's slots
+            n = new("GeometryNodeIndexSwitch")
+            n.data_type = SOCKET_TYPE[p["dtype"]]
+            while len([x for x in n.inputs if x.identifier.startswith("Item_")]) < len(ins) - 1:
+                n.index_switch_items.new()
+            slots = [x for x in n.inputs if x.identifier.startswith("Item_")]
+            connect(ins[0], n.inputs["Index"])
+            for v, sock in zip(ins[1:], slots):
+                connect(v, sock)
+            return [n.outputs[0]]
         if kind == "records":  # one Repeat Zone pass of a GeoOp
             return [make_records(ins[0], dict(zip(p["keys"], ins[1:])), p["domain"])]
         if kind == "geojoin":
@@ -1058,6 +1068,7 @@ BUTTON_ROWS = {
     "GeometryNodeAttributeDomainSize": 1,
     "GeometryNodeSampleCurve": 3,
     "GeometryNodeSampleUVSurface": 1,
+    "GeometryNodeIndexSwitch": 1,
     "GeometryNodeInputNamedAttribute": 1,
     "GeometryNodeStoreNamedAttribute": 2,
     "GeometryNodeCaptureAttribute": 1,

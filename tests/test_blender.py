@@ -1905,6 +1905,68 @@ def test_review_fixes():
     assert all(abs(w - 1) < 1e-5 for w in attr(mesh, "w"))
 
 
+def test_arrays():
+    src = """
+    a = [@P.x, @P.y, 0.5]
+    i = @ptnum % 3
+    f@pick = a[i]
+    b = []
+    for k in range(chi("n", 4)):
+        if (k + @ptnum) % 2 == 0:
+            b.append(k * 10)
+    i@blen = len(b)
+    f@bsum = sum(b)
+    s = sort([@P.x, -@P.y, 0.25])
+    f@lo = s[0]
+    f@hi = s[-1]
+    nb = neighbours(0, @ptnum)
+    i@ncount = len(nb)
+    t = 0.0
+    for p in nb:
+        t += point(0, "P", p).x
+    f@nx = t
+    near = nearpoints(0, @P, 0.6, 3)
+    i@nn = len(near)
+    i@n0 = near[0]
+    b@has = 3 in nb
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    pts = original_points(obj)
+    edges = {}
+    for e in mesh.edges:
+        a, b = e.vertices
+        edges.setdefault(a, []).append(b)
+        edges.setdefault(b, []).append(a)
+    for i, (x, y, z) in enumerate(pts):
+        assert abs(attr(mesh, "pick")[i] - [x, y, 0.5][i % 3]) < 1e-5
+        b = [k * 10 for k in range(4) if (k + i) % 2 == 0]
+        assert attr(mesh, "blen")[i] == len(b) and abs(attr(mesh, "bsum")[i] - sum(b)) < 1e-5
+        srt = sorted([x, -y, 0.25])
+        assert abs(attr(mesh, "lo")[i] - srt[0]) < 1e-5 and abs(attr(mesh, "hi")[i] - srt[-1]) < 1e-5
+        nb = edges[i]
+        assert attr(mesh, "ncount")[i] == len(nb) and abs(attr(mesh, "nx")[i] - sum(pts[p][0] for p in nb)) < 1e-4
+        assert attr(mesh, "has")[i] == (3 in nb)
+        near = sorted((k for k, p in enumerate(pts) if (p[0] - x) ** 2 + (p[1] - y) ** 2 <= 0.36),
+                      key=lambda k: ((pts[k][0] - x) ** 2 + (pts[k][1] - y) ** 2, k))
+        assert attr(mesh, "nn")[i] == min(len(near), 3) and attr(mesh, "n0")[i] == i, (i, attr(mesh, "nn")[i], near)
+
+    # faces from an array of points; primpoints on faces
+    obj, node, text = make_setup("""
+    if @ptnum % 5 < 4 and @ptnum < 20:
+        pts = [@ptnum, @ptnum + 1, @ptnum + 6]
+        addprim(0, "poly", pts)
+    """)
+    assert node.error == "", node.error
+    assert len(evaluate(obj).polygons) == 32
+    obj, node, text = make_setup("pts = primpoints(0, @primnum)\ni@c = len(pts)\ni@p2 = pts[2]", domain="FACE")
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert attr(mesh, "c") == [4] * 16
+    assert all(attr(mesh, "p2")[f] == mesh.polygons[f].vertices[2] for f in range(16))
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

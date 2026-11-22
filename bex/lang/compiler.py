@@ -25,7 +25,7 @@ TEMP_PREFIX = ".bex"  # hidden attributes a chunked loop keeps its values in; re
 CHUNK_FIRST, CHUNK_GROWTH = 32, 1.5
 MAX_CALL_DEPTH = 50  # nested calls of your own functions (recursion has to end while compiling)
 MAX_CALLS = 10_000  # calls of your own functions in one script  # chunk k of a loop that can end early runs floor(32 * 1.5^k) times
-RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5, "geometry": 9}
+RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5, "geometry": 9, "array": 10}
 # Types that never convert to or from another (a quaternion is a Blender Rotation, a matrix a 4x4 Matrix).
 OPAQUE = ("quaternion", "matrix")
 SIZES = {"vector": 3, "quaternion": 4}
@@ -58,7 +58,21 @@ class Val:
 
     @property
     def is_const(self):
-        return self.node is None
+        return self.node is None and (self.type != "array" or self.const.is_const)
+
+
+@dataclass(frozen=True)
+class Arr:
+    """An array (Val type "array", this as its const): a row of slots, each an
+    ordinary value (a field, so every element has its own array), and how many of
+    them are used. Blender's lists can't differ per element, so arrays live here."""
+    type: str  # the elements' type
+    items: tuple  # the slots (Vals); their number is the array's capacity
+    length: object  # an int Val: how many slots are used (may differ per element)
+
+    @property
+    def is_const(self):
+        return self.length.is_const and all(v.is_const for v in self.items)
 
 
 @dataclass
@@ -359,6 +373,7 @@ NODE_OUTS = {
     "GeometryNodeVertexOfCorner": ("Vertex Index",),
     "GeometryNodeFaceOfCorner": ("Face Index", "Index in Face"),
     "GeometryNodeInputMeshEdgeVertices": ("Vertex Index 1", "Vertex Index 2"),
+    "GeometryNodeCornersOfVertex": ("Corner Index", "Total"),
 }
 # Quaternion and matrix functions (Compiler.transform_call)
 TRANSFORM_FUNCS = ("quaternion", "eulertoquaternion", "quaterniontoeuler", "qrotate", "qmultiply", "qinvert",
@@ -387,7 +402,14 @@ SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemi
 # Built-in functions that take keyword options: name -> allowed keywords
 FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
 KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
-            "curlnoise": NOISE_OPTS, "chf": ("min", "max"), "chi": ("min", "max"), "chv": ("min", "max"), **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+            "curlnoise": NOISE_OPTS, "neighbours": ("max",), "primpoints": ("max",), "pointprims": ("max",),
+            "chf": ("min", "max"), "chi": ("min", "max"), "chv": ("min", "max"), **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+# Arrays (Compiler.array_call)
+ARRAY_FUNCS = ("array", "append", "push", "pop", "insert", "removeindex", "find", "sort", "reverse", "sum",
+               "isvalidindex", "resize", "neighbours", "primpoints", "pointprims", "nearpoints", "pcfind")
+ARRAY_ZONE_CAP = 32  # slots of an array that grows inside a Repeat Zone (its longest length)
+LIST_CAP = 16  # how many neighbours(), primpoints(), pointprims(), nearpoints() return at most (max= to change)
+MAX_ARRAY = 1024  # the most slots an array can have
 # Making and removing elements, writing to other elements (Compiler.geo_call)
 GEO_FUNCS = ("addpoint", "addprim", "addvertex", "removepoint", "removeprim", "setpointattrib", "setprimattrib",
              "setpointgroup", "setprimgroup", "setvertexattrib", "setdetailattrib")
@@ -421,7 +443,7 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
-    "countof", "blur", "at", "promote", *GEO_FUNCS, "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
+    "countof", "blur", "at", "promote", *GEO_FUNCS, *ARRAY_FUNCS, "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
 }) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
@@ -458,7 +480,7 @@ SIGNATURES = {
     "max": (("a", "b", "[more...]"), "The largest value. max(v) of one vector: its largest component."),
     "isnan": (("value",), "True when value is not a number (0 / 0 and the like)."),
     "isfinite": (("value",), "True for an ordinary number: not infinite, not NaN."),
-    "len": (("vector",), "Number of components: 3 for a vector, 4 for a quaternion."),
+    "len": (("value",), "Length of an array; 3 for a vector, 4 for a quaternion."),
     "clamp": (("value", "min", "max"), "Keeps value between min and max."),
     "mod": (("value", "divisor"), "Remainder after division. Never negative for a positive divisor."),
     "fmod": (("value", "divisor"), "Same as mod()."),
@@ -621,6 +643,25 @@ SIGNATURES = {
     "setprimgroup": (("geo", "group", "prim", "value"), "Puts a face in a group (a bool attribute) or takes it out."),
     "setvertexattrib": (("geo", "name", "prim", "vertex", "value"), "Not available in BEX."),
     "setdetailattrib": (("geo", "name", "value"), "Not available: Blender has no detail attributes."),
+    # Arrays
+    "array": (("values...",), "An array of the values: array(1, 2, 3) is [1, 2, 3]."),
+    "append": (("array", "value"), "Adds value at the end of the array variable. Also a.append(value)."),
+    "push": (("array", "value"), "Same as append()."),
+    "pop": (("array", "[index]"), "Takes the last value (or the one at index) out of the array variable."),
+    "insert": (("array", "index", "value"), "Puts value into the array variable at index."),
+    "removeindex": (("array", "index"), "Takes the value at index out of the array variable."),
+    "find": (("array", "value"), "The first index holding value, or -1."),
+    "sort": (("array",), "The array sorted from small to large."),
+    "reverse": (("array",), "The array back to front."),
+    "sum": (("array",), "All the values added up."),
+    "isvalidindex": (("array", "index"), "True when the array has a value at index."),
+    "resize": (("array", "length"), "Makes the array variable this long (new values are 0)."),
+    "neighbours": (("geo", "point"), "Array of the points connected to point by an edge (max= the most, 16)."),
+    "primpoints": (("geo", "prim"), "Array of a face's points, in order (max= the most, 16)."),
+    "pointprims": (("geo", "point"), "Array of the faces using point (max= the most, 16)."),
+    "nearpoints": (("geo", "position", "radius", "[maxpts]"),
+                   "Array of the points within radius, nearest first (at most maxpts, 16). Checks every point."),
+    "pcfind": (("geo", "channel", "position", "radius", "[maxpts]"), 'Same as nearpoints(); the channel is "P".'),
     # Loops
     "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
 }
@@ -691,6 +732,14 @@ class Compiler:
             raise self.err("m[i] is a row of a matrix: pick one element with m[i][j]")
         if v.type == type:
             return v
+        if v.type == "array":  # [1, 2, 3] used as a vector, [x, y, z, w] as a quaternion
+            a = v.const
+            n = SIZES.get(type)
+            if n and a.length.is_const and a.length.const == n == len(a.items) and RANK[a.type] <= 2:
+                return self.combine([self.conv(x, "float") for x in a.items])
+            raise self.err(f"cannot use an array as {type} (pick a value with a[i], or len(a))")
+        if type == "array":
+            raise self.err(f"expected an array, not a {v.type} (make one with [a, b] or array(a, b))")
         if v.type in OPAQUE or type in OPAQUE:
             hint = {"quaternion": " (make one with quaternion(), or (x, y, z, w))",
                     "matrix": " (make one with maketransform() or ident())"}.get(type, "")
@@ -753,6 +802,11 @@ class Compiler:
         if e.kind == "tuple" or (e.kind == "call" and e.name == "set"):
             return [self.eval(x) for x in (e.items if e.kind == "tuple" else e.args)]
         v = self.eval(e)
+        if v.type == "array":
+            a = v.const
+            if not a.length.is_const:
+                raise self.err("this array's length differs per element: use a loop (for x in a) or find()")
+            return list(a.items[:a.length.const])
         if v.type not in SIZES:
             raise self.err(f"expected several values, like (a, b) or a vector, not a {v.type}")
         return [self.member(v, i) for i in range(SIZES[v.type])]
@@ -845,9 +899,19 @@ class Compiler:
                 self.conv(x, "float")  # explains m[i][j]
         # where a function hasn't returned yet its value is never used: any neutral value will do
         if a is NOT_RETURNED and b.type != "bool":
-            a = self._neutral(b.type)
+            a = self._neutral(b.type) if b.type != "array" else self.empty_array(b.const.type)
         elif b is NOT_RETURNED and a.type != "bool":
-            b = self._neutral(a.type)
+            b = self._neutral(a.type) if a.type != "array" else self.empty_array(a.const.type)
+        if a.type == "array" or b.type == "array":
+            if a.type != b.type:
+                raise self.err("can't mix an array and a single value here")
+            if cond.is_const:
+                return a if cond.const else b
+            t = self.array_type([a.const.type, b.const.type])
+            n = max(len(a.const.items), len(b.const.items))
+            xa, xb = self.padded(a.const, n, t), self.padded(b.const, n, t)
+            return self.make_arr(t, [self.select(cond, x, y) for x, y in zip(xa, xb)],
+                                 self.select(cond, a.const.length, b.const.length))
         t = a.type if RANK[a.type] >= RANK[b.type] else b.type
         a, b = self.conv(a, t), self.conv(b, t)
         if cond.is_const:
@@ -868,6 +932,8 @@ class Compiler:
         return SIZES[v.type]
 
     def member(self, v, i):
+        if v.type == "array":
+            return self.arr_get(v.const, Val("int", i))
         if v.type == "matrix":  # m[i] is half of m[i][j]: a "row" until the second index
             if not -4 <= i < 4:
                 raise self.err("a matrix has rows 0 to 3: m[i][j]")
@@ -1313,6 +1379,318 @@ class Compiler:
         return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
                                         ("Color",), props=(("mode", mode),)) for i in range(3)])
 
+    # -- arrays --------------------------------------------------------------
+    # An array is a row of slots plus a length. Slots past the length hold leftovers
+    # and are never read. Changing an array makes a new one (like every value here).
+
+    def make_arr(self, type, items, length):
+        if len(items) > MAX_ARRAY:
+            raise self.err(f"an array can have at most {MAX_ARRAY} values")
+        return Val("array", Arr(type, tuple(items), self.conv(length, "int")))
+
+    def empty_array(self, type):
+        return self.make_arr(type, [], Val("int", 0))
+
+    def array_type(self, types):
+        """The type of an array holding these types (numbers widen; others must match)."""
+        types = [t for t in types if t is not None]
+        if not types:
+            return "float"
+        if any(t in OPAQUE for t in types) and len(set(types)) > 1:
+            raise self.err(f"an array holds one type, not {' and '.join(sorted(set(types)))}")
+        if "array" in types:
+            raise self.err("an array can't hold arrays")
+        return max(types, key=lambda t: RANK[t])
+
+    def padded(self, a, n, t=None):
+        """`a`'s slots converted to `t`, padded with zeros to `n`."""
+        t = t or a.type
+        return [self.conv(x, t) for x in a.items] + [self._neutral(t)] * (n - len(a.items))
+
+    def arr(self, v, fn):
+        if v.type != "array":
+            raise self.err(f"{fn}() works on an array, not a {v.type}")
+        return v.const
+
+    def _index(self, a, i):
+        """A Python-style index (negative counts from the end) as a slot number."""
+        if i.is_const and a.length.is_const:
+            return Val("int", i.const + a.length.const if i.const < 0 else i.const)
+        if i.is_const and i.const >= 0:
+            return i
+        return self.select(self.compare("<", i, Val("int", 0)), self.arith("+", i, a.length), i)
+
+    def arr_get(self, a, i):
+        i = self._index(a, self.conv(i, "int"))
+        if i.is_const:
+            if not 0 <= i.const < len(a.items) or (a.length.is_const and i.const >= a.length.const):
+                return self._neutral(a.type)  # VEX: out of range gives 0
+            v = a.items[i.const]
+            return v if a.length.is_const else self.select(self.compare("<", i, a.length), v, self._neutral(a.type))
+        if not a.items:
+            return self._neutral(a.type)
+        valid = self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        picked = self.node("pick", a.type, (i,) + tuple(a.items), dtype=a.type)  # one Index Switch
+        return self.select(valid, picked, self._neutral(a.type))
+
+    def arr_set(self, a, i, v):
+        """a with slot i set to v (growing it when i is the next slot past a constant length)."""
+        t = self.array_type([a.type, v.type])
+        i = self._index(a, self.conv(i, "int"))
+        items = self.padded(a, len(a.items), t)
+        v = self.conv(v, t)
+        if i.is_const:
+            if i.const < 0:
+                raise self.err("array index out of range")
+            if i.const >= len(items):
+                if not a.length.is_const:
+                    raise self.err("setting a value past an array's end needs append() here")
+                items += [self._neutral(t)] * (i.const + 1 - len(items))
+            items[i.const] = v
+            length = a.length
+            if a.length.is_const and i.const >= a.length.const:
+                length = Val("int", i.const + 1)  # VEX grows the array
+            return self.make_arr(t, items, length)
+        return self.make_arr(t, [self.select(self.compare("==", i, Val("int", k)), v, x)
+                                 for k, x in enumerate(items)], a.length)
+
+    def arr_append(self, a, v):
+        t = self.array_type([a.type, v.type])
+        v = self.conv(v, t)
+        items = self.padded(a, len(a.items), t)
+        if a.length.is_const and a.length.const == len(items):
+            return self.make_arr(t, items + [v], Val("int", len(items) + 1))
+        # the length differs per element: every slot might be the next one
+        items = [self.select(self.compare("==", a.length, Val("int", k)), v, x) for k, x in enumerate(items)]
+        cap = len(items)
+        if self.zone_depth and cap >= ARRAY_ZONE_CAP:  # a loop's array has a fixed number of slots
+            self._array_cap_warning()
+            return self.make_arr(t, items, self.fn2("MINIMUM", min, self.arith("+", a.length, Val("int", 1)),
+                                                    Val("int", cap)))
+        items.append(self.select(self.compare("==", a.length, Val("int", cap)), v, self._neutral(t)))
+        return self.make_arr(t, items, self.arith("+", a.length, Val("int", 1)))
+
+    def _array_cap_warning(self):
+        msg = f"line {self.line}: an array growing in a loop keeps at most {ARRAY_ZONE_CAP} values"
+        if msg not in self.warnings:
+            self.warnings.append(msg)
+
+    def arr_find(self, a, v):
+        """The first used slot equal to v, or -1."""
+        found = Val("int", -1)
+        for k in range(len(a.items) - 1, -1, -1):
+            hit = self.compare("==", a.items[k], v)
+            if not a.length.is_const:
+                hit = self.logic("and", hit, self.compare("<", Val("int", k), a.length))
+            elif k >= a.length.const:
+                continue
+            found = self.select(hit, Val("int", k), found)
+        return found
+
+    def _used(self, a, k):
+        return Val("bool", k < a.length.const) if a.length.is_const else self.compare("<", Val("int", k), a.length)
+
+    def arr_reduce(self, name, a):
+        """sum(), min(), max(), avg() over the used slots."""
+        if a.type not in ("int", "float", "vector", "bool"):
+            raise self.err(f"{name}() of an array of {a.type}s")
+        t = "int" if a.type == "bool" else a.type
+        if name in ("sum", "avg"):
+            total = self._neutral(t)
+            for k, x in enumerate(a.items):
+                total = self.arith("+", total, self.select(self._used(a, k), self.conv(x, t), self._neutral(t)))
+            if name == "sum":
+                return total
+            return self.arith("/", total, self.fn2("MAXIMUM", max, self.conv(a.length, "float"), Val("float", 1.0)))
+        if not a.items:
+            return self._neutral(t)
+        result = self.conv(a.items[0], t)
+        for k, x in enumerate(a.items[1:], 1):
+            better = self.fn2(*MATH2[name], result, self.conv(x, t))
+            result = self.select(self._used(a, k), better, result)
+        return result
+
+    def arr_sort(self, a):
+        """Sorted, small to large (odd-even transposition: one compare-swap per pair per round)."""
+        if a.type not in ("int", "float", "bool"):
+            raise self.err(f"sort() works on numbers, not {a.type}s")
+        vals = list(a.items)
+        used = [self._used(a, k) for k in range(len(vals))]
+        n = len(vals)
+        for rnd in range(n):
+            for k in range(rnd % 2, n - 1, 2):
+                # swap when the right one is used and smaller, or the left one isn't used
+                swap = self.logic("and", used[k + 1], self.logic("or", self.not_(used[k]),
+                                                                 self.compare("<", vals[k + 1], vals[k])))
+                vals[k], vals[k + 1] = self.select(swap, vals[k + 1], vals[k]), self.select(swap, vals[k], vals[k + 1])
+                used[k], used[k + 1] = self.select(swap, used[k + 1], used[k]), self.select(swap, used[k], used[k + 1])
+        return self.make_arr(a.type, vals, a.length)
+
+    def _mutate(self, fn, args, result):
+        """append(a, x) & co. change their first argument, a variable or an @name."""
+        target = args[0]
+        if target.kind not in ("var", "attr", "member", "index"):
+            raise self.err(f"{fn}()'s first argument is the array it changes: give it a variable name")
+        self.assign(target, result)
+
+    def array_call(self, name, args, kw):
+        line = self.line
+        if name == "array":
+            vals = [self.eval(x) for x in args]
+            self.line = line
+            t = self.array_type([v.type for v in vals])
+            return self.make_arr(t, [self.conv(v, t) for v in vals], Val("int", len(vals)))
+        if name in ("neighbours", "primpoints", "pointprims", "nearpoints", "pcfind"):
+            return self.topology_array(name, args, kw)
+        if not args:
+            raise self.err(f"{name}() needs an array")
+        a = self.arr(self.eval(args[0]), name)
+        rest = [self.eval(x) for x in args[1:]]
+        self.line = line
+        need = {"append": 1, "push": 1, "insert": 2, "removeindex": 1, "find": 1, "sort": 0, "reverse": 0,
+                "sum": 0, "isvalidindex": 1, "resize": 1}.get(name)
+        if name == "pop":
+            if len(rest) > 1:
+                raise self.err("pop() takes an array and an optional index")
+            i = self._index(a, self.conv(rest[0], "int")) if rest else self.arith("-", a.length, Val("int", 1))
+            value = self.arr_get(a, i)
+            self._mutate(name, args, self.arr_remove(a, i))
+            return value
+        if len(rest) != need:
+            raise self.err(f"{name}() takes an array" + (f" and {need} more argument(s)" if need else ""))
+        if name in ("append", "push"):
+            self._mutate(name, args, self.arr_append(a, rest[0]))
+            return a.length
+        if name == "insert":
+            self._mutate(name, args, self.arr_insert(a, self._index(a, self.conv(rest[0], "int")), rest[1]))
+            return a.length
+        if name == "removeindex":
+            value = self.arr_get(a, rest[0])
+            self._mutate(name, args, self.arr_remove(a, self._index(a, self.conv(rest[0], "int"))))
+            return value
+        if name == "resize":
+            n = self.conv(rest[0], "int")
+            if not n.is_const or n.const < 0:
+                raise self.err("resize()'s length has to be a constant whole number")
+            items = self.padded(a, max(n.const, len(a.items)))[:n.const] if a.length.is_const else \
+                self.padded(a, max(n.const, len(a.items)))
+            fresh = [self.select(self._used(a, k), x, self._neutral(a.type)) for k, x in enumerate(items)]
+            result = self.make_arr(a.type, fresh[:n.const], n)
+            self._mutate(name, args, result)
+            return n
+        if name == "find":
+            return self.arr_find(a, rest[0])
+        if name == "isvalidindex":
+            i = self.conv(rest[0], "int")
+            return self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        if name == "sum":
+            return self.arr_reduce("sum", a)
+        if name == "sort":
+            return self.arr_sort(a)
+        # reverse
+        if a.length.is_const:
+            return self.make_arr(a.type, list(reversed(a.items[:a.length.const])), a.length)
+        last = self.arith("-", a.length, Val("int", 1))
+        return self.make_arr(a.type, [self.arr_get(a, self.arith("-", last, Val("int", k)))
+                                      for k in range(len(a.items))], a.length)
+
+    def arr_insert(self, a, i, v):
+        t = self.array_type([a.type, v.type])
+        v = self.conv(v, t)
+        items = self.padded(a, len(a.items), t)
+        if i.is_const and a.length.is_const:
+            k = min(max(i.const, 0), a.length.const)
+            return self.make_arr(t, items[:k] + [v] + items[k:a.length.const], Val("int", a.length.const + 1))
+        out = []
+        for k in range(len(items) + 1):
+            before = items[k] if k < len(items) else self._neutral(t)
+            shifted = items[k - 1] if k > 0 else self._neutral(t)
+            out.append(self.select(self.compare("<", Val("int", k), i), before,
+                                   self.select(self.compare("==", Val("int", k), i), v, shifted)))
+        return self.make_arr(t, out, self.arith("+", a.length, Val("int", 1)))
+
+    def arr_remove(self, a, i):
+        if i.is_const and a.length.is_const:
+            if not 0 <= i.const < a.length.const:
+                return Val("array", a)  # VEX: nothing to remove
+            items = list(a.items[:a.length.const])
+            del items[i.const]
+            return self.make_arr(a.type, items, Val("int", a.length.const - 1))
+        out = []
+        for k in range(len(a.items)):
+            nxt = a.items[k + 1] if k + 1 < len(a.items) else self._neutral(a.type)
+            out.append(self.select(self.compare("<", Val("int", k), i), a.items[k], nxt))
+        valid = self.logic("and", self.compare(">=", i, Val("int", 0)), self.compare("<", i, a.length))
+        return self.make_arr(a.type, out, self.select(valid, self.arith("-", a.length, Val("int", 1)), a.length))
+
+    def topology_array(self, name, args, kw):
+        """neighbours() / primpoints() / pointprims() / nearpoints(): arrays from the geometry."""
+        cap = kw.get("max")
+        if cap is not None and (isinstance(cap, str) or not cap.is_const or cap.type != "int" or cap.const < 1):
+            raise self.err(f"{name}()'s max= is a whole number above 0")
+        cap = cap.const if cap is not None else LIST_CAP
+        if name in ("nearpoints", "pcfind"):
+            if name == "pcfind":
+                if len(args) < 2 or args[1].kind != "str" or args[1].value != "P":
+                    raise self.err('pcfind() searches positions: pcfind(0, "P", position, radius, [maxpts])')
+                args = args[:1] + args[2:]
+            if len(args) not in (3, 4):
+                raise self.err(f"{name}() takes an input, a position, a radius and an optional most points")
+            return self.nearpoints(args, cap)
+        if len(args) != 2:
+            raise self.err(f"{name}() takes an input number and an element number")
+        n = self.input_number(self.eval(args[0]), name)
+        elem = self.conv(self.eval(args[1]), "int")
+        if name == "neighbours":
+            count = self.call_val("neighbourcount", Val("int", n), elem)
+            items = [self.call_val("neighbour", Val("int", n), elem, Val("int", k)) for k in range(cap)]
+        elif name == "primpoints":
+            count = self.call_val("primvertexcount", Val("int", n), elem)
+            items = [self.call_val("primpoint", Val("int", n), elem, Val("int", k)) for k in range(cap)]
+        else:  # pointprims: the faces of the point's corners
+            count = self.topology(name, n, "GeometryNodeCornersOfVertex", "Total", "Vertex Index", elem, "POINT")
+            items = []
+            for k in range(cap):
+                corner = self.topology(name, n, "GeometryNodeCornersOfVertex", "Corner Index", "Vertex Index", elem,
+                                       "POINT", [("Sort Index", Val("int", k))])
+                items.append(self.topology(name, n, "GeometryNodeFaceOfCorner", "Face Index", "Corner Index", corner,
+                                           "CORNER"))
+        return self.make_arr("int", items, self.fn2("MINIMUM", min, count, Val("int", cap)))
+
+    def nearpoints(self, args, cap):
+        """The points of an input within a radius, nearest first: a loop over every point
+        keeping the `maxpts` nearest (written in BEX itself, see _NEARPOINTS)."""
+        n = self.input_number(self.eval(args[0]), "nearpoints")
+        pos = self.conv(self.eval(args[1]), "vector")
+        radius = self.conv(self.eval(args[2]), "float")
+        if len(args) == 4:
+            m = self.eval(args[3])
+            if not (m.is_const and m.type == "int" and m.const >= 1):
+                raise self.err("nearpoints()'s maxpts has to be a constant whole number above 0")
+            cap = m.const
+        if cap > 64:
+            raise self.err("nearpoints() keeps at most 64 points")
+        line = self.line
+        self.loop_count += 1
+        tag = f"__np{self.loop_count}_"
+        src = _NEARPOINTS.format(t=tag, n=n, last=cap - 1, minus=", ".join(["-1"] * cap),
+                                 radii=", ".join([tag + "r"] * cap), swaps="".join(
+            _NEARPOINTS_SWAP.format(t=tag, a=k, b=k - 1) for k in range(cap - 1, 0, -1)))
+        stmts = parse(src)
+        _set_lines(stmts, line)
+        self.vars[tag + "q"], self.vars[tag + "r"] = pos, self.arith("*", radius, radius)
+        for st in stmts:
+            self.exec(st)
+        found = self.vars[tag + "idx"]
+        count = self.vars.get(tag + "n", Val("int", 0))
+        for name in [v for v in self.vars if v.startswith(tag)]:
+            self.vars.pop(name)
+            self.loop_only.pop(name, None)
+            self.half_set.pop(name, None)
+        self.line = line
+        a = found.const
+        return self.make_arr("int", a.items, self.fn2("MINIMUM", min, count, Val("int", cap)))
+
     # -- making and removing elements ----------------------------------------
     # Each call site is a GeoOp. The builder turns every element where the call ran
     # into a record point, then, after the writes: adds the new points and
@@ -1396,13 +1774,23 @@ class Compiler:
             if len(args) < 2 or args[1].kind != "str" or args[1].value not in PRIM_TYPES:
                 raise self.err(f'addprim()\'s second argument is "poly" or "polyline": {usage[fn]}')
             ptype = PRIM_TYPES[args[1].value]
-            pts = [self.conv(self.eval(a), "int") for a in args[2:]]
+            pts = []  # (point, where it is used): an array gives one corner per used slot
+            for x in args[2:]:
+                v = self.eval(x)
+                if v.type == "array":
+                    a = v.const
+                    pts += [(self.conv(p, "int"), self._used(a, k)) for k, p in enumerate(a.items)]
+                else:
+                    pts.append((self.conv(v, "int"), Val("bool", True)))
             self.line = line
             prim = self.geo_number(ptype, mask)
-            for pt in pts:
-                self.add_geo_op(GeoOp("vertex", mask, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
+            for pt, used in pts:
+                m = self.logic("and", mask, used)
+                if m.is_const and not m.const:
+                    continue
+                self.add_geo_op(GeoOp("vertex", m, {"prim": prim, "pt": pt, "ty": Val("int", int(ptype == "polyline"))},
                                       {"ptype": ptype}, line))
-                self.geo_number("vertex", mask)
+                self.geo_number("vertex", m)
             if not prim.is_const:
                 self.prim_kinds[(prim.node, prim.out)] = ptype
             return prim
@@ -1759,6 +2147,8 @@ class Compiler:
             return self.surface_sample(name, arg_nodes)
         if name in GEO_FUNCS:
             return self.geo_call(name, arg_nodes)
+        if name in ARRAY_FUNCS:
+            return self.array_call(name, arg_nodes, kw)
         if name == "setcomp":  # setcomp(v, value, i, [j]): v[i] = value, v[i][j] = value
             if len(arg_nodes) not in (3, 4) or arg_nodes[0].kind not in ("var", "attr"):
                 raise self.err("setcomp() takes a variable, a value and one or two constant indexes")
@@ -1806,10 +2196,14 @@ class Compiler:
             for c in range(1, len(a) - 1):
                 result = self.select(self.compare("==", i, Val("int", c)), a[c], result)
             return result
+        if name == "$len" and a[0].type == "array":
+            return a[0].const.length
         if name == "$len":
             if a[0].type not in SIZES:
                 raise self.err(f"a for loop goes over range(), (a, b, c) or a vector's components, not a {a[0].type}")
             return Val("int", SIZES[a[0].type])
+        if name in ("min", "max", "avg") and len(a) == 1 and a[0].type == "array":
+            return self.arr_reduce(name, a[0].const)
         if name in ("min", "max") and len(a) != 2:  # min(a, b, c...), or of one vector's components
             if len(a) == 1 and a[0].type == "vector":
                 a = [self.member(a[0], i) for i in range(3)]
@@ -1839,6 +2233,8 @@ class Compiler:
             big = self.node("compare", "bool", (self.fn1("ABSOLUTE", abs, x), Val("float", 3.4e38)),
                             op="LESS_THAN", dtype="FLOAT")
             return big  # NaN compares false too
+        if name == "len" and len(a) == 1 and a[0].type == "array":
+            return a[0].const.length
         if name == "len":
             want(1)
             if a[0].type not in SIZES:
@@ -2135,6 +2531,11 @@ class Compiler:
         return self.arith("%", i, Val("int", n))
 
     def assign(self, target, val):
+        if target.kind in ("index", "member"):
+            cur = self.eval(target.obj)
+            if cur.type == "array":  # a[i] = value
+                i = Val("int", target.comp) if target.kind == "member" else self.conv(self.eval(target.index), "int")
+                return self.assign(target.obj, self.arr_set(cur.const, i, val))
         if target.kind == "index":
             cur = self.eval(target.obj)
             if cur.type in ("matrix", "row"):
@@ -2178,6 +2579,11 @@ class Compiler:
             raise self.err(f"@{name} reads another input, it cannot be written")
         fresh = not target.type and name not in self.attr_types and name not in KNOWN_TYPES and name not in BUILTINS
         type = self.attr_type(name, target.type)
+        if val.type == "array":
+            a = val.const
+            if not (type in SIZES and a.length.is_const and a.length.const == len(a.items) == SIZES[type]):
+                raise self.err(f"@{name}: Blender has no array attributes; store one value (a[i]) or keep the "
+                               f"array in a variable")
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
         if name == "P" and self.domain not in ("POINT", "INSTANCE"):
@@ -2217,7 +2623,8 @@ class Compiler:
         # one closure per argument types, and per which arguments differ per element
         key = (name, tuple(v.type for v in args), tuple(_is_field(v) for v in args))
         recursive = any(f["name"] == name for f in self.frames)
-        if want_value and not multi and not recursive and not all(v.is_const for v in args):
+        if want_value and not multi and not recursive and not all(v.is_const for v in args) \
+                and not any(v.type == "array" for v in args):  # a Closure can't carry an array: inline
             self.call_counts[key] = self.call_counts.get(key, 0) + 1
             if key in self.closure_keys:
                 out = self._find_closure(d, key)
@@ -2316,7 +2723,7 @@ class Compiler:
         deps = self.reading.pop()
         self.line = line
         if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]) or isinstance(result, list) \
-                or len(self.geo_ops) != len(saved["geo_ops"]):
+                or len(self.geo_ops) != len(saved["geo_ops"]) or result.type == "array":
             self._restore(saved)
             return None, None
         result = self._result(d, name, result, returned, has_value)
@@ -2359,6 +2766,10 @@ class Compiler:
             return self.member(v, e.comp)
         if k == "index":
             v = self.eval(e.obj)
+            if v.type == "array":
+                i = self.conv(self.eval(e.index), "int")
+                self.line = e.line
+                return self.arr_get(v.const, i)
             if v.type in ("matrix", "row"):
                 raise self.err("a matrix's indexes have to be constant numbers: m[3][0]")
             n = self.size(v)
@@ -2386,6 +2797,12 @@ class Compiler:
             b = self._eval_where(e.b, self.not_(cond))
             self.line = e.line
             return self.select(cond, a, b)
+        if k == "binop" and e.op in ("in", "not in") and e.b.kind not in ("tuple", "call"):
+            seq = self.eval(e.b)
+            if seq.type == "array":  # x in a: any used slot equals x
+                a = self.eval(e.a)
+                found = self.compare(">=", self.arr_find(seq.const, a), Val("int", 0))
+                return self.not_(found) if e.op == "not in" else found
         if k == "binop" and e.op in ("in", "not in"):
             a = self.eval(e.a)
             items = self.items(e.b)
@@ -2760,32 +3177,41 @@ class Compiler:
                 if kind not in self.geo_counts:
                     self.geo_counts[kind] = self.geo_start(kind)
                 items.append(("count", kind, self.geo_counts[kind]))
-        types = [v.type for _, _, v in items]
-        fields = [_is_field(v) and v.type != "geometry" for _, _, v in items]
-        temp = [f"{TEMP_PREFIX}{self.loop_count}_{k}" for k in range(len(items))]  # chunked: hidden attribute names
+        # An item's type: a Val type, or "array:<element type>:<slots>" for an array,
+        # which is carried as one zone item per slot plus its length (_flat_types).
+        types = [_enc(v) for _, _, v in items]
+        fields = [_field_any(v) for _, _, v in items]
+        temp_base = f"{TEMP_PREFIX}{self.loop_count}_"  # chunked: hidden attribute names, one per flat item
         saved = self._snapshot()
         accs = {}  # key -> (kind, info, line) of the GeoOps whose records a geometry item collects
         while True:
-            starts = tuple(self._neutral(t) if v is NOT_RETURNED else self.conv(v, t)
-                           for (_, _, v), t in zip(items, types))
+            flat_types = [ft for t in types for ft in _flat_types(t)]
+            flat_fields = [f for t, f in zip(types, fields) for _ in _flat_types(t)]
+            temp = [f"{temp_base}{k}" for k in range(len(flat_types))]
+            starts = tuple(x for (_, _, v), t in zip(items, types) for x in self._to_flat(v, t))
             if chunked:
-                fields = [True] * len(items)  # read back from the geometry
+                flat_fields = [True] * len(flat_types)  # read back from the geometry
                 chunks = 1
                 longest = count.const if count.is_const else MAX_ZONE_ITERATIONS
                 while CHUNK_FIRST * (CHUNK_GROWTH ** chunks - 1) / (CHUNK_GROWTH - 1) < longest:
                     chunks += 1
-                chunk = IRNode("chunk", {"names": tuple(temp), "items": tuple(types), "count": chunks,
+                chunk = IRNode("chunk", {"names": tuple(temp), "items": tuple(flat_types), "count": chunks,
                                          "domain": self.domain}, starts, line)
                 size, offset = Val("int", node=chunk, out=0), Val("int", node=chunk, out=1)
-                starts = tuple(self.node("attr", t, name=n, dtype=t) for n, t in zip(temp, types))
-                zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (size,) + starts, line)
+                starts = tuple(self.node("attr", t, name=n, dtype=t) for n, t in zip(temp, flat_types))
+                zone = IRNode("repeat_in", {"items": tuple(flat_types), "fields": tuple(flat_fields)},
+                              (size,) + starts, line)
                 it = self.arith("+", offset, Val("int", node=zone, out=0))
             else:
-                zone = IRNode("repeat_in", {"items": tuple(types), "fields": tuple(fields)}, (count,) + starts, line)
+                zone = IRNode("repeat_in", {"items": tuple(flat_types), "fields": tuple(flat_fields)},
+                              (count,) + starts, line)
                 it = Val("int", node=zone, out=0)
             current = {}  # geometry items: the records collected so far
-            for k, ((kind, name, start), t) in enumerate(zip(items, types)):
-                v = Val(t, node=zone, out=k + 1)
+            at = 1
+            for (kind, name, start), t in zip(items, types):
+                n = len(_flat_types(t))
+                v = self._from_flat(t, [Val(ft, node=zone, out=at + j) for j, ft in enumerate(_flat_types(t))])
+                at += n
                 if start is NOT_RETURNED and t == "bool":  # its type is learnt from the first pass's returns
                     v = NOT_RETURNED
                 if kind == "acc":
@@ -2820,8 +3246,8 @@ class Compiler:
             finals = [current.get(name) if kind == "acc" else self._item_store(kind).get(name)
                       for kind, name, _ in items]
             # e.g. x = 0 before the loop and x += 0.5 inside: carry a float
-            wider = [f.type if f is not None and RANK[f.type] > RANK[t] else t for f, t in zip(finals, types)]
-            varying = [d or (f is not None and _is_field(f) and f.type != "geometry") for f, d in zip(finals, fields)]
+            wider = [self._wider(f, t) for f, t in zip(finals, types)]
+            varying = [d or (f is not None and _field_any(f)) for f, d in zip(finals, fields)]
             carried = {name for kind, name, _ in items if kind == "attr"}
             missed = [a for a, v in self.attrs.items() if a not in carried and saved["attrs"].get(a) is not v]
             if wider == types and varying == fields and not missed and not new_accs:
@@ -2833,36 +3259,70 @@ class Compiler:
                 items.append(("acc", key, Val("geometry", "empty")))
                 types.append("geometry")
                 fields.append(False)
-                temp.append(f"{TEMP_PREFIX}{self.loop_count}_{len(temp)}")
             for name, type in missed:  # written by a function the body calls
                 v = self.read_attr(name, self.attr_type(name, type))
                 items.append(("attr", name, v))
                 types.append(v.type)
                 fields.append(True)
-                temp.append(f"{TEMP_PREFIX}{self.loop_count}_{len(temp)}")
             saved = self._snapshot()
         self.line = self.stmt_line = line
-        finals = [self.conv(f, t) for f, t in zip(finals, types)]
-        out = IRNode("repeat_out", {"zone": zone}, tuple(finals), line)
-        for k, ((kind, name, _), t) in enumerate(zip(items, types)):
+        flat_finals = tuple(x for f, t in zip(finals, types) for x in self._to_flat(f, t))
+        out = IRNode("repeat_out", {"zone": zone}, flat_finals, line)
+        at = 0
+        for (kind, name, _), t in zip(items, types):
+            fts = _flat_types(t)
             if chunked:  # the values the chunks left on the geometry
-                val = self.node("attr", t, name=temp[k], dtype=t)
+                parts = [self.node("attr", ft, name=temp[at + j], dtype=ft) for j, ft in enumerate(fts)]
             else:
-                val = Val(t, node=out, out=k)
+                parts = [Val(ft, node=out, out=at + j) for j, ft in enumerate(fts)]
+            at += len(fts)
+            val = self._from_flat(t, parts)
             if kind == "acc":
                 op_kind, info, op_line = accs[name]
                 self.geo_ops.append(GeoOp(op_kind, Val("bool", True), {}, info, op_line, records=val))
             else:
                 self._item_store(kind)[name] = val
         if chunked:
-            running = next(k for k, (kind, name, _) in enumerate(items) if name == brk)
+            offsets = itertools.accumulate([0] + [len(_flat_types(t)) for t in types])
+            running = next(o for o, (kind, name, _) in zip(offsets, items) if name == brk)
             sel = self.group_sel if self.group_sel is not None else Val("bool", True)
             self.preludes.append(IRNode("chunk_end", {"chunk": chunk, "flag": running},
-                                        tuple(Val(t, node=out, out=k) for k, t in enumerate(types)) + (sel,), line))
+                                        tuple(Val(t, node=out, out=k) for k, t in enumerate(flat_types)) + (sel,),
+                                        line))
         for name in local:  # its value would come from inside the zone
             self.vars.pop(name, None)
             self.loop_only[name] = line
         return out
+
+    def _to_flat(self, v, t):
+        """A loop item's value as its zone items (an array: its slots, then its length)."""
+        if not t.startswith("array:"):
+            return [self._neutral(t) if v is NOT_RETURNED else self.conv(v, t)]
+        _, et, cap = t.split(":")
+        if v is NOT_RETURNED:
+            v = self.empty_array(et)
+        if v.type != "array":
+            raise self.err("a variable can't change between an array and a single value in a loop")
+        a = v.const
+        return self.padded(a, int(cap), et)[:int(cap)] + [a.length]
+
+    def _from_flat(self, t, parts):
+        if not t.startswith("array:"):
+            return parts[0]
+        return self.make_arr(t.split(":")[1], parts[:-1], parts[-1])
+
+    def _wider(self, f, t):
+        """The item type a loop needs after a pass that ended with `f`."""
+        if f is None or f is NOT_RETURNED:
+            return t
+        if f.type == "array":
+            a = f.const
+            if t.startswith("array:"):
+                _, et, cap = t.split(":")
+                et, cap = self.array_type([et, a.type]), int(cap)
+                return f"array:{et}:{cap if len(a.items) <= cap else max(len(a.items), ARRAY_ZONE_CAP)}"
+            return _enc(f) if t == "bool" else t  # bool: a function's return value, learnt now
+        return f.type if RANK[f.type] > RANK.get(t, 99) else t
 
     def _item_store(self, kind):
         """Where a Repeat Zone item lives: variables, attributes, or the next element numbers."""
@@ -3070,9 +3530,40 @@ def _assigned(body, brk=None, cont=None, outer=()):
     return names, attrs
 
 
+# nearpoints(): every point of the input is checked; the `k` nearest within the radius
+# are kept in order (an unrolled insertion step per point). {t} prefixes hidden names.
+_NEARPOINTS = """
+{t}idx = array({minus})
+{t}dst = array({radii})
+{t}n = 0
+for {t}j in range(npoints({n})):
+    {t}d = distance2({t}q, point({n}, "P", {t}j))
+    if {t}d <= {t}r and {t}d < {t}dst[{last}]:
+        {t}dst[{last}] = {t}d
+        {t}idx[{last}] = {t}j
+        {t}n += 1
+{swaps}"""
+_NEARPOINTS_SWAP = """        if {t}dst[{a}] < {t}dst[{b}]:
+            {t}dst[{a}], {t}dst[{b}] = {t}dst[{b}], {t}dst[{a}]
+            {t}idx[{a}], {t}idx[{b}] = {t}idx[{b}], {t}idx[{a}]
+"""
+
+
+def _set_lines(x, line):
+    """Every AST node in `x` reports `line` (code the compiler writes for a call)."""
+    if isinstance(x, (list, tuple)):
+        for v in x:
+            _set_lines(v, line)
+    elif isinstance(x, N):
+        x.line = line
+        for v in x.__dict__.values():
+            _set_lines(v, line)
+
+
 # Built-ins that assign one of their arguments: name -> which (a slice of the arguments)
 _ARG_TARGETS = {"translate": slice(0, 1), "rotate": slice(0, 1), "scale": slice(0, 1), "setcomp": slice(0, 1),
-                "wnoise": slice(1, 4)}
+                "wnoise": slice(1, 4), "append": slice(0, 1), "push": slice(0, 1), "pop": slice(0, 1),
+                "insert": slice(0, 1), "removeindex": slice(0, 1), "resize": slice(0, 1)}
 
 
 def _call_targets(s):
@@ -3098,6 +3589,25 @@ def _call_targets(s):
                 visit(v)
     visit(s)
     return [t for t in found if t.kind in ("var", "attr", "member", "index")]
+
+
+def _enc(v):
+    """A loop item's type: the Val's, or "array:<element type>:<slots>"."""
+    return f"array:{v.const.type}:{len(v.const.items)}" if v.type == "array" else v.type
+
+
+def _flat_types(t):
+    if t.startswith("array:"):
+        _, et, cap = t.split(":")
+        return [et] * int(cap) + ["int"]
+    return [t]
+
+
+def _field_any(v):
+    """`v` differs per element (an array: any slot or its length). Geometry never does."""
+    if v.type == "array":
+        return any(_is_field(x) for x in v.const.items + (v.const.length,))
+    return bool(_is_field(v)) and v.type != "geometry"
 
 
 def _tuple_arity(s):
