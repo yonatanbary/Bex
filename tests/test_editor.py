@@ -501,6 +501,37 @@ def test_every_function_has_a_signature():
     for name, (params, summary) in SIGNATURES.items():
         assert (params or name == "ident") and summary.endswith("."), name
 
+def test_auto_pairs():
+    b = TextBuffer("")
+    for ch in "f(":
+        b.insert(ch)
+    assert b.text == "f()" and b.cursor == (0, 2)
+    for ch in '"a':
+        b.insert(ch)
+    assert b.text == 'f("a")' and b.cursor == (0, 4)
+    b.insert('"')  # steps over the closing quote
+    b.insert(")")  # and the bracket
+    assert b.text == 'f("a")' and b.cursor == (0, 6)
+    b = TextBuffer("x")
+    b.insert("(")  # before a word: no pair
+    assert b.text == "(x"
+    b = TextBuffer("")
+    b.insert("[")
+    b.backspace()  # [|] -> |
+    assert b.text == ""
+    b = TextBuffer("noise")
+    b.select_all()
+    b.insert("(")  # wraps the selection
+    assert b.text == "(noise)" and b.selected_text() == "noise"
+    b = TextBuffer("it")
+    b.move_end()
+    b.insert("'")  # an apostrophe after a word
+    assert b.text == "it'"
+    b = TextBuffer("")
+    b.insert("ab()")  # a paste is left alone
+    assert b.text == "ab()"
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
