@@ -1714,6 +1714,76 @@ def test_matrices_normals_instances():
         assert close(rot @ Vector((1, 0, 0)), (math.cos(k * 0.5), math.sin(k * 0.5), 0))
 
 
+def test_geometry_functions():
+    from mathutils import Vector
+    # New points after the old ones, attributes written on them, faces with shared points
+    obj, node, text = make_setup("""
+    f@w = @ptnum
+    if @ptnum % 5 < 4 and @ptnum < 20:
+        pt = addpoint(0, @P + (0.25, 0.25, 1))
+        setpointattrib(0, "h", pt, @ptnum + 100.0)
+        addprim(0, "poly", @ptnum, @ptnum + 1, pt)
+    """)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    orig = original_points(obj)
+    makers = [i for i in range(25) if i % 5 < 4 and i < 20]
+    assert len(mesh.vertices) == 25 + len(makers) and len(mesh.polygons) == 16 + len(makers)
+    assert all(close(mesh.vertices[i].co, orig[i]) for i in range(25))
+    h = attr(mesh, "h")
+    for k, i in enumerate(makers):
+        new = mesh.vertices[25 + k]
+        assert close(new.co, Vector(orig[i]) + Vector((0.25, 0.25, 1))) and abs(h[25 + k] - (i + 100)) < 1e-5
+        face = mesh.polygons[16 + k]
+        assert sorted(face.vertices) == sorted((i, i + 1, 25 + k))
+        # Houdini's clockwise order: the normal is the left-handed one of (i, i + 1, pt)
+        a, b, c = (Vector(mesh.vertices[v].co) for v in (i, i + 1, 25 + k))
+        assert close(face.normal, -(b - a).cross(c - a).normalized())
+    assert attr(mesh, "w")[:25] == [pytest_approx(i) for i in range(25)]
+
+    # Polylines become curves; copies keep attributes; write modes; removals
+    text.from_string(textwrap.dedent("""
+    f@w = @ptnum
+    pt = addpoint(0, @ptnum)
+    addprim(0, "polyline", @ptnum, pt)
+    setpointattrib(0, "acc", 0, 1.0, "add")
+    setpointattrib(0, "lo", 2, @P.x, "min")
+    if @ptnum >= 20:
+        removepoint(0, @ptnum - 20)
+    """))
+    node.sync()
+    assert node.error == "", node.error
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    assert len(geo.curves.curves) == 25
+    mesh = obj.evaluated_get(deps).data
+    assert len(mesh.vertices) == 50 - 5  # points 0-4 removed
+    w = attr(mesh, "w")
+    assert w[:20] == [pytest_approx(i) for i in range(5, 25)] and w[20:] == [pytest_approx(i) for i in range(25)]
+    acc, lo = attr(mesh, "acc"), attr(mesh, "lo")
+    assert abs(acc[0] - 0.0) < 1e-6  # point 0 was removed; nothing else got "add"
+    # point 2 was removed too; check the min mode on a kept point instead
+    text.from_string('setpointattrib(0, "lo", 7, @P.x, "min")\nsetpointattrib(0, "acc", 7, 1.0, "add")\n'
+                     'setprimattrib(0, "f", @ptnum % 16, 1, "add")')
+    node.sync()
+    mesh = evaluate(obj)
+    assert abs(attr(mesh, "lo")[7] - min(min(x for x, _, _ in orig), 0)) < 1e-6 and attr(mesh, "acc")[7] == 25
+    assert sorted(round(v) for v in attr(mesh, "f")) == [1] * 7 + [2] * 9
+
+    # Faces: removeprim, in a loop of fixed length (unrolled)
+    obj, node, text = make_setup("""
+    if @primnum % 2 == 0:
+        removeprim(0, @primnum, 1)
+    """, domain="FACE")
+    assert node.error == "", node.error
+    assert len(evaluate(obj).polygons) == 8
+    text.from_string("for i in range(12):\n    addpoint(0, @P + (0, 0, i + 1))")
+    node.sync()
+    assert node.error == "", node.error
+    assert len(evaluate(obj).vertices) == 25 + 16 * 12  # 16 faces, 12 points each
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

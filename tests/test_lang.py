@@ -871,6 +871,32 @@ def test_matrix_elements_and_instances():
     fails("@N = (0, 0, 1)", "custom normals", domain="EDGE")
 
 
+def test_geometry_functions():
+    prog = compile_source('pt = addpoint(0, @P + @N)\nprim = addprim(0, "polyline")\naddvertex(0, prim, @ptnum)\n'
+                          'addvertex(0, prim, pt)\nif @P.x > 0:\n    removepoint(0, @ptnum)\n'
+                          'setpointattrib(0, "Cd", pt, (1, 0, 0))\nsetprimattrib(0, "w", prim, 2.0, "add")\n'
+                          'i@made = pt')
+    kinds = [op.kind for op in prog.geo_ops]
+    assert kinds == ["addpoint", "vertex", "vertex", "remove", "set", "set"]
+    assert prog.geo_ops[3].mask.node.kind == "compare"  # only where the if runs
+    assert prog.geo_ops[5].info["domain"] == "CURVE"  # a polyline is a curve
+    assert prog.geo_ops[4].info["storage"] == "FLOAT_COLOR"
+    made = {n: v for n, _t, v in prog.writes}["made"]
+    assert made.node.kind == "imath"  # the point count plus the elements before
+    prog = compile_source("for i in range(20):\n    addpoint(0, @P + (0, 0, i))")
+    assert len(prog.geo_ops) == 20  # unrolled
+    prog = compile_source("addpoint(0, @P)", group="@P.x > 0")
+    assert prog.geo_ops[0].mask.node.kind == "compare"
+    fails('for i in range(chi("n")):\n    addpoint(0, @P)', "Repeat Zone")
+    fails("addpoint(1, @P)", "first argument is the geometry")
+    fails("addvertex(0, 3, @ptnum)", "pass the number addprim() gave")
+    fails('setdetailattrib(0, "x", 1)', "no detail attributes")
+    fails('setpointattrib(0, "x", 0, 1.0, "toggle")', "mode is one of")
+    fails('setpointgroup(0, "g", 0, 1)\nsetpointattrib(0, "b@g", 0, True, "add")', "needs numbers")
+    fails('addprim(0, "sphere")', '"poly" or "polyline"')
+    fails('setpointattrib(0, "ptnum", 0, 1)', "can't write")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

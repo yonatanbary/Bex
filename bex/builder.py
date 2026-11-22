@@ -522,6 +522,352 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
         line_stack.pop()
         return zone_out.outputs["Geometry"]
 
+    # -- addpoint(), addprim(), set*attrib(), remove*() ------------------------
+    # Each call site (GeoOp) becomes record points: one per element where it ran,
+    # holding its values (read on the incoming geometry). Then, on the written
+    # geometry: new points are joined after the existing ones, primitives are built
+    # from their corners (copies of the points they use), writes to other elements
+    # are gathered per element, and removals run last.
+    G = TEMP_PREFIX + "g_"  # the records' hidden attributes
+
+    def out(n, name):
+        return _enabled(n.outputs, name)[0]
+
+    def g_read(name, type):
+        return read(G + name, type)
+
+    def g_store(geo, name, type, value, dom="POINT"):
+        return store(geo, G + name, type, value, dom)
+
+    def index():
+        return new("GeometryNodeInputIndex").outputs[0]
+
+    def size(geo, dom):
+        n = new("GeometryNodeAttributeStatistic")
+        n.data_type, n.domain = "FLOAT", dom
+        links.new(geo, n.inputs["Geometry"])
+        n.inputs["Attribute"].default_value = 1.0
+        return n.outputs["Sum"]
+
+    def points(count):
+        n = new("GeometryNodePoints")
+        links.new(count, n.inputs["Count"])
+        return n.outputs[0]
+
+    def int_math(op, a, b):
+        n = new("FunctionNodeIntegerMath")
+        n.operation = op
+        for sock, v in zip(n.inputs, (a, b)):
+            if isinstance(v, int):
+                sock.default_value = v
+            else:
+                links.new(v, sock)
+        return n.outputs[0]
+
+    def int_compare(a, op, b):
+        n = new("FunctionNodeCompare")
+        n.data_type, n.operation = "INT", op
+        sa, sb = _enabled(n.inputs, "A")[0], _enabled(n.inputs, "B")[0]
+        links.new(a, sa)
+        if isinstance(b, int):
+            sb.default_value = b
+        else:
+            links.new(b, sb)
+        return n.outputs[0]
+
+    def delete(geo, dom, selection, mode="ALL"):
+        n = new("GeometryNodeDeleteGeometry")
+        n.domain, n.mode = dom, mode
+        links.new(geo, n.inputs["Geometry"])
+        links.new(selection, n.inputs["Selection"])
+        return n.outputs[0]
+
+    def join(geos):
+        n = new("GeometryNodeJoinGeometry")
+        for g in reversed(geos):  # a multi-input socket lists its newest link first
+            links.new(g, n.inputs[0])
+        return n.outputs[0]
+
+    def sample(geo, type, value, idx, dom="POINT"):
+        n = new("GeometryNodeSampleIndex")
+        n.data_type, n.domain = ATTR_TYPE[type], dom
+        links.new(geo, n.inputs["Geometry"])
+        (connect if isinstance(value, Val) else links.new)(value, _enabled(n.inputs, "Value")[0])
+        links.new(idx, n.inputs["Index"])
+        return out(n, "Value")
+
+    def field_node(idname, type, value, group, dom="POINT", **props):
+        n = new(idname)
+        n.domain = dom
+        n.data_type = ATTR_TYPE[type]
+        for k, v in props.items():
+            setattr(n, k, v)
+        links.new(value, _enabled(n.inputs, "Value")[0])
+        if group is not None:
+            links.new(group, n.inputs["Group ID"])
+        return n
+
+    def sort(geo, group=None, weight=None):
+        n = new("GeometryNodeSortElements")
+        n.domain = "POINT"
+        links.new(geo, n.inputs["Geometry"])
+        if group is not None:
+            links.new(group, n.inputs["Group ID"])
+        if weight is not None:
+            links.new(weight, n.inputs["Sort Weight"])
+        return n.outputs[0]
+
+    def to_points(geo):
+        """Every point of `geo` as a point cloud (mesh vertices and point cloud points)."""
+        sep = new("GeometryNodeSeparateComponents")
+        links.new(geo, sep.inputs[0])
+        m2p = new("GeometryNodeMeshToPoints")
+        links.new(sep.outputs["Mesh"], m2p.inputs["Mesh"])
+        return join([m2p.outputs[0], sep.outputs["Point Cloud"]])
+
+    def split_points(geo):
+        """(points, rest): Houdini's point numbers mean the mesh and point cloud
+        points; curve points only when there are none of those (each component
+        numbers its points on its own)."""
+        sep = new("GeometryNodeSeparateComponents")
+        links.new(geo, sep.inputs[0])
+        counts = []
+        for comp in ("MESH", "POINTCLOUD"):
+            n = new("GeometryNodeAttributeDomainSize")
+            n.component = comp
+            links.new(geo, n.inputs[0])
+            counts.append(n.outputs["Point Count"])
+        has = int_compare(int_math("ADD", *counts), "GREATER_THAN", 0)
+        picked = []
+        for when_true, when_false in ((join([sep.outputs["Mesh"], sep.outputs["Point Cloud"]]), geo),
+                                      (join([sep.outputs["Curve"], sep.outputs["Instances"], sep.outputs["Volume"],
+                                             sep.outputs["Grease Pencil"]]), None)):
+            sw = new("GeometryNodeSwitch")
+            sw.input_type = "GEOMETRY"
+            links.new(has, _enabled(sw.inputs, "Switch")[0])
+            links.new(when_true, _enabled(sw.inputs, "True")[0])
+            if when_false is not None:
+                links.new(when_false, _enabled(sw.inputs, "False")[0])
+            picked.append(_enabled(sw.outputs, "Output")[0])
+        return picked
+
+    def on_points(geo, dom, fn):
+        """fn(geometry) on the points Houdini's point numbers mean (split_points), or on all of `dom`."""
+        if dom != "POINT":
+            return fn(geo)
+        main, rest = split_points(geo)
+        return join([fn(main), rest])
+
+    def records(op):
+        """One point per element where the call ran, holding the call's values."""
+        line_stack.append(op.line)
+        geo = points(size(geometry(0), domain))
+        for key, val in list(op.values.items()) + ([("mask", op.mask)] if not op.mask.is_const else []):
+            v = val if val.is_const else sample(geometry(0), val.type, val, index(), domain)
+            geo = g_store(geo, key, val.type, v)
+        if not op.mask.is_const:
+            no = new("FunctionNodeBooleanMath")
+            no.operation = "NOT"
+            links.new(g_read("mask", "bool"), no.inputs[0])
+            geo = delete(geo, "POINT", no.outputs[0])
+        line_stack.pop()
+        return geo
+
+    def gather(geo, recs, key, dom):
+        """Lines the records up with the elements of `dom` they name in `key`: a
+        point cloud with one point per element, in element order, holding `c` (how
+        many records name it) and `m` (where its records start in the sorted cloud,
+        which is returned too)."""
+        marks = g_store(g_store(points(size(geo, dom)), "t", "int", index()), "k", "int", Val("int", 0))
+        recs = g_store(g_store(recs, "t", "int", g_read(key, "int")), "k", "int", Val("int", 1))
+        recs = g_store(recs, "o", "int", index())
+        # Grouped by element, a group's marker first (sorting is stable), then its records in order.
+        cloud = sort(join([marks, recs]), group=g_read("t", "int"))
+        acc = field_node("GeometryNodeAccumulateField", "int", g_read("k", "int"), g_read("t", "int"))
+        cloud = g_store(g_store(cloud, "c", "int", out(acc, "Total")), "m", "int", index())
+        return cloud, delete(cloud, "POINT", int_compare(g_read("k", "int"), "EQUAL", 1))
+
+    def pick(geo, recs, key, carry):
+        """Copies of geo's points, one per record, in record order: record r copies
+        point `key` with all its attributes (`sp` = that point's number). `carry`:
+        record attributes copied onto the copies."""
+        cloud, marks = gather(geo, recs, key, "POINT")
+        src = g_store(geo, "sp", "int", index())
+        dup = new("GeometryNodeDuplicateElements")
+        dup.domain = "POINT"
+        links.new(src, dup.inputs["Geometry"])
+        links.new(sample(marks, "int", g_read("c", "int"), index()), dup.inputs["Amount"])
+        copies = g_store(dup.outputs["Geometry"], "di", "int", dup.outputs["Duplicate Index"])
+        # copy k of point p is the k-th record naming p in the sorted cloud
+        start = sample(marks, "int", g_read("m", "int"), g_read("sp", "int"))
+        rec = int_math("ADD", int_math("ADD", start, 1), g_read("di", "int"))
+        for name, type in list(carry) + [("o", "int")]:
+            copies = g_store(copies, name, type, sample(cloud, type, g_read(name, type), rec))
+        return sort(copies, weight=g_read("o", "int"))
+
+    def gathered(geo, recs, dom, mode, type):
+        """Per element of `dom`: (any record names it, the records' value combined by mode)."""
+        big = {"float": 3.4e38, "int": 2147483647}
+        if mode in ("min", "max"):
+            b = big.get(type, 3.4e38) * (1 if mode == "min" else -1)
+            init = Val(type, (b,) * 3 if type == "vector" else (int(b) if type == "int" else b))
+        else:
+            init = Val(type, {"vector": (0.0, 0.0, 0.0), "int": 0, "float": 0.0, "bool": False}.get(type, 0))
+        marks_v = None
+        if type is not None:
+            recs = g_store(recs, "v", type, g_read("value", type))
+        cloud, marks = gather(geo, recs, "target", dom)
+        if type is not None:
+            # the markers' own value can't change a sum, minimum or maximum
+            cloud = store(cloud, G + "v", type, init, "POINT",
+                          int_compare(g_read("k", "int"), "EQUAL", 0)) if init.const not in (0, 0.0, False) else cloud
+            group = g_read("t", "int")
+            if mode == "set":  # the last record wins: it sits c places after its marker
+                n = field_node("GeometryNodeFieldAtIndex", type, g_read("v", type), None)
+                links.new(int_math("ADD", index(), g_read("c", "int")), n.inputs["Index"])
+                agg = n.outputs[0]
+            elif mode == "add":
+                agg = out(field_node("GeometryNodeAccumulateField", type, g_read("v", type), group), "Total")
+            else:
+                agg = out(field_node("GeometryNodeFieldMinAndMax", type, g_read("v", type), group),
+                          "Min" if mode == "min" else "Max")
+            cloud = g_store(cloud, "a", type, agg)
+            marks = delete(cloud, "POINT", int_compare(g_read("k", "int"), "EQUAL", 1))
+            marks_v = sample(marks, type, g_read("a", type), index())
+        hit = int_compare(sample(marks, "int", g_read("c", "int"), index()), "GREATER_THAN", 0)
+        return hit, marks_v
+
+    def combine_existing(name, type, mode, v):
+        if mode == "set":
+            return v
+        old = read(name, type)
+        if type == "vector":
+            n = new("ShaderNodeVectorMath")
+            n.operation = {"add": "ADD", "min": "MINIMUM", "max": "MAXIMUM"}[mode]
+        elif type == "int":
+            n = new("FunctionNodeIntegerMath")
+            n.operation = {"add": "ADD", "min": "MINIMUM", "max": "MAXIMUM"}[mode]
+        else:
+            n = new("ShaderNodeMath")
+            n.operation = {"add": "ADD", "min": "MINIMUM", "max": "MAXIMUM"}[mode]
+        links.new(old, n.inputs[0])
+        links.new(v, n.inputs[1])
+        return n.outputs[0]
+
+    def write_other(geo, op):
+        """setpointattrib() & co.: each element gets the values of the records naming it."""
+        name, type, dom, mode = (op.info[k] for k in ("name", "type", "domain", "mode"))
+        hit, v = gathered(geo, records(op), dom, mode, type)
+        if name == "position":
+            n = new("GeometryNodeSetPosition")
+            links.new(geo, n.inputs["Geometry"])
+            links.new(combine_existing(name, type, mode, v), n.inputs["Position"])
+            links.new(hit, n.inputs["Selection"])
+            return n.outputs[0]
+        n = new("GeometryNodeStoreNamedAttribute")
+        n.data_type = op.info["storage"] or ATTR_TYPE[type]
+        n.domain = dom
+        n.inputs["Name"].default_value = name
+        n.label = "@" + name
+        links.new(geo, n.inputs["Geometry"])
+        links.new(combine_existing(name, type, mode, v), _enabled(n.inputs, "Value")[0])
+        links.new(hit, n.inputs["Selection"])
+        return n.outputs["Geometry"]
+
+    def geometry_ops(geo, ops):
+        kinds = lambda k: [op for op in ops if op.kind == k]  # noqa: E731
+        # New points, in call order, after the existing ones (vertices when there is a mesh).
+        adds = kinds("addpoint")
+        if adds:
+            chunks = []
+            for op in adds:
+                recs = records(op)
+                if op.info["src"]:
+                    chunks.append(to_points(pick(split_points(geo)[0], recs, "src", [])))
+                else:
+                    n = new("GeometryNodeSetPosition")
+                    links.new(recs, n.inputs["Geometry"])
+                    links.new(g_read("pos", "vector"), n.inputs["Position"])
+                    chunks.append(n.outputs[0])
+            fresh = join(chunks)
+            has_mesh = new("GeometryNodeAttributeDomainSize")
+            has_mesh.component = "MESH"
+            links.new(geo, has_mesh.inputs[0])
+            verts = new("GeometryNodePointsToVertices")
+            links.new(fresh, verts.inputs["Points"])
+            sw = new("GeometryNodeSwitch")
+            sw.input_type = "GEOMETRY"
+            links.new(int_compare(has_mesh.outputs["Point Count"], "GREATER_THAN", 0), _enabled(sw.inputs, "Switch")[0])
+            links.new(join([geo, fresh]), _enabled(sw.inputs, "False")[0])
+            links.new(join([geo, verts.outputs[0]]), _enabled(sw.inputs, "True")[0])
+            geo = _enabled(sw.outputs, "Output")[0]
+        # New primitives from their corners: copies of the points they use.
+        corners = kinds("vertex")
+        if corners:
+            recs = join([g_store(records(op), "ty", "int", Val("int", int(op.info["ptype"] == "polyline")))
+                         for op in corners])
+            copies = to_points(pick(split_points(geo)[0], recs, "pt", [("prim", "int"), ("ty", "int")]))
+            types = {op.info["ptype"] for op in corners}
+            if "poly" in types:
+                polys = delete(copies, "POINT", int_compare(g_read("ty", "int"), "NOT_EQUAL", 0))
+                polys = g_store(polys, "rp", "vector", new("GeometryNodeInputPosition").outputs[0])
+                curves = new("GeometryNodePointsToCurves")
+                links.new(polys, curves.inputs["Points"])
+                links.new(g_read("prim", "int"), curves.inputs["Curve Group ID"])
+                links.new(index(), curves.inputs["Weight"])
+                cyc = new("GeometryNodeSetSplineCyclic")
+                cyc.inputs["Cyclic"].default_value = True
+                links.new(curves.outputs[0], cyc.inputs[0])
+                path = new("GeometryNodeCurvePrimitiveLine")
+                path.inputs["End"].default_value = (0.0, 0.0, 0.0)
+                one = new("GeometryNodeResampleCurve")
+                one.inputs["Count"].default_value = 1
+                links.new(path.outputs[0], one.inputs[0])
+                faces = new("GeometryNodeCurveToMesh")  # a one-point path: each profile becomes its cap
+                faces.inputs["Fill Caps"].default_value = True
+                links.new(one.outputs[0], faces.inputs["Curve"])
+                links.new(cyc.outputs[0], faces.inputs["Profile Curve"])
+                placed = new("GeometryNodeSetPosition")
+                links.new(faces.outputs[0], placed.inputs["Geometry"])
+                links.new(g_read("rp", "vector"), placed.inputs["Position"])
+                # Curve to Mesh's cap runs the profile backwards: Blender's winding of Houdini's
+                # clockwise order, so the face points the way it would in Houdini.
+                # The corners join the points they copy: Merge Points by point number.
+                sep = new("GeometryNodeSeparateComponents")
+                links.new(geo, sep.inputs[0])
+                cloud = new("GeometryNodePointsToVertices")
+                links.new(sep.outputs["Point Cloud"], cloud.inputs["Points"])
+                whole = join([sep.outputs["Mesh"], cloud.outputs[0], sep.outputs["Curve"], sep.outputs["Instances"]])
+                whole = g_store(whole, "sp", "int", index())
+                merge = new("GeometryNodeMergePoints")
+                links.new(join([whole, placed.outputs[0]]), merge.inputs["Geometry"])
+                links.new(g_read("sp", "int"), merge.inputs["Merge ID"])
+                geo = merge.outputs[0]
+            if "polyline" in types:
+                lines = delete(copies, "POINT", int_compare(g_read("ty", "int"), "NOT_EQUAL", 1))
+                curves = new("GeometryNodePointsToCurves")
+                links.new(lines, curves.inputs["Points"])
+                links.new(g_read("prim", "int"), curves.inputs["Curve Group ID"])
+                links.new(index(), curves.inputs["Weight"])
+                geo = join([geo, curves.outputs[0]])
+        # Writes to other elements, call by call.
+        for op in kinds("set"):
+            geo = on_points(geo, op.info["domain"], lambda g, op=op: write_other(g, op))
+        # Removals: mark every target first (removing renumbers), faces and curves before points.
+        groups = {}
+        for op in kinds("remove"):
+            groups.setdefault((op.info["domain"], op.info["mode"]), []).append(op)
+        flags = []
+        for k, ((dom, mode), group) in enumerate(groups.items()):
+            def mark(g, dom=dom, group=group, k=k):
+                hit, _ = gathered(g, join([records(op) for op in group]), dom, "set", None)
+                return store(g, f"{G}del{k}", "bool", hit, dom)
+            geo = on_points(geo, dom, mark)
+            flags.append((dom, mode, f"{G}del{k}"))
+        for dom, mode, flag in sorted(flags, key=lambda f: f[0] == "POINT"):
+            geo = delete(geo, dom, read(flag, "bool"), mode)
+        return geo
+
     # -- geometry chain: chunked loops first (they leave their results on the
     # geometry as hidden attributes), then capture the values that need it
     # (Program.captures), then one write node per Program.stores entry.
@@ -568,7 +914,10 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             connect(st.selection, n.inputs["Selection"])
         geo = n.outputs["Geometry"]
 
-    if program.preludes:  # the chunked loops' hidden attributes
+    if program.geo_ops:  # addpoint() & co.: after the writes, on the written geometry
+        geo = geometry_ops(geo, program.geo_ops)
+
+    if program.preludes or program.geo_ops:  # the chunked loops' and geometry records' hidden attributes
         n = new("GeometryNodeRemoveAttribute")
         n.inputs["Pattern Mode"].default_value = "Wildcard"  # a menu socket in 5.2, not a property
         n.inputs["Name"].default_value = TEMP_PREFIX + "*"
@@ -640,6 +989,19 @@ BUTTON_ROWS = {
     "ShaderNodeTexVoronoi": 4,
     "ShaderNodeTexGabor": 1,
     "GeometryNodeSetMeshNormal": 2,
+    "GeometryNodeDeleteGeometry": 2,
+    "GeometryNodeSortElements": 1,
+    "GeometryNodeAccumulateField": 2,
+    "GeometryNodeFieldAtIndex": 2,
+    "GeometryNodeFieldMinAndMax": 2,
+    "GeometryNodeFieldAverage": 2,
+    "GeometryNodeFieldVariance": 2,
+    "GeometryNodeFieldOnDomain": 2,
+    "GeometryNodeBlurAttribute": 1,
+    "GeometryNodeDuplicateElements": 1,
+    "GeometryNodeAttributeDomainSize": 1,
+    "GeometryNodeSampleCurve": 3,
+    "GeometryNodeSampleUVSurface": 1,
     "GeometryNodeInputNamedAttribute": 1,
     "GeometryNodeStoreNamedAttribute": 2,
     "GeometryNodeCaptureAttribute": 1,

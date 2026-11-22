@@ -77,6 +77,19 @@ class Program:
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
     preludes: list = field(default_factory=list)  # chunk_end IRNodes: chunked loops, run on the geometry first
+    geo_ops: list = field(default_factory=list)  # [GeoOp]: added / removed elements, writes to other elements
+
+
+@dataclass
+class GeoOp:
+    """One call site of addpoint() / addprim() / addvertex() / remove*() / set*attrib().
+    Every element of the run-over domain where `mask` is true makes one record;
+    `values` are fields of that element (read on the incoming geometry)."""
+    kind: str  # addpoint | vertex | remove | set
+    mask: Val
+    values: dict  # name -> Val: pos or src (addpoint), prim + pt (vertex), target (+ value for set)
+    info: dict  # addpoint: src; vertex: ptype (poly / polyline); remove: domain, mode; set: domain, name, type, mode
+    line: int = 0
 
 
 @dataclass
@@ -369,6 +382,12 @@ SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemi
 FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
 KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
             "curlnoise": NOISE_OPTS, **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+# Making and removing elements, writing to other elements (Compiler.geo_call)
+GEO_FUNCS = ("addpoint", "addprim", "addvertex", "removepoint", "removeprim", "setpointattrib", "setprimattrib",
+             "setpointgroup", "setprimgroup", "setvertexattrib", "setdetailattrib")
+GEO_UNROLL_MAX = 64  # a loop making elements is unrolled up to this many passes
+PRIM_TYPES = {"poly": "poly", "polygon": "poly", "polyline": "polyline"}
+SET_MODES = ("set", "add", "min", "max")
 # Statistics over the run-over domain, optionally per group (Compiler.aggregate): name -> (node, output)
 AGGREGATES = {"mean": ("GeometryNodeFieldAverage", "Mean"), "median": ("GeometryNodeFieldAverage", "Median"),
               "minof": ("GeometryNodeFieldMinAndMax", "Min"), "maxof": ("GeometryNodeFieldMinAndMax", "Max"),
@@ -396,7 +415,7 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
-    "countof", "blur", "at", "promote", "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
+    "countof", "blur", "at", "promote", *GEO_FUNCS, "primuv", "uvsample", "isnan", "isfinite", "len", "getcomp", "setcomp",
 }) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
@@ -583,6 +602,19 @@ SIGNATURES = {
     "promote": (("value", "domain"), 'value computed on another domain ("face", "point"...) and read back here.'),
     "primuv": (("input", "name", "curve", "u"), 'An attribute along a curve, at u from 0 to 1: primuv(1, "P", 0, 0.5).'),
     "uvsample": (("input", "name", "uvname", "uv"), 'An attribute at a UV position: uvsample(1, "P", "UVMap", uv).'),
+    # Making and removing elements
+    "addpoint": (("geo", "position"), "Adds a point; gives its number. addpoint(0, ptnum) copies that point."),
+    "addprim": (("geo", "type", "[points...]"), 'Adds a "poly" (a face) or "polyline" (a curve); gives its number.'),
+    "addvertex": (("geo", "prim", "point"), "Adds a corner using point to a primitive addprim() made."),
+    "removepoint": (("geo", "point"), "Removes a point (and the faces using it) after the script."),
+    "removeprim": (("geo", "prim", "[andpoints]"), "Removes a face (or curve); andpoints = 1 also its unused points."),
+    "setpointattrib": (("geo", "name", "point", "value", "[mode]"),
+                       'Writes an attribute on any point. mode: "set", "add", "min" or "max".'),
+    "setprimattrib": (("geo", "name", "prim", "value", "[mode]"), "Writes an attribute on any face (or curve)."),
+    "setpointgroup": (("geo", "group", "point", "value"), "Puts a point in a group (a bool attribute) or takes it out."),
+    "setprimgroup": (("geo", "group", "prim", "value"), "Puts a face in a group (a bool attribute) or takes it out."),
+    "setvertexattrib": (("geo", "name", "prim", "vertex", "value"), "Not available in BEX."),
+    "setdetailattrib": (("geo", "name", "value"), "Not available: Blender has no detail attributes."),
     # Loops
     "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
 }
@@ -614,6 +646,9 @@ class Compiler:
         self.frames = []  # one dict per running call of an own function (see call_user)
         self.calls = 0
         self.path = []  # conditions of the `if` branches being run (a loop starts stopped outside them)
+        self.geo_ops = []  # GeoOp, in call order
+        self.geo_counts = {}  # "point" / "poly" / "polyline" / "vertex" -> the next number (an int Val)
+        self.prim_kinds = {}  # (IRNode, out) of a number addprim() gave -> "poly" / "polyline"
         self.reading = []  # per closure being built: what its body read from outside (see _closure)
         self.warnings = []
         self.attrs = {}  # attribute name -> current Val (only attributes that were written)
@@ -1245,6 +1280,155 @@ class Compiler:
         return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
                                         ("Color",), props=(("mode", mode),)) for i in range(3)])
 
+    # -- making and removing elements ----------------------------------------
+    # Each call site is a GeoOp. The builder turns every element where the call ran
+    # into a record point, then, after the writes: adds the new points and
+    # primitives, writes other elements' attributes, and removes elements.
+    # Numbers given back follow Houdini's rule for one call site (in element order)
+    # and continue across call sites in the order the script runs them.
+
+    def geo_mask(self):
+        """Where a call made now runs: the Group, the `if` branches around it, not
+        after a break / continue / return, and where its function was called."""
+        m = self._live()
+        if self.frames:
+            m = self.logic("and", m, self.frames[-1]["live"])
+        for c in self.path:
+            m = self.logic("and", m, c)
+        if self.group_sel is not None:
+            m = self.logic("and", m, self.group_sel)
+        return m
+
+    def geo_number(self, kind, mask):
+        """The number the element's record gets: the next free number, plus how
+        many elements before it made one at this call site."""
+        if kind not in self.geo_counts:
+            domain = {"point": "POINT", "poly": "FACE", "polyline": "CURVE", "vertex": "CORNER"}[kind]
+            self.geo_counts[kind] = self.count(0, domain)
+        made = self.conv(mask, "int")
+        outs = AGGREGATE_OUTS["GeometryNodeAccumulateField"]
+        acc = lambda out: self.gnode("int", "GeometryNodeAccumulateField", outs, out,  # noqa: E731
+                                     (made, Val("int", 0)), ("Value", "Group ID"),
+                                     props=(("domain", self.domain), ("data_type", "INT")), field=True)
+        base = self.geo_counts[kind]
+        self.geo_counts[kind] = self.arith("+", base, acc(2))
+        return self.arith("+", base, acc(1))
+
+    def geo_call(self, fn, args):
+        usage = {
+            "addpoint": "addpoint(0, position) or addpoint(0, point_number)",
+            "addprim": 'addprim(0, "poly", pt0, pt1, pt2...) or addprim(0, "polyline", pt0, pt1...)',
+            "addvertex": "addvertex(0, prim, point)",
+            "removepoint": "removepoint(0, point)", "removeprim": "removeprim(0, prim, 1)",
+            "setpointattrib": 'setpointattrib(0, "name", point, value, "set")',
+            "setprimattrib": 'setprimattrib(0, "name", prim, value, "set")',
+            "setpointgroup": 'setpointgroup(0, "name", point, 1)', "setprimgroup": 'setprimgroup(0, "name", prim, 1)',
+        }
+        if fn == "setdetailattrib":
+            raise self.err("Blender has no detail attributes: store the value on every point (@name = value), "
+                           "or read a statistic with mean() / sumof()")
+        if fn == "setvertexattrib":
+            raise self.err("setvertexattrib() isn't available; run over Corners and write @name instead")
+        if self.zone_depth:
+            raise self.err(f"{fn}() can't run inside a loop that becomes a Repeat Zone. Loops with a fixed "
+                           f"count of up to {GEO_UNROLL_MAX} passes work")
+        if not args:
+            raise self.err(f"{fn}() takes: {usage[fn]}")
+        geo = self.eval(args[0])
+        if not (geo.is_const and geo.type == "int" and geo.const == 0):
+            raise self.err(f"{fn}()'s first argument is the geometry it changes: 0 (this node's output)")
+        line = self.line
+        mask = self.geo_mask()
+        if mask.is_const and not mask.const:
+            return Val("int", -1)  # never runs
+        if fn == "addpoint":
+            if len(args) != 2:
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            x = self.eval(args[1])
+            if x.type == "vector":
+                values, info = {"pos": x}, {"src": False}
+            elif RANK.get(x.type, 9) <= 1:
+                values, info = {"src": self.conv(x, "int")}, {"src": True}
+            else:
+                raise self.err(f"addpoint() takes a position (a vector) or a point number, not a {x.type}")
+            self.geo_ops.append(GeoOp("addpoint", mask, values, info, line))
+            return self.geo_number("point", mask)
+        if fn == "addprim":
+            if len(args) < 2 or args[1].kind != "str" or args[1].value not in PRIM_TYPES:
+                raise self.err(f'addprim()\'s second argument is "poly" or "polyline": {usage[fn]}')
+            ptype = PRIM_TYPES[args[1].value]
+            pts = [self.conv(self.eval(a), "int") for a in args[2:]]
+            self.line = line
+            prim = self.geo_number(ptype, mask)
+            for pt in pts:
+                self.geo_ops.append(GeoOp("vertex", mask, {"prim": prim, "pt": pt}, {"ptype": ptype}, line))
+                self.geo_number("vertex", mask)
+            if not prim.is_const:
+                self.prim_kinds[(prim.node, prim.out)] = ptype
+            return prim
+        if fn == "addvertex":
+            if len(args) != 3:
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            prim, pt = self.conv(self.eval(args[1]), "int"), self.conv(self.eval(args[2]), "int")
+            self.line = line
+            ptype = self._prim_kind(prim)
+            if ptype is None:
+                raise self.err("addvertex() adds to a primitive this script made: pass the number addprim() gave")
+            self.geo_ops.append(GeoOp("vertex", mask, {"prim": prim, "pt": pt}, {"ptype": ptype}, line))
+            return self.geo_number("vertex", mask)
+        if fn in ("removepoint", "removeprim"):
+            if len(args) not in (2, 3):
+                raise self.err(f"{fn}() takes: {usage[fn]}")
+            target = self.conv(self.eval(args[1]), "int")
+            flag = self.eval(args[2]) if len(args) == 3 else Val("int", 1)
+            if not flag.is_const:
+                raise self.err(f"{fn}()'s last argument has to be a constant 0 or 1")
+            self.line = line
+            domain = "POINT" if fn == "removepoint" else self._prim_domain(target)
+            mode = "ALL" if fn == "removepoint" or flag.const else "ONLY_FACE"
+            self.geo_ops.append(GeoOp("remove", mask, {"target": target}, {"domain": domain, "mode": mode}, line))
+            return Val("int", 0)
+        # set*attrib / set*group
+        group = fn.endswith("group")
+        need = 4 if group else (4, 5)
+        if len(args) not in ((need,) if group else need) or args[1].kind != "str":
+            raise self.err(f"{fn}() takes: {usage[fn]}")
+        name, type = _typed_name(args[1].value)
+        name = ALIASES.get(name, name)
+        target = self.conv(self.eval(args[2]), "int")
+        value = self.eval(args[3])
+        mode = "set"
+        if len(args) == 5:
+            if args[4].kind != "str" or args[4].value not in SET_MODES:
+                raise self.err(f'{fn}()\'s mode is one of {", ".join(repr(m) for m in SET_MODES)}')
+            mode = args[4].value
+        self.line = line
+        if group:
+            type = "bool"
+        elif type is None:
+            type = self.attr_types.get(name) or BUILTINS.get(name, (None,))[0] or KNOWN_TYPES.get(name) or value.type
+        if name in READ_ONLY or name in BUILTINS and name not in ("P",):
+            raise self.err(f"{fn}() can't write @{name}")
+        if mode != "set" and type in ("bool",) + OPAQUE:
+            raise self.err(f'mode "{mode}" needs numbers or vectors, not a {type}')
+        value = self.conv(value, type)
+        domain = "POINT" if fn.startswith("setpoint") else self._prim_domain(target)
+        if name == "P":
+            if domain != "POINT":
+                raise self.err("only points have a position")
+            name = "position"
+        self.geo_ops.append(GeoOp("set", mask, {"target": target, "value": value},
+                                  {"domain": domain, "name": name, "type": type, "mode": mode,
+                                   "storage": self.storage.get(name)}, line))
+        return value
+
+    def _prim_kind(self, prim):
+        return None if prim.is_const else self.prim_kinds.get((prim.node, prim.out))
+
+    def _prim_domain(self, prim):
+        """A primitive number means a curve when running over curves or when addprim() made a polyline."""
+        return "CURVE" if self.domain == "CURVE" or self._prim_kind(prim) == "polyline" else "FACE"
+
     # -- statistics and other elements -------------------------------------
     def aggregate(self, name, v, group):
         """mean(), sumof()...: one value over the whole run-over domain, or per group number."""
@@ -1494,6 +1678,8 @@ class Compiler:
             return self.wnoise(arg_nodes, kw)
         if name in ("primuv", "uvsample"):
             return self.surface_sample(name, arg_nodes)
+        if name in GEO_FUNCS:
+            return self.geo_call(name, arg_nodes)
         if name == "setcomp":  # setcomp(v, value, i, [j]): v[i] = value, v[i][j] = value
             if len(arg_nodes) not in (3, 4) or arg_nodes[0].kind not in ("var", "attr"):
                 raise self.err("setcomp() takes a variable, a value and one or two constant indexes")
@@ -2035,7 +2221,8 @@ class Compiler:
         result, returned, has_value = self._run_body(d, values, Val("bool", True))
         deps = self.reading.pop()
         self.line = line
-        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]) or isinstance(result, list):
+        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]) or isinstance(result, list) \
+                or len(self.geo_ops) != len(saved["geo_ops"]):
             self._restore(saved)
             return None, None
         result = self._result(d, name, result, returned, has_value)
@@ -2375,7 +2562,8 @@ class Compiler:
         condition but a non-constant body), else False."""
         saved = self._snapshot()
         names, attrs = _assigned(s.body, brk, cont, [b for b, _ in self.loops])
-        short = values is not None and len(values) <= UNROLL_MAX
+        limit = GEO_UNROLL_MAX if self._makes_geometry(s.body) else UNROLL_MAX  # zones can't add elements
+        short = values is not None and len(values) <= limit
         n, all_const = 0, True
         for value in (values if values is not None else itertools.count()):
             run = self.not_(self.vars[brk])
@@ -2404,10 +2592,28 @@ class Compiler:
             if not all_const and values is not None and not short:
                 self._restore(saved)
                 return False
-        if all_const or n <= UNROLL_MAX:
+        if all_const or n <= limit:
             return True
         self._restore(saved)
         return n
+
+    def _makes_geometry(self, s, seen=()):
+        """Statement `s` calls addpoint() & co., directly or through the script's functions."""
+        found = []
+
+        def walk(x):
+            if isinstance(x, N):
+                if x.kind == "call" and (x.name in GEO_FUNCS or (x.name in self.funcs and x.name not in seen and
+                                                               self._makes_geometry(self.funcs[x.name].body,
+                                                                                    seen + (x.name,)))):
+                    found.append(x)
+                for v in x.__dict__.values():
+                    walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x:
+                    walk(v)
+        walk(s)
+        return bool(found)
 
     def _zone(self, s, count, brk, cont, begin, carry=(), chunked=False):
         """One Repeat Zone running the loop body `count` times (one value, not a
@@ -2500,7 +2706,7 @@ class Compiler:
 
     _STATE = ("vars", "half_set", "loop_only", "attrs", "attr_types", "written", "params", "ramps",
               "reads", "pending", "inputs", "cse", "preludes", "closures", "call_counts", "calls",
-              "loop_count", "warnings")
+              "loop_count", "warnings", "geo_ops", "geo_counts", "prim_kinds")
 
     def _snapshot(self):
         """Copies of everything running statements can change (see _restore)."""
@@ -2513,7 +2719,8 @@ class Compiler:
     def program(self):
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
                        ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
-                       reads=list(self.reads), inputs=sorted(self.inputs), preludes=list(self.preludes))
+                       reads=list(self.reads), inputs=sorted(self.inputs), preludes=list(self.preludes),
+                       geo_ops=list(self.geo_ops))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing
