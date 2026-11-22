@@ -26,6 +26,7 @@ INPUT_NODES = {
     "face_area": "GeometryNodeInputMeshFaceArea",
     "mesh_island": "GeometryNodeInputMeshIsland",
     "edge_angle": "GeometryNodeInputMeshEdgeAngle",
+    "spline_cyclic": "GeometryNodeInputSplineCyclic",
 }
 VMATH_FLOAT_OUT = {"DOT_PRODUCT", "LENGTH", "DISTANCE"}
 RAMP_PREFIX = "BEX Ramp "  # + the chramp() name: the Float Curve node evaluating that ramp

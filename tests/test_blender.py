@@ -1570,6 +1570,66 @@ def test_noise_family():
     assert len(set(at("r2"))) > 20 and len(set(at("r4"))) > 20
 
 
+def test_statistics_and_lookups():
+    src = """
+    f@m = mean(@P.x)
+    f@mx = maxof(@P.x + @P.y, @ptnum % 2)
+    i@c = countof()
+    i@ce = countof(@ptnum % 2)
+    f@s = sumof(@ptnum)
+    f@acc = accumulate(1.0)
+    v@nx = at(@P, (@ptnum + 1) % @numpt)
+    f@pr = promote(@P.x, "face")
+    f@bl = blur(@P.x, 2)
+    v@uvp = uvsample(0, "P", "uv", (0.25, 0.75, 0))
+    f@ti = @TimeInc
+    @P.z = mean(@P.y)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    pts = original_points(obj)
+    at = lambda n: attr(mesh, n)  # noqa: E731
+    count = len(pts)
+    assert all(abs(m) < 1e-5 for m in at("m")) and set(at("c")) == {count}
+    for i, (mx, ce) in enumerate(zip(at("mx"), at("ce"))):
+        group = [p for k, p in enumerate(pts) if k % 2 == i % 2]
+        assert abs(mx - max(x + y for x, y, _ in group)) < 1e-5 and ce == len(group)
+    assert all(abs(v - sum(range(count))) < 1e-3 for v in at("s"))
+    assert at("acc") == [pytest_approx(i + 1) for i in range(count)]
+    for i, v in enumerate(at("nx")):
+        assert close(v, pts[(i + 1) % count])
+    corner = min(range(count), key=lambda i: pts[i][0] + pts[i][1])
+    assert abs(at("pr")[corner] - (pts[corner][0] + 0.25)) < 1e-4  # one face: its centre
+    assert all(math.isfinite(b) for b in at("bl"))
+    assert all(close(v, (-0.5, 0.5, 0)) for v in at("uvp"))
+    assert all(abs(t - 1 / bpy.context.scene.render.fps) < 1e-6 for t in at("ti")), at("ti")[:2]
+    assert all(abs(v.co.z) < 1e-5 for v in mesh.vertices)
+
+    # primuv() and @cyclic / @curveptnum on curves
+    obj, node, text = make_setup('v@pu = primuv(1, "P", 0, @ptnum / 24.0)')
+    tree = node.id_data
+    line = tree.nodes.new("GeometryNodeCurvePrimitiveLine")
+    line.inputs["End"].default_value = (2, 0, 0)
+    tree.links.new(line.outputs[0], node.inputs["Input 2"])
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, v in enumerate(attr(mesh, "pu")):
+        assert close(v, (2 * i / 24.0, 0, 0)), (i, v)
+    circle, to_mesh = tree.nodes.new("GeometryNodeCurvePrimitiveCircle"), tree.nodes.new("GeometryNodeCurveToMesh")
+    circle.inputs["Resolution"].default_value = 6
+    out = next(n for n in tree.nodes if n.bl_idname == "NodeGroupOutput")
+    tree.links.new(circle.outputs[0], node.inputs[0])
+    tree.links.new(node.outputs[0], to_mesh.inputs[0])
+    tree.links.new(to_mesh.outputs[0], out.inputs[0])
+    text.from_string("i@cy = @cyclic\ni@cp = @curveptnum")
+    node.sync()
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    assert set(attr(mesh, "cy")) == {1} and sorted(attr(mesh, "cp")) == list(range(6))
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

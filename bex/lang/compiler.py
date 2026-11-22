@@ -112,6 +112,9 @@ BUILTINS = {
     "area": ("float", "face_area", 0),
     "island": ("int", "mesh_island", 0),  # which connected piece of the mesh
     "edgeangle": ("float", "edge_angle", 0),  # angle between an edge's two faces, 0 when flat
+    "cyclic": ("bool", "spline_cyclic", 0),  # the curve is closed
+    "curveptnum": ("int", "curve_of_point", 1),  # a curve point's number within its curve: 0, 1, 2...
+    "TimeInc": ("float", "time", 0),  # seconds per frame (read_original computes it)
 }
 # Index built-ins that depend on the Run Over domain, like Formula to Nodes / Houdini:
 # name -> {domain: (input kind, output)}. @elemnum / @index are always the element's index.
@@ -134,7 +137,8 @@ INDEX_HINTS = {
 # Element counts of the incoming geometry (Houdini's @numpt...): name -> domain
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
 READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
-             "curveu", "curvelength", "tangent", "area", "island", "edgeangle"} | set(COUNT_ATTRS)
+             "curveu", "curvelength", "tangent", "area", "island", "edgeangle", "cyclic", "curveptnum",
+             "TimeInc"} | set(COUNT_ATTRS)
 KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "UVMap": "vector",
                "scale": "vector", "orient": "quaternion", "rot": "quaternion", "transform": "matrix",
                "Alpha": "float"}
@@ -361,6 +365,20 @@ SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemi
 FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
 KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
             "curlnoise": NOISE_OPTS, **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+# Statistics over the run-over domain, optionally per group (Compiler.aggregate): name -> (node, output)
+AGGREGATES = {"mean": ("GeometryNodeFieldAverage", "Mean"), "median": ("GeometryNodeFieldAverage", "Median"),
+              "minof": ("GeometryNodeFieldMinAndMax", "Min"), "maxof": ("GeometryNodeFieldMinAndMax", "Max"),
+              "stddev": ("GeometryNodeFieldVariance", "Standard Deviation"),
+              "variance": ("GeometryNodeFieldVariance", "Variance"),
+              "sumof": ("GeometryNodeAccumulateField", "Total"), "accumulate": ("GeometryNodeAccumulateField", "Leading")}
+AGGREGATE_OUTS = {"GeometryNodeFieldAverage": ("Mean", "Median"), "GeometryNodeFieldMinAndMax": ("Min", "Max"),
+                  "GeometryNodeFieldVariance": ("Standard Deviation", "Variance"),
+                  "GeometryNodeAccumulateField": ("Leading", "Trailing", "Total")}
+INT_AGGREGATES = ("GeometryNodeFieldMinAndMax", "GeometryNodeAccumulateField")  # also work on whole numbers
+DATA_TYPES = {"float": "FLOAT", "int": "INT", "bool": "BOOLEAN", "vector": "FLOAT_VECTOR",
+              "quaternion": "QUATERNION", "matrix": "FLOAT4X4"}
+DOMAIN_NAMES = {"point": "POINT", "edge": "EDGE", "face": "FACE", "prim": "FACE", "primitive": "FACE",
+                "corner": "CORNER", "vertex": "CORNER", "curve": "CURVE", "instance": "INSTANCE"}
 COLOR_MODES = {"hsvtorgb": "HSV", "rgbtohsv": "HSV", "hsltorgb": "HSL", "rgbtohsl": "HSL"}
 LUMINANCE = (0.2126, 0.7152, 0.0722)  # Rec. 709, for linear colours
 # Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
@@ -374,7 +392,8 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
-}) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
+    "countof", "blur", "at", "promote", "primuv", "uvsample",
+}) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
 # BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
@@ -537,6 +556,21 @@ SIGNATURES = {
     "vertexprimindex": (("input", "vertex"), "Which corner of its face a corner is: 0, 1, 2..."),
     "neighbour": (("input", "point", "n"), "Point number of a point's nth neighbour along an edge."),
     "neighbourcount": (("input", "point"), "Number of points connected to a point by an edge."),
+    # Statistics and other elements
+    "mean": (("value", "[group]"), "Average of value over all elements, or over those with the same group number."),
+    "median": (("value", "[group]"), "Middle value over all elements (or per group)."),
+    "minof": (("value", "[group]"), "Smallest value over all elements (or per group)."),
+    "maxof": (("value", "[group]"), "Largest value over all elements (or per group)."),
+    "sumof": (("value", "[group]"), "Total of value over all elements (or per group)."),
+    "stddev": (("value", "[group]"), "Standard deviation of value over all elements (or per group)."),
+    "variance": (("value", "[group]"), "Variance of value over all elements (or per group)."),
+    "countof": (("[group]",), "Number of elements (or of elements with this group number)."),
+    "accumulate": (("value", "[group]"), "Running total: this element's value plus all before it (per group)."),
+    "blur": (("value", "[iterations]", "[weight]"), "value averaged with the neighbours', iterations times."),
+    "at": (("value", "index"), "value as computed at another element of this geometry."),
+    "promote": (("value", "domain"), 'value computed on another domain ("face", "point"...) and read back here.'),
+    "primuv": (("input", "name", "curve", "u"), 'An attribute along a curve, at u from 0 to 1: primuv(1, "P", 0, 0.5).'),
+    "uvsample": (("input", "name", "uvname", "uv"), 'An attribute at a UV position: uvsample(1, "P", "UVMap", uv).'),
     # Loops
     "range": (("[start]", "stop", "[step]"), "The numbers a for loop counts through, e.g. for i in range(4)."),
 }
@@ -1118,6 +1152,43 @@ class Compiler:
         return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
                                         ("Color",), props=(("mode", mode),)) for i in range(3)])
 
+    # -- statistics and other elements -------------------------------------
+    def aggregate(self, name, v, group):
+        """mean(), sumof()...: one value over the whole run-over domain, or per group number."""
+        idname, out = AGGREGATES[name]
+        if v.type in ("bool", "int"):
+            v = self.conv(v, "int" if idname in INT_AGGREGATES else "float")
+        elif v.type not in ("float", "vector"):
+            raise self.err(f"{name}() works on numbers and vectors, not a {v.type}")
+        group = self.conv(group, "int") if group is not None else Val("int", 0)
+        outs = AGGREGATE_OUTS[idname]
+        return self.gnode(v.type, idname, outs, outs.index(out), (v, group), ("Value", "Group ID"),
+                          props=(("domain", self.domain), ("data_type", DATA_TYPES[v.type])), field=True)
+
+    def surface_sample(self, fn, args):
+        """primuv(1, "P", curve, u) along a curve, uvsample(1, "P", "UVMap", uv) on a mesh by UV."""
+        usage = ('primuv(1, "P", curve, u)' if fn == "primuv" else 'uvsample(1, "P", "UVMap", uv)')
+        if len(args) != 4 or args[1].kind != "str" or (fn == "uvsample" and args[2].kind != "str"):
+            raise self.err(f"{fn}() takes an input number, an attribute name in quotes, then: {usage}")
+        n = self.input_number(self.eval(args[0]), fn)
+        name, type = _typed_name(args[1].value)
+        name = ALIASES.get(name, name)
+        if type is None:
+            type = BUILTINS[name][0] if name in BUILTINS else KNOWN_TYPES.get(name, "float")
+        value = self.read_input(n, name, type)
+        if fn == "primuv":
+            curve, u = self.conv(self.eval(args[2]), "int"), self.eval(args[3])
+            u = self.member(u, 0) if u.type == "vector" else self.conv(u, "float")
+            return self.gnode(type, "GeometryNodeSampleCurve", ("Value", "Position", "Tangent", "Normal"), 0,
+                              (value, u, curve), ("Value", "Factor", "Curve Index"),
+                              props=(("data_type", DATA_TYPES[type]), ("mode", "FACTOR"), ("use_all_curves", False)),
+                              geo=("Curves", n))
+        uvname = ALIASES.get(args[2].value, args[2].value)
+        uvmap = self.read_input(n, uvname, "vector")
+        uv = self.conv(self.eval(args[3]), "vector")
+        return self.gnode(type, "GeometryNodeSampleUVSurface", ("Value", "Is Valid"), 0, (value, uvmap, uv),
+                          ("Value", "UV Map", "Sample UV"), props=(("data_type", DATA_TYPES[type]),), geo=("Mesh", n))
+
     # -- noise ---------------------------------------------------------------
     def call_val(self, name, *vals):
         """A built-in function called with values that are already computed."""
@@ -1328,6 +1399,16 @@ class Compiler:
             return self.query(name, arg_nodes)
         if name == "wnoise":
             return self.wnoise(arg_nodes, kw)
+        if name in ("primuv", "uvsample"):
+            return self.surface_sample(name, arg_nodes)
+        if name == "promote":
+            if len(arg_nodes) != 2 or arg_nodes[1].kind != "str" or arg_nodes[1].value.lower() not in DOMAIN_NAMES:
+                raise self.err('promote() takes a value and a domain in quotes: "point", "edge", "face", '
+                               '"corner", "curve" or "instance"')
+            v = self.eval(arg_nodes[0])
+            return self.gnode(v.type, "GeometryNodeFieldOnDomain", ("Value",), 0, (v,), ("Value",),
+                              props=(("domain", DOMAIN_NAMES[arg_nodes[1].value.lower()]),
+                                     ("data_type", DATA_TYPES[v.type])), field=True)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
 
@@ -1492,6 +1573,25 @@ class Compiler:
             if a[0].type == "float" and not a[0].is_const:
                 return self.conv(self.node("math", "float", (a[0],), op="TRUNC"), "int")
             return self.conv(a[0], "int")
+        if name in AGGREGATES:
+            want(1, 2)
+            return self.aggregate(name, a[0], a[1] if len(a) == 2 else None)
+        if name == "countof":
+            want(0, 1)
+            return self.aggregate("sumof", Val("int", 1), a[0] if a else None)
+        if name == "blur":
+            want(1, 2, 3)
+            v = a[0] if a[0].type in ("float", "int", "vector", "quaternion", "matrix") else self.conv(a[0], "int")
+            its = self.conv(a[1], "int") if len(a) > 1 else Val("int", 1)
+            weight = self.conv(a[2], "float") if len(a) > 2 else Val("float", 1.0)
+            return self.gnode(v.type, "GeometryNodeBlurAttribute", ("Value",), 0, (v, its, weight),
+                              ("Value", "Iterations", "Weight"), props=(("data_type", DATA_TYPES[v.type]),), field=True)
+        if name == "at":
+            want(2)
+            v = a[0]
+            return self.gnode(v.type, "GeometryNodeFieldAtIndex", ("Value",), 0, (v, self.conv(a[1], "int")),
+                              ("Value", "Index"), props=(("domain", self.domain), ("data_type", DATA_TYPES[v.type])),
+                              field=True)
         if name in NOISE_FUNCS or name == "curlnoise":
             want(2) if name == "flownoise" else want(1, 2)
             return self.noise_call(name, a, kw)
@@ -1555,6 +1655,11 @@ class Compiler:
             if found is None:
                 raise self.err(INDEX_HINTS[name].format(d=self.domain.lower() + "s"))
             return self.node("input", "int", (), out=found[1], name=found[0])
+        if name == "TimeInc":  # seconds / frame; at frame 0 assume 24 frames a second
+            seconds, frame = self.node("input", "float", (), out=0, name="time"), \
+                self.node("input", "float", (), out=1, name="time")
+            return self.select(self.compare("==", frame, Val("float", 0.0)), Val("float", 1 / 24),
+                               self.arith("/", seconds, frame))
         if name in BUILTINS:
             _, kind, out = BUILTINS[name]
             return self.node("input", type, (), out=out, name=kind)

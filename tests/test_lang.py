@@ -805,6 +805,22 @@ def test_noise_family():
     fails("f@a = noise(@P, ridge=1)", "no option 'ridge'")
 
 
+def test_statistics_and_lookups():
+    w = writes('f@m = mean(@P.x, @island)\ni@c = countof()\nv@a = at(@P, 0)\nf@p = promote(@P.x, "prim")\n'
+               'f@b = blur(@P.x)\nv@u = primuv(1, "P", 0, 0.5)', domain="POINT")
+    m = w["m"].node
+    assert m.params["idname"] == "GeometryNodeFieldAverage" and ("domain", "POINT") in m.params["props"]
+    assert m.inputs[1].node.kind == "input"  # the group: @island
+    assert w["c"].type == "int" and w["c"].node.params["outs"][w["c"].out] == "Total"
+    assert ("domain", "FACE") in w["p"].node.params["props"]
+    assert w["u"].node.params["geo"] == ("Curves", 1)
+    w = writes("f@m = mean(@P.x)", domain="FACE")
+    assert ("domain", "FACE") in w["m"].node.params["props"]
+    fails('f@p = promote(@P.x, "volume")', "promote() takes a value and a domain")
+    fails("f@m = mean(quaternion(0.1, (0, 0, 1)))", "works on numbers and vectors")
+    fails('v@u = primuv(1, P, 0, 0.5)', "attribute name in quotes")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:
