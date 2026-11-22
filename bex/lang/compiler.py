@@ -14,7 +14,7 @@ import math
 import re
 from dataclasses import dataclass, field
 
-from .lexer import _PREFIX_TYPES, BexError
+from .lexer import _PREFIX_TYPES, ALIASES, BexError
 from .parser import N, parse, parse_group
 
 MAX_LOOP_ITERATIONS = 1024  # longest loop run at compile time
@@ -25,7 +25,11 @@ TEMP_PREFIX = ".bex"  # hidden attributes a chunked loop keeps its values in; re
 CHUNK_FIRST, CHUNK_GROWTH = 32, 1.5
 MAX_CALL_DEPTH = 50  # nested calls of your own functions (recursion has to end while compiling)
 MAX_CALLS = 10_000  # calls of your own functions in one script  # chunk k of a loop that can end early runs floor(32 * 1.5^k) times
-RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3}
+RANK = {"bool": 0, "int": 1, "float": 2, "vector": 3, "quaternion": 4, "matrix": 5}
+# Types that never convert to or from another (a quaternion is a Blender Rotation, a matrix a 4x4 Matrix).
+OPAQUE = ("quaternion", "matrix")
+SIZES = {"vector": 3, "quaternion": 4}
+PREFIXES = {"vector": "v", "quaternion": "p", "matrix": "4"}  # the prefix that gives an attribute this type  # components: v.x .y .z, a quaternion's .w too (Houdini order x, y, z, w)
 
 
 class IRNode:
@@ -45,8 +49,10 @@ class IRNode:
 
 @dataclass(frozen=True)
 class Val:
-    type: str  # float | int | vector | bool
-    const: object = None  # python value when known at compile time
+    type: str  # float | int | vector | bool | quaternion | matrix
+    # python value when known at compile time: a vector is (x, y, z), a quaternion (x, y, z, w),
+    # a matrix 16 floats in Blender's order (column by column, translation in the last column)
+    const: object = None
     node: object = None  # IRNode otherwise
     out: int = 0  # which output of the node
 
@@ -82,6 +88,7 @@ class Store:
     selection: object = None  # bool Val: which elements are written, None = all
     conds: list = field(default_factory=list)  # the bool Vals ANDed into `selection` (Group first)
     offset: bool = False  # Set Position: `value` goes into Offset, not Position
+    storage: str = None  # the attribute's data type when it isn't the type's own (Cd: FLOAT_COLOR)
 
 
 # Built-in attributes that read from a field node instead of a named attribute.
@@ -128,7 +135,12 @@ INDEX_HINTS = {
 COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
 READ_ONLY = {"N", "ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
              "curveu", "curvelength", "tangent", "area", "island", "edgeangle"} | set(COUNT_ATTRS)
-KNOWN_TYPES = {"v": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float"}
+KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "UVMap": "vector",
+               "scale": "vector", "orient": "quaternion", "rot": "quaternion", "transform": "matrix",
+               "Alpha": "float"}
+# Attributes stored as another Blender data type than their BEX type, so the rest of Blender
+# sees them for what they are: Cd as a colour attribute, the UV map as 2D vectors.
+STORAGE = {"Cd": "FLOAT_COLOR", "UVMap": "FLOAT2"}
 
 
 def _sign(x):
@@ -199,6 +211,70 @@ VMATH1 = {"ABSOLUTE": "ABSOLUTE", "FLOOR": "FLOOR", "CEIL": "CEIL", "ROUND": "RO
 VMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM", "POWER": "POWER", "SNAP": "SNAP"}
 IMATH2 = {"MINIMUM": "MINIMUM", "MAXIMUM": "MAXIMUM"}
 
+# -- quaternions (x, y, z, w) and matrices (16 floats, column by column) for constant folding
+_IDENTITY = tuple(float(c == r) for c in range(4) for r in range(4))
+
+
+def _qnorm(q):
+    """Blender's rotations are unit quaternions; a zero one is no rotation."""
+    n = math.sqrt(sum(c * c for c in q))
+    return tuple(float(c / n) for c in q) if n > 1e-12 else (0.0, 0.0, 0.0, 1.0)
+
+
+def _qmul(a, b):
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz)
+
+
+def _cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def _qrotate(q, v):
+    u, w = q[:3], q[3]
+    t = tuple(2 * c for c in _cross(u, v))
+    c = _cross(u, t)
+    return tuple(v[i] + w * t[i] + c[i] for i in range(3))
+
+
+def _qaxis(axis, angle):
+    n = math.sqrt(sum(c * c for c in axis))
+    if n < 1e-12:
+        return (0.0, 0.0, 0.0, 1.0)
+    s = math.sin(angle / 2) / n
+    return (axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2))
+
+
+def _qeuler(angles, order):
+    q = (0.0, 0.0, 0.0, 1.0)
+    for axis in order:  # the first axis turns first
+        k = "XYZ".index(axis)
+        q = _qmul(_qaxis(tuple(float(i == k) for i in range(3)), angles[k]), q)
+    return q
+
+
+def _qinv(q):
+    return (-q[0], -q[1], -q[2], q[3])
+
+
+def _mat_mul(a, b):
+    """Blender's A @ B."""
+    return tuple(sum(a[k * 4 + r] * b[c * 4 + k] for k in range(4)) for c in range(4) for r in range(4))
+
+
+def _mat_point(m, v):
+    return tuple(sum(m[c * 4 + r] * v[c] for c in range(3)) + m[12 + r] for r in range(3))
+
+
+def _mat_trs(t, q, s):
+    cols = [_qrotate(q, tuple(s[k] * (i == k) for i in range(3))) for k in range(3)]
+    return tuple(x for col in cols for x in (*col, 0.0)) + (*t, 1.0)
+
+
 def _floor_div(a, b):
     return math.floor(a / b) if b else 0
 
@@ -221,7 +297,10 @@ ARITH = {
     "%": ("FLOORED_MODULO", _floor_mod),
     "**": ("POWER", _safe_pow),
 }
-CONSTANTS = {"PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau}
+CONSTANTS = {"PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
+             # rotation orders, as in VEX (eulertoquaternion(r, XFORM_ZYX)): the first axis turns first
+             "XFORM_XYZ": 0, "XFORM_XZY": 1, "XFORM_YXZ": 2, "XFORM_YZX": 3, "XFORM_ZXY": 4, "XFORM_ZYX": 5}
+EULER_ORDERS = ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX")
 COMPARE = {
     "<": ("LESS_THAN", lambda a, b: a < b),
     "<=": ("LESS_EQUAL", lambda a, b: a <= b),
@@ -258,6 +337,10 @@ NODE_OUTS = {
     "GeometryNodeFaceOfCorner": ("Face Index", "Index in Face"),
     "GeometryNodeInputMeshEdgeVertices": ("Vertex Index 1", "Vertex Index 2"),
 }
+# Quaternion and matrix functions (Compiler.transform_call)
+TRANSFORM_FUNCS = ("quaternion", "eulertoquaternion", "quaterniontoeuler", "qrotate", "qmultiply", "qinvert",
+                   "slerp", "dihedral", "ident", "maketransform", "invert", "transpose", "determinant",
+                   "translate", "rotate", "scale")
 COLOR_MODES = {"hsvtorgb": "HSV", "rgbtohsv": "HSV", "hsltorgb": "HSL", "rgbtohsl": "HSL"}
 LUMINANCE = (0.2126, 0.7152, 0.0722)  # Rec. 709, for linear colours
 # Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
@@ -271,7 +354,7 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody",
-}) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
+}) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
 # BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
@@ -349,6 +432,25 @@ SIGNATURES = {
     "float": (("value",), "Turns value into a float."),
     "int": (("value",), "Turns value into a whole number, cutting off the decimals."),
     "bool": (("value",), "True unless value is 0."),
+    # Rotations and matrices
+    "quaternion": (("angle", "axis"), "A rotation by angle (radians) around axis. Also quaternion(m), "
+                                      "quaternion(x, y, z, w)."),
+    "eulertoquaternion": (("angles", "[order]"), "Rotation from Euler angles in radians (order XFORM_XYZ...)."),
+    "quaterniontoeuler": (("q", "[order]"), "Euler angles in radians, XYZ order."),
+    "qrotate": (("q", "v"), "v turned by the rotation q. Same as v * q."),
+    "qmultiply": (("a", "b"), "Both rotations: b first, then a. Same as a * b."),
+    "qinvert": (("q",), "The opposite rotation."),
+    "slerp": (("a", "b", "t"), "Turns smoothly from rotation a (t = 0) to b (t = 1)."),
+    "dihedral": (("a", "b"), "The rotation that turns direction a onto b."),
+    "ident": ((), "The identity matrix: no change."),
+    "maketransform": (("zaxis", "yaxis", "[translate]"),
+                      "Matrix facing zaxis with yaxis up. Also maketransform(translate, q, [scale])."),
+    "invert": (("m",), "The matrix (or quaternion) that undoes m."),
+    "transpose": (("m",), "Rows and columns swapped."),
+    "determinant": (("m",), "How much the matrix scales volume."),
+    "translate": (("m", "offset"), "Moves the matrix variable m by offset, after what it does."),
+    "rotate": (("m", "angle", "axis"), "Turns the matrix variable m, after what it does."),
+    "scale": (("m", "size"), "Scales the matrix variable m, after what it does."),
     # Noise and random
     "noise": (("position",), "Smooth noise, roughly between 0 and 1."),
     "vnoise": (("position",), "Smooth noise as a vector, one value per axis."),
@@ -432,6 +534,7 @@ class Compiler:
         self.stmt_line = 0  # line of the statement being executed (0 = the Group expression)
         self.bare_attributes = False
         self.inputs = []  # extra geometry inputs (1-3) the script reads, first-use order
+        self.storage = dict(STORAGE)  # attribute name -> Blender data type, when not the BEX type's own
 
     # -- IR construction ---------------------------------------------------
     def err(self, msg):
@@ -448,6 +551,12 @@ class Compiler:
         """Implicit conversion. Node outputs rely on Blender's link conversion."""
         if v.type == type:
             return v
+        if v.type in OPAQUE or type in OPAQUE:
+            hint = {"quaternion": " (make one with quaternion(), or (x, y, z, w))",
+                    "matrix": " (make one with maketransform() or ident())"}.get(type, "")
+            if v.type == "quaternion":
+                hint = " (pick a component like .w, or use qrotate())"
+            raise self.err(f"cannot use a {v.type} as {type}{hint}")
         if v.type == "vector":
             raise self.err(f"cannot use a vector as {type} (use length() or a component like .x)")
         if not v.is_const:
@@ -476,6 +585,8 @@ class Compiler:
 
     # -- operators ---------------------------------------------------------
     def arith(self, op, a, b):
+        if a.type in OPAQUE or b.type in OPAQUE:
+            return self.transform_arith(op, a, b)
         bop, fn = ARITH[op]
         if op == "//":
             # floor(a / b), kept integer when both sides are
@@ -508,6 +619,9 @@ class Compiler:
 
     def compare(self, op, a, b):
         bop, fn = COMPARE[op]
+        for x in (a, b):
+            if x.type in OPAQUE:
+                raise self.err(f"'{op}' cannot compare {x.type}s")
         if "vector" in (a.type, b.type):
             if op not in ("==", "!="):
                 raise self.err(f"'{op}' cannot compare vectors (compare length() or a component)")
@@ -532,6 +646,9 @@ class Compiler:
         return self.node("bmath", "bool", (a, b), op="AND" if is_and else "OR")
 
     def negate(self, a):
+        if a.type in OPAQUE:
+            raise self.err(f"cannot negate a {a.type}" + (" (qinvert() turns it the other way)"
+                                                          if a.type == "quaternion" else " (use invert())"))
         if a.type == "vector":
             return self.arith("*", a, Val("float", -1.0))
         if a.type == "float":
@@ -553,20 +670,228 @@ class Compiler:
             return a
         return self.node("switch", t, (cond, b, a), dtype=t)
 
+    def size(self, v):
+        """How many components `v` has (a vector 3, a quaternion 4)."""
+        if v.type not in SIZES:
+            raise self.err(f"only vectors and quaternions have components, this is a {v.type}")
+        return SIZES[v.type]
+
     def member(self, v, i):
-        if v.type != "vector":
-            raise self.err(f"only vectors have components, this is a {v.type}")
+        n = self.size(v)
+        if not -n <= i < n:
+            raise self.err(f"a {v.type} has components 0 to {n - 1}" + (" (.x .y .z)" if n == 3 else ""))
+        i %= n
         if v.is_const:
             return Val("float", v.const[i])
+        if v.type == "quaternion":  # Blender's order is w, x, y, z
+            if v.node.kind == "node" and v.node.params["idname"] == "FunctionNodeQuaternionToRotation":
+                return v.node.inputs[(i + 1) % 4]
+            return self.gnode("float", "FunctionNodeRotationToQuaternion", ("W", "X", "Y", "Z"), (i + 1) % 4,
+                              (v,), ("Rotation",))
         if v.node.kind == "combine":
             return v.node.inputs[i]
         return self.node("separate", "float", (v,), out=i)
 
     def combine(self, comps):
+        """A vector from three numbers, or a quaternion from four (x, y, z, w)."""
         comps = [self.conv(c, "float") for c in comps]
+        if len(comps) == 4:
+            if all(c.is_const for c in comps):
+                return Val("quaternion", _qnorm(tuple(c.const for c in comps)))
+            x, y, z, w = comps
+            return self.gnode("quaternion", "FunctionNodeQuaternionToRotation", ("Rotation",), 0, (w, x, y, z),
+                              ("W", "X", "Y", "Z"))
         if all(c.is_const for c in comps):
             return Val("vector", tuple(c.const for c in comps))
         return self.node("combine", "vector", comps)
+
+    # -- rotations and matrices ---------------------------------------------
+    # Operators follow VEX: v * q and v * m turn / transform a vector, q1 * q2 is
+    # qmultiply (q2 turns first), and m1 * m2 applies m1 first, then m2 (row vectors,
+    # as in Houdini; Blender's own order is the other way round).
+
+    def transform_arith(self, op, a, b):
+        types = (a.type, b.type)
+        if op == "*":
+            if types in (("vector", "quaternion"), ("quaternion", "vector")):
+                q, v = (b, a) if a.type == "vector" else (a, b)
+                return self.qrotate(q, v)
+            if types == ("quaternion", "quaternion"):
+                return self.qmultiply(a, b)
+            if types == ("vector", "matrix"):
+                return self.transform(a, b)
+            if types == ("matrix", "matrix"):
+                return self.matmul(a, b)
+            if types == ("matrix", "vector"):
+                raise self.err("write the vector first, as in VEX: v * m")
+        other = {"quaternion": "qmultiply(), qrotate() or slerp()",
+                 "matrix": "* with another matrix or a vector (v * m)"}
+        t = a.type if a.type in OPAQUE else b.type
+        raise self.err(f"'{op}' doesn't work on a {t} and a {b.type if t == a.type else a.type}; "
+                       f"use {other[t]}")
+
+    def quat(self, v, fn):
+        if v.type != "quaternion":
+            raise self.err(f"{fn}() needs a quaternion, got a {v.type}")
+        return v
+
+    def mat(self, v, fn):
+        if v.type != "matrix":
+            raise self.err(f"{fn}() needs a matrix, got a {v.type}")
+        return v
+
+    def qrotate(self, q, v):
+        v = self.conv(v, "vector")
+        if q.is_const and v.is_const:
+            return Val("vector", _qrotate(q.const, v.const))
+        return self.gnode("vector", "FunctionNodeRotateVector", ("Vector",), 0, (v, q), ("Vector", "Rotation"))
+
+    def qmultiply(self, a, b):
+        """Hamilton product a * b: b turns first, then a."""
+        if a.is_const and b.is_const:
+            return Val("quaternion", _qmul(a.const, b.const))
+        return self.gnode("quaternion", "FunctionNodeRotateRotation", ("Rotation",), 0, (b, a),
+                          ("Rotation", "Rotate By"), props=(("rotation_space", "GLOBAL"),))
+
+    def axis_angle(self, angle, axis):
+        angle, axis = self.conv(angle, "float"), self.conv(axis, "vector")
+        if angle.is_const and axis.is_const:
+            return Val("quaternion", _qaxis(axis.const, angle.const))
+        return self.gnode("quaternion", "FunctionNodeAxisAngleToRotation", ("Rotation",), 0, (axis, angle),
+                          ("Axis", "Angle"))
+
+    def euler_order(self, v, fn):
+        if not (v.is_const and v.type == "int" and 0 <= v.const < len(EULER_ORDERS)):
+            raise self.err(f"{fn}()'s rotation order is a constant like XFORM_XYZ (0) to XFORM_ZYX (5)")
+        return EULER_ORDERS[v.const]
+
+    def euler(self, angles, order="XYZ"):
+        """Euler angles in radians to a quaternion; the first axis of `order` turns first."""
+        angles = self.conv(angles, "vector")
+        if angles.is_const:
+            return Val("quaternion", _qeuler(angles.const, order))
+        if order == "XYZ":
+            return self.gnode("quaternion", "FunctionNodeEulerToRotation", ("Rotation",), 0, (angles,), ("Euler",))
+        q = None
+        for axis in order:
+            k = "XYZ".index(axis)
+            step = self.axis_angle(self.member(angles, k), Val("vector", tuple(float(i == k) for i in range(3))))
+            q = step if q is None else self.qmultiply(step, q)
+        return q
+
+    def transform(self, v, m):
+        v = self.conv(v, "vector")
+        if v.is_const and m.is_const:
+            return Val("vector", _mat_point(m.const, v.const))
+        return self.gnode("vector", "FunctionNodeTransformPoint", ("Vector",), 0, (v, m), ("Vector", "Transform"))
+
+    def matmul(self, a, b):
+        """VEX's a * b: a applies first, then b. Blender's Multiply Matrices is B @ A for that."""
+        if a.is_const and b.is_const:
+            return Val("matrix", _mat_mul(b.const, a.const))
+        return self.gnode("matrix", "FunctionNodeMatrixMultiply", ("Matrix",), 0, (b, a), (0, 1))
+
+    def trs(self, t, q, s):
+        """Translate, rotate and scale as one matrix (scale first, then rotate, then translate)."""
+        t, s = self.conv(t, "vector"), self.conv(s, "vector")
+        if t.is_const and q.is_const and s.is_const:
+            return Val("matrix", _mat_trs(t.const, q.const, s.const))
+        return self.gnode("matrix", "FunctionNodeCombineTransform", ("Transform",), 0, (t, q, s),
+                          ("Translation", "Rotation", "Scale"))
+
+    def transform_call(self, name, a, arg_nodes, want):
+        """The quaternion and matrix functions."""
+        if name == "quaternion":
+            want(1, 2, 4)
+            if len(a) == 4:
+                return self.combine(a)
+            if len(a) == 2:
+                return self.axis_angle(a[0], a[1])
+            v = a[0]
+            if v.type == "quaternion":
+                return v
+            if v.type == "matrix":
+                return self.gnode("quaternion", "FunctionNodeSeparateTransform", ("Translation", "Rotation", "Scale"),
+                                  1, (v,), ("Transform",))
+            v = self.conv(v, "vector")  # angle * axis in one vector
+            length = Val("float", math.hypot(*v.const)) if v.is_const else \
+                self.node("vmath", "float", (v,), op="LENGTH")
+            return self.axis_angle(length, v)
+        if name == "eulertoquaternion":
+            want(1, 2)
+            return self.euler(a[0], self.euler_order(a[1], name) if len(a) == 2 else "XYZ")
+        if name == "quaterniontoeuler":
+            want(1, 2)
+            if len(a) == 2 and self.euler_order(a[1], name) != "XYZ":
+                raise self.err("quaterniontoeuler() only gives the XYZ order (XFORM_XYZ) in Blender")
+            return self.gnode("vector", "FunctionNodeRotationToEuler", ("Euler",), 0, (self.quat(a[0], name),),
+                              ("Rotation",))
+        if name == "qrotate":
+            want(2)
+            return self.qrotate(self.quat(a[0], name), a[1])
+        if name == "qmultiply":
+            want(2)
+            return self.qmultiply(self.quat(a[0], name), self.quat(a[1], name))
+        if name == "qinvert" or (name == "invert" and a and a[0].type == "quaternion"):
+            want(1)
+            q = self.quat(a[0], name)
+            if q.is_const:
+                return Val("quaternion", _qinv(q.const))
+            return self.gnode("quaternion", "FunctionNodeInvertRotation", ("Rotation",), 0, (q,), ("Rotation",))
+        if name == "slerp":
+            want(3)
+            q1, q2 = self.quat(a[0], name), self.quat(a[1], name)
+            return self.node("mix", "quaternion", (self.conv(a[2], "float"), q1, q2), dtype="quaternion")
+        if name == "dihedral":
+            want(2)
+            v, w = self.conv(a[0], "vector"), self.conv(a[1], "vector")
+            if v.is_const and w.is_const:
+                axis = Val("vector", _cross(v.const, w.const))
+                angle = Val("float", math.atan2(math.hypot(*axis.const), sum(x * y for x, y in zip(v.const, w.const))))
+            else:
+                axis = self.node("vmath", "vector", (v, w), op="CROSS_PRODUCT")
+                angle = self.fn2("ARCTAN2", math.atan2, self.node("vmath", "float", (axis,), op="LENGTH"),
+                                 self.node("vmath", "float", (v, w), op="DOT_PRODUCT"))
+            return self.axis_angle(angle, axis)
+        if name == "ident":
+            want(0)
+            return Val("matrix", _IDENTITY)
+        if name == "maketransform":
+            want(2, 3)
+            if a[1].type == "quaternion":  # maketransform(translate, rotation, [scale])
+                return self.trs(a[0], a[1], a[2] if len(a) == 3 else Val("vector", (1.0, 1.0, 1.0)))
+            z, y = self.conv(a[0], "vector"), self.conv(a[1], "vector")  # VEX: maketransform(zaxis, yaxis, [t])
+            rot = self.gnode("quaternion", "FunctionNodeAxesToRotation", ("Rotation",), 0, (z, y),
+                             ("Primary Axis", "Secondary Axis"), props=(("primary_axis", "Z"), ("secondary_axis", "Y")))
+            return self.trs(a[2] if len(a) == 3 else Val("vector", (0.0, 0.0, 0.0)), rot, Val("vector", (1.0, 1.0, 1.0)))
+        if name == "invert":
+            want(1)
+            return self.gnode("matrix", "FunctionNodeInvertMatrix", ("Matrix", "Invertible"), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        if name == "transpose":
+            want(1)
+            return self.gnode("matrix", "FunctionNodeTransposeMatrix", ("Matrix",), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        if name == "determinant":
+            want(1)
+            return self.gnode("float", "FunctionNodeMatrixDeterminant", ("Determinant",), 0, (self.mat(a[0], name),),
+                              ("Matrix",))
+        # translate(m, t), rotate(m, angle, axis), scale(m, s): change the matrix variable, as in VEX
+        want(3 if name == "rotate" else 2)
+        m = self.mat(a[0], name)
+        target = arg_nodes[0]
+        if target.kind not in ("var", "attr"):
+            raise self.err(f"{name}()'s first argument is the matrix it changes: give it a variable name")
+        one, zero, no_turn = Val("vector", (1.0, 1.0, 1.0)), Val("vector", (0.0, 0.0, 0.0)), Val("quaternion", (0.0, 0.0, 0.0, 1.0))
+        if name == "translate":
+            step = self.trs(a[1], no_turn, one)
+        elif name == "scale":
+            step = self.trs(zero, no_turn, a[1])
+        else:
+            step = self.trs(zero, self.axis_angle(a[1], a[2]), one)
+        result = self.matmul(m, step)
+        self.assign(target, result)
+        return result
 
     # -- functions ---------------------------------------------------------
     def fn1(self, op, fn, a):
@@ -752,6 +1077,7 @@ class Compiler:
         if n > MAX_INPUT:
             raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
         self.input_number(Val("int", n), f"@opinput{n}")
+        name = ALIASES.get(name, name)
         type = BUILTINS[name][0] if name in BUILTINS else prefix_type or KNOWN_TYPES.get(name, "float")
         index = self.read_original("index", "int")
         return self.sample(n, name, type, index, self.domain)
@@ -842,8 +1168,12 @@ class Compiler:
                 return self.fn2("MINIMUM", min, self.fn2("MAXIMUM", max, a[0], a[1]), a[2])
             x, lo, hi = floats()
             return self.fold("float", lambda v, l, h: min(max(v, l), h), x, lo, hi) or self.node("clamp", "float", (x, lo, hi))
+        if name in TRANSFORM_FUNCS:
+            return self.transform_call(name, a, arg_nodes, want)
         if name in ("lerp", "mix"):
             want(3)
+            if "quaternion" in (a[0].type, a[1].type):
+                return self.transform_call("slerp", a, arg_nodes, want)
             t = "vector" if "vector" in (a[0].type, a[1].type) else "float"
             x, y, f = self.conv(a[0], t), self.conv(a[1], t), self.conv(a[2], "float")
             return self.node("mix", t, (f, x, y), dtype=t)
@@ -947,6 +1277,8 @@ class Compiler:
             return self.bbox(name, a, want)
         if name in ("length", "normalize"):
             want(1)
+            if name == "normalize" and a[0].type == "quaternion":
+                return a[0]  # Blender's rotations are always unit quaternions
             v = self.conv(a[0], "vector")
             return self.node("vmath", "float" if name == "length" else "vector", (v,), op=name.upper())
         if name in ("dot", "cross", "distance"):
@@ -955,7 +1287,7 @@ class Compiler:
             op = {"dot": "DOT_PRODUCT", "cross": "CROSS_PRODUCT", "distance": "DISTANCE"}[name]
             return self.node("vmath", "vector" if name == "cross" else "float", (v, w), op=op)
         if name == "set" or (name == "vector" and len(a) == 3):
-            want(3)
+            want(3, 4) if name == "set" else want(3)
             return self.combine(a)
         if name == "vector":
             want(1, 3)
@@ -987,6 +1319,12 @@ class Compiler:
         raise BexError(f"unknown function '{name}()'", line)
 
     # -- attributes and variables -----------------------------------------
+    def note_storage(self, e):
+        """`u@name`: a vector kept as a 2D vector attribute."""
+        storage = getattr(e, "storage", None)
+        if storage:
+            self.storage[e.name] = storage
+
     def attr_type(self, name, prefix_type):
         known = self.attr_types.get(name)
         builtin = BUILTINS.get(name)
@@ -1030,7 +1368,8 @@ class Compiler:
                 deps.append(("var", name, val))
             return val
         if name in CONSTANTS:
-            return Val("float", CONSTANTS[name])
+            c = CONSTANTS[name]
+            return Val("int" if isinstance(c, int) else "float", c)
         if self.bare_attributes:  # in the Group field a bare name is an attribute (ptnum < 5)
             return self.read_attr(name, self.attr_type(name, None))
         if name in self.loop_only:
@@ -1041,28 +1380,32 @@ class Compiler:
                            f"give it a value before the if")
         raise self.err(f"unknown variable '{name}' (give it a value first, e.g. {name} = 0)")
 
-    def component_index(self, e):
-        """`v[i]`: the component number (0-2) as an int Val; negative counts from the end."""
+    def component_index(self, e, n):
+        """`v[i]`: the component number (0 to n - 1) as an int Val; negative counts from the end."""
         i = self.conv(self.eval(e.index), "int")
         self.line = e.line
         if i.is_const:
-            if not -3 <= i.const <= 2:
-                raise self.err("component index must be 0, 1 or 2 (or -1, -2, -3)")
-            return Val("int", i.const % 3)
-        return self.arith("%", i, Val("int", 3))
+            if not -n <= i.const < n:
+                raise self.err(f"component index must be 0 to {n - 1} (or negative, from the end)")
+            return Val("int", i.const % n)
+        return self.arith("%", i, Val("int", n))
 
     def assign(self, target, val):
         if target.kind == "index":
-            cur, i = self.eval(target.obj), self.component_index(target)
+            cur = self.eval(target.obj)
+            n = self.size(cur)
+            i = self.component_index(target, n)
             if i.is_const:
                 return self.assign(N("member", target.line, obj=target.obj, comp=i.const), val)
             val = self.conv(val, "float")
-            comps = [self.select(self.compare("==", i, Val("int", c)), val, self.member(cur, c)) for c in range(3)]
+            comps = [self.select(self.compare("==", i, Val("int", c)), val, self.member(cur, c)) for c in range(n)]
             return self.assign(target.obj, self.combine(comps))
         if target.kind == "member":
             cur = self.eval(target.obj)
-            comps = [self.member(cur, i) for i in range(3)]
-            comps[target.comp] = self.conv(val, "float")
+            self.line = target.line
+            comps = [self.member(cur, i) for i in range(self.size(cur))]
+            self.member(cur, target.comp)  # checks the component exists
+            comps[target.comp % len(comps)] = self.conv(val, "float")
             return self.assign(target.obj, self.combine(comps))
         live = self._live()
         if target.kind == "var":
@@ -1074,13 +1417,17 @@ class Compiler:
             self.loop_only.pop(target.name, None)
             return
         name = target.name
+        self.note_storage(target)
         if OPINPUT_RE.match(name):
             raise self.err(f"@{name} reads another input, it cannot be written")
+        fresh = not target.type and name not in self.attr_types and name not in KNOWN_TYPES and name not in BUILTINS
         type = self.attr_type(name, target.type)
         if name in READ_ONLY:
             raise self.err(f"@{name} is read-only")
         if name == "P" and self.domain != "POINT":
             raise self.err("@P can only be written when the wrangle runs over Points")
+        if fresh and val.type != type and val.type in PREFIXES:  # @a = @P: a new attribute is a float
+            raise self.err(f"@{name} is a {type}; write {PREFIXES[val.type]}@{name} to store a {val.type}")
         val = self.conv(val, type)
         if self.frames:  # inside a call: only where the call itself runs
             live = self.logic("and", live, self.frames[-1]["live"])
@@ -1224,18 +1571,23 @@ class Compiler:
                 return self.read_opinput(int(m.group(1)), m.group(2), e.type)
             if e.name in COUNT_ATTRS:
                 return self.count(0, COUNT_ATTRS[e.name])
+            self.note_storage(e)
             return self.read_attr(e.name, self.attr_type(e.name, e.type))
         if k == "member":
             v = self.eval(e.obj)
             self.line = e.line
             return self.member(v, e.comp)
         if k == "index":
-            v, i = self.eval(e.obj), self.component_index(e)
+            v = self.eval(e.obj)
+            n = self.size(v)
+            i = self.component_index(e, n)
             if i.is_const:
                 return self.member(v, i.const)
-            comps = [self.member(v, c) for c in range(3)]
-            return self.select(self.compare("==", i, Val("int", 2)), comps[2],
-                               self.select(self.compare("==", i, Val("int", 1)), comps[1], comps[0]))
+            comps = [self.member(v, c) for c in range(n)]
+            result = comps[0]
+            for c in range(1, n):
+                result = self.select(self.compare("==", i, Val("int", c)), comps[c], result)
+            return result
         if k == "call":
             return self.call(e.name, e.args)
         if k == "unop":
@@ -1648,7 +2000,7 @@ class Compiler:
         for name, type, val in prog.writes:
             conds = [] if group is None else [group]
             val = self._peel_selection(name, type, val, conds)
-            store = Store(name, type, val, conds=conds)
+            store = Store(name, type, val, conds=conds, storage=self.storage.get(name))
             if name == "P" and "position" not in written:
                 off = self._position_offset(val)
                 if off is not None:
@@ -1871,7 +2223,8 @@ def _uses_items(val):
 def _typed_name(text):
     """`"v@vel"` -> ("vel", "vector"); `"P"` or `"@P"` -> ("P", None)."""
     prefix, _, name = text.strip().rpartition("@")
-    return name.strip(), _PREFIX_TYPES.get(prefix.strip())
+    name = name.strip()
+    return ALIASES.get(name, name), _PREFIX_TYPES.get(prefix.strip())
 
 
 def _same(a, b):

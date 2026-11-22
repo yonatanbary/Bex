@@ -1,11 +1,16 @@
 """Turns a compiled BEX `Program` into real nodes inside a geometry node group."""
 
+import mathutils
+
 from . import library
 from .lang.compiler import CHUNK_FIRST, CHUNK_GROWTH, INPUT_SOCKETS, TEMP_PREFIX, Val
 
-SOCKET_IDNAME = {"float": "NodeSocketFloat", "int": "NodeSocketInt", "vector": "NodeSocketVector", "bool": "NodeSocketBool"}
-ATTR_TYPE = {"float": "FLOAT", "int": "INT", "vector": "FLOAT_VECTOR", "bool": "BOOLEAN"}
-SOCKET_TYPE = {"float": "FLOAT", "int": "INT", "vector": "VECTOR", "bool": "BOOLEAN"}
+SOCKET_IDNAME = {"float": "NodeSocketFloat", "int": "NodeSocketInt", "vector": "NodeSocketVector", "bool": "NodeSocketBool",
+                 "quaternion": "NodeSocketRotation", "matrix": "NodeSocketMatrix"}
+ATTR_TYPE = {"float": "FLOAT", "int": "INT", "vector": "FLOAT_VECTOR", "bool": "BOOLEAN", "quaternion": "QUATERNION",
+             "matrix": "FLOAT4X4"}
+SOCKET_TYPE = {"float": "FLOAT", "int": "INT", "vector": "VECTOR", "bool": "BOOLEAN", "quaternion": "ROTATION",
+               "matrix": "MATRIX"}
 
 INPUT_NODES = {
     "position": "GeometryNodeInputPosition",
@@ -54,8 +59,13 @@ def _enabled(sockets, name):
 
 
 def _set_default(sock, const):
-    if sock.type == "VECTOR":
-        sock.default_value = const if isinstance(const, tuple) else (float(const),) * 3
+    if sock.type == "ROTATION":  # a quaternion (x, y, z, w); the socket holds Euler angles
+        x, y, z, w = const
+        sock.default_value = mathutils.Quaternion((w, x, y, z)).to_euler("XYZ")
+    elif sock.type in ("VECTOR", "RGBA"):  # also a colour or 2D vector attribute's value (alpha 1)
+        size = len(sock.default_value)
+        const = tuple(const) if isinstance(const, tuple) else (float(const),) * 3
+        sock.default_value = (const + (1.0,))[:size] if size > 3 else const[:size]
     elif sock.type == "INT":
         sock.default_value = int(const)
     elif sock.type == "BOOLEAN":
@@ -161,7 +171,12 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
     zones = {}  # repeat_in IRNode -> its Repeat Output node
 
     def connect(val, sock):
-        if val.is_const:
+        if val.is_const and val.type == "matrix":  # a matrix socket has no value of its own
+            n = new("FunctionNodeCombineMatrix")
+            for s, c in zip(n.inputs, val.const):
+                s.default_value = c
+            links.new(n.outputs[0], sock)
+        elif val.is_const:
             _set_default(sock, val.const)
         elif (val.node, val.out) in captured:
             links.new(captured[(val.node, val.out)], sock)
@@ -284,8 +299,9 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             if "geo" in p:
                 links.new(geometry(p["geo"][1]), n.inputs[p["geo"][0]])
             implicit = p.get("implicit", ())
-            for name, v in zip(p["ins"], ins):
-                (connect_field if name in implicit else connect)(v, _enabled(n.inputs, name)[0])
+            for name, v in zip(p["ins"], ins):  # a socket name, or its number when names repeat
+                sock = n.inputs[name] if isinstance(name, int) else _enabled(n.inputs, name)[0]
+                (connect_field if name in implicit else connect)(v, sock)
             return [_enabled(n.outputs, name)[0] for name in p["outs"]]
         if kind == "group":  # a library node group (library.py); geometry comes from the input
             d = library.GROUPS[p["name"]]
@@ -535,7 +551,7 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
                 connect_field(st.value, n.inputs["Position"])
         else:
             n = new("GeometryNodeStoreNamedAttribute")
-            n.data_type = ATTR_TYPE[st.type]
+            n.data_type = st.storage or ATTR_TYPE[st.type]
             n.domain = domain
             n.inputs["Name"].default_value = st.name
             n.label = "@" + st.name
@@ -631,6 +647,9 @@ BUTTON_ROWS = {
     "FunctionNodeInputBool": 1,
     "ShaderNodeValue": 1,
     "GeometryNodeProximity": 1,
+    "FunctionNodeRotateRotation": 1,
+    "FunctionNodeAxesToRotation": 2,
+    "FunctionNodeCombineMatrix": 0,
     "GeometryNodeRaycast": 2,  # data type, and the Interpolation menu
     "GeometryNodeSampleNearestSurface": 1,
     "FunctionNodeCombineColor": 1,
@@ -647,7 +666,7 @@ def estimate_height(node):
             h += SOCKET_ROW
     for s in node.inputs:
         if s.enabled and not s.hide:
-            expanded = s.type == "VECTOR" and not s.is_linked and not s.hide_value
+            expanded = s.type in ("VECTOR", "ROTATION") and not s.is_linked and not s.hide_value
             h += SOCKET_ROW * (4 if expanded else 1)
     return h + 10.0
 

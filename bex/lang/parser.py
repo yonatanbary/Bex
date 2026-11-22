@@ -4,9 +4,9 @@ import re
 
 from .lexer import BexError, tokenize
 
-TYPES = ("float", "int", "vector", "bool")
+TYPES = ("float", "int", "vector", "bool", "quaternion", "matrix")
 ASSIGN_OPS = ("=", "+=", "-=", "*=", "/=", "%=", "//=", "**=")
-COMPONENTS = {"x": 0, "y": 1, "z": 2, "r": 0, "g": 1, "b": 2}
+COMPONENTS = {"x": 0, "y": 1, "z": 2, "w": 3, "r": 0, "g": 1, "b": 2}
 COMPARE_OPS = ("<", "<=", ">", ">=", "==", "!=")
 KEYWORDS = ("if", "elif", "else", "for", "in", "while", "pass", "and", "or", "not", "True", "False",
             "break", "continue", "def", "return", "import", "from", "class", "lambda")
@@ -261,23 +261,23 @@ class Parser:
             if self.at("."):
                 line = self.next().line
                 name = self.next()
-                if name.kind == "num" and name.val in (0, 1, 2):  # @P.1 == @P.y == @P[1]
+                if name.kind == "num" and name.val in (0, 1, 2, 3):  # @P.1 == @P.y == @P[1]
                     comp = name.val
                 elif name.kind == "ident" and name.val in COMPONENTS:
                     comp = COMPONENTS[name.val]
                 else:
-                    raise BexError("expected a component (.x .y .z, .r .g .b or .0 .1 .2)", line)
+                    raise BexError("expected a component (.x .y .z .w, .r .g .b or .0 .1 .2 .3)", line)
                 e = N("member", line, obj=e, comp=comp)
             elif self.at("["):
                 line = self.next().line
                 idx = self.expr()
                 self.expect("]")
                 lit = idx.a if idx.kind == "unop" and idx.op == "-" else idx
-                if lit.kind == "num":  # v[1], v[-1]: a fixed component
+                if lit.kind == "num":  # v[1], v[-1]: a fixed component (the compiler checks the size)
                     k = -lit.value if lit is not idx else lit.value
-                    if not isinstance(k, int) or not -3 <= k <= 2:
-                        raise BexError("component index must be 0, 1 or 2 (or -1, -2, -3)", line)
-                    e = N("member", line, obj=e, comp=k % 3)
+                    if not isinstance(k, int) or not -4 <= k <= 3:
+                        raise BexError("component index must be 0, 1, 2 (3 for a quaternion), or negative", line)
+                    e = N("member", line, obj=e, comp=k)
                 else:  # v[i]: chosen when the script runs
                     e = N("index", line, obj=e, index=idx)
             else:
@@ -336,13 +336,13 @@ class Parser:
             return N("str", t.line, value=t.val)
         if t.kind == "attr":
             self.next()
-            name, type = t.val
+            name, type, storage = t.val
             if name.startswith(GROUP_PREFIX) and len(name) > len(GROUP_PREFIX):
                 # Houdini spelling: @group_top is the boolean attribute "top".
                 if type not in (None, "bool"):
                     raise BexError(f"@{name} is a group, i.e. a bool attribute", t.line)
                 name, type = name[len(GROUP_PREFIX):], "bool"
-            return N("attr", t.line, name=name, type=type)
+            return N("attr", t.line, name=name, type=type, storage=storage)
         if t.kind == "ident":
             if t.val in ("True", "False"):
                 self.next()
@@ -367,8 +367,9 @@ class Parser:
             self.expect(close)
             if t.val == "(" and len(items) == 1:
                 return items[0]
-            if len(items) != 3:
-                raise BexError("a vector needs three components: (x, y, z)", t.line)
+            if len(items) not in (3, 4):
+                raise BexError("a vector needs three components: (x, y, z) (a quaternion four: (x, y, z, w))",
+                               t.line)
             return N("call", t.line, name="set", args=items)
         self.next()
         raise BexError(f"unexpected {self._text(t)}", t.line)

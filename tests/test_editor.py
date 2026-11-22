@@ -499,7 +499,7 @@ def test_every_function_has_a_signature():
     from bex.lang.compiler import FUNCTION_NAMES, SIGNATURES
     assert set(SIGNATURES) == FUNCTION_NAMES, set(SIGNATURES) ^ FUNCTION_NAMES
     for name, (params, summary) in SIGNATURES.items():
-        assert params and summary.endswith("."), name
+        assert (params or name == "ident") and summary.endswith("."), name
 
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]

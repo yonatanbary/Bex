@@ -91,8 +91,8 @@ def test_variables_like_python():
     assert w["a"].node.kind == "switch"
     fails("if @P.x > 0:\n    y = 2\n@a = y", "only set in one branch", 3)
     # the type follows the value; an annotation converts
-    w = writes("x = 1\nx = x / 2\n@a = x\nn: int = 2.7\ni@n = n\nv: vector = 1\nv@v = v")
-    assert w["a"].const == 0.5 and w["n"].const == 2 and w["v"].const == (1.0, 1.0, 1.0)
+    w = writes("x = 1\nx = x / 2\n@a = x\nn: int = 2.7\ni@n = n\nv: vector = 1\nv@w = v")
+    assert w["a"].const == 0.5 and w["n"].const == 2 and w["w"].const == (1.0, 1.0, 1.0)
     fails("x += 1", "unknown variable 'x'")
 
 
@@ -423,7 +423,7 @@ def test_bbox_and_mapping():
 def test_errors():
     fails("@a = 1 2", "end of the line", 1)
     fails("@a = 1\n@b = foo(2)", "unknown function", 2)
-    fails("@a = @P", "vector as float")
+    fails("@a = @P", "write v@a to store a vector")
     fails("@N = (0, 0, 1)", "read-only")
     fails("@P = (0, 0, 1)", "Points", domain="FACE")
     fails("v@a = 1; f@a = 2", "cannot be used as float")
@@ -705,6 +705,74 @@ def _ir_nodes(p):
         stack.extend(v.node for v in n.inputs if v.node is not None)
         stack.extend(x for x in n.params.values() if hasattr(x, "kind"))
     return list(seen.values())
+
+
+def test_rotations_and_matrices():
+    from lang.compiler import _mat_point, _mat_trs, _qaxis, _qmul, _qrotate
+    # quaternions are (x, y, z, w) like Houdini's orient; constants fold and are unit length
+    w = writes("q = (0, 0, 0, 2)\np@a = q\nf@w = q.w\nf@x = q[0]\nf@last = q[-1]\nq.x = 1\np@b = q")
+    assert w["a"].const == (0.0, 0.0, 0.0, 1.0) and w["w"].const == 1.0 and w["x"].const == 0.0
+    assert w["last"].const == 1.0
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["b"].const, (math.sqrt(0.5), 0, 0, math.sqrt(0.5))))
+    # v * q turns v; q1 * q2 turns by q2 first (Hamilton product, as qmultiply)
+    quarter = _qaxis((0, 0, 1), math.pi / 2)
+    w = writes("q = quaternion(PI / 2, (0, 0, 1))\nv@a = (1, 0, 0) * q\nv@b = q * (1, 0, 0)\n"
+               "v@c = qrotate(q, (1, 0, 0))\np@d = q * quaternion(PI / 2, (1, 0, 0))\np@e = qinvert(q)")
+    for name in "abc":
+        assert all(abs(c - e) < 1e-9 for c, e in zip(w[name].const, (0, 1, 0))), (name, w[name].const)
+    assert w["d"].const == _qmul(quarter, _qaxis((1, 0, 0), math.pi / 2))
+    assert all(abs(c) < 1e-9 for c in _qrotate(_qmul(w["e"].const, quarter), (1, 0, 0))[1:])
+    # Euler orders: the first axis turns first
+    w = writes("p@a = eulertoquaternion((0.1, 0.2, 0.3))\np@b = eulertoquaternion((0.1, 0.2, 0.3), XFORM_ZYX)")
+    qx, qy, qz = (_qaxis(tuple(float(i == k) for i in range(3)), a) for k, a in enumerate((0.1, 0.2, 0.3)))
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["a"].const, _qmul(qz, _qmul(qy, qx))))
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["b"].const, _qmul(qx, _qmul(qy, qz))))
+    # per element: Blender's rotation nodes, Houdini's component order mapped onto W, X, Y, Z
+    w = writes("p@orient = quaternion(@P.x, (0, 0, 1))\nf@w = @orient.w\nf@x = @orient.x\n"
+               "p@s = slerp(@orient, (0, 0, 0, 1), 0.5)\np@l = lerp(@orient, (0, 0, 0, 1), 0.5)\nv@P = @P * @orient")
+    assert w["orient"].node.params["idname"] == "FunctionNodeAxisAngleToRotation"
+    assert w["w"].node.params["idname"] == "FunctionNodeRotationToQuaternion" and w["w"].out == 0
+    assert w["x"].out == 1
+    assert w["s"].node.kind == "mix" and w["s"].node.params["dtype"] == "quaternion" and w["l"] == w["s"]
+    assert w["P"].node.params["idname"] == "FunctionNodeRotateVector"
+    w = writes("q = (@P.x, 0, 0, 1)\nf@y = q.y\nf@x = q.x")  # read back from the inputs, no node
+    assert w["y"].const == 0.0 and w["x"].node.kind == "separate"
+    # matrices: v * m transforms, m1 * m2 applies m1 first
+    w = writes("m = maketransform((1, 2, 3), quaternion(PI / 2, (0, 0, 1)), (2, 2, 2))\nv@a = (1, 0, 0) * m\n"
+               "n = ident()\ntranslate(n, (0, 0, 5))\nscale(n, (2, 2, 2))\nv@b = (1, 1, 1) * n\n"
+               "v@c = (1, 0, 0) * (m * n)")
+    assert all(abs(c - e) < 1e-9 for c, e in zip(w["a"].const, (1, 4, 3))), w["a"].const
+    assert w["b"].const == (2.0, 2.0, 12.0)  # translated, then scaled
+    trs = _mat_trs((1, 2, 3), quarter, (2, 2, 2))
+    assert w["c"].const == _mat_point(_mat_trs((0, 0, 0), (0, 0, 0, 1), (2, 2, 2)),
+                                      tuple(x + d for x, d in zip(_mat_point(trs, (1, 0, 0)), (0, 0, 5))))
+    w = writes("4@m = maketransform(@N, (0, 0, 1), @P)\np@orient = quaternion(@m)\nv@P = @P * @m\n"
+               "f@d = determinant(invert(transpose(@m)))\nm = @m\nrotate(m, 1, (0, 0, 1))\n4@m = m * @m")
+    assert w["m"].node.params["idname"] == "FunctionNodeMatrixMultiply"
+    assert w["orient"].node.params["idname"] == "FunctionNodeSeparateTransform" and w["orient"].out == 1
+    assert w["P"].node.params["idname"] == "FunctionNodeTransformPoint"
+    # types never convert by themselves
+    fails("p@q = (0, 0, 0, 1)\nf@a = @q", "cannot use a quaternion as float")
+    fails("p@q = (0, 0, 0, 1)\nx = @q + 1", "'+' doesn't work on a quaternion")
+    fails("m = ident()\nv@P = m * @P", "write the vector first")
+    fails("v@P.w = 1", "components 0 to 2")
+    fails("@q = (0, 0, 0, 1)", "write p@q to store a quaternion")
+    fails("@m = ident()", "write 4@m to store a matrix")
+    fails("translate(ident(), (1, 0, 0))", "give it a variable name")
+    fails("p@q = quaternion(1, (0, 0, 1)) == (0, 0, 0, 1)", "cannot compare quaternions")
+    fails("p@q = quaterniontoeuler((0, 0, 0, 1), XFORM_ZYX)", "only gives the XYZ order")
+
+
+def test_houdini_names_and_storage():
+    prog = compile_source("@v = (1, 2, 3)\n@pscale = 0.5\n@uv = @P\n@Cd = (1, 0, 0)\nu@st = @P\n"
+                          "f@a = point(1, \"v@v\", 0).x + @opinput1_pscale")
+    assert [n for n, _t, _v in prog.writes] == ["velocity", "radius", "UVMap", "Cd", "st", "a"]
+    assert {st.name: st.storage for st in prog.stores} == {"velocity": None, "radius": None, "UVMap": "FLOAT2",
+                                                           "Cd": "FLOAT_COLOR", "st": "FLOAT2", "a": None}
+    assert {n.params["name"] for n in _ir_nodes(prog) if n.kind == "attr"} == {"velocity", "radius"}
+    assert [t for n, t, _v in prog.writes] == ["vector", "float", "vector", "vector", "vector", "float"]
+    w = writes("p@orient = @orient * quaternion(0.1, (0, 0, 1))\n4@transform = ident()")  # known types
+    assert set(w) == {"orient", "transform"}
 
 
 if __name__ == "__main__":

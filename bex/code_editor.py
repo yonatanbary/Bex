@@ -108,7 +108,7 @@ _COLOR_OF = {
     "attr": "attr", "function": "function", "channel": "function",
     "type": "keyword", "keyword": "keyword", "operator": "dim", "punct": "dim",
 }
-_TYPE_PREFIX = {"float": "f", "int": "i", "vector": "v", "bool": "b"}
+_TYPE_PREFIX = {"float": "f", "int": "i", "vector": "v", "bool": "b", "quaternion": "p", "matrix": "4"}
 
 # Where the reserved block sits relative to the node's bottom edge. Below it come
 # the input sockets (one row each) and the node's bottom padding. Measured from

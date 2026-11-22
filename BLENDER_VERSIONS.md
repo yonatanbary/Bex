@@ -134,6 +134,11 @@ Units are node-editor units at zoom 1, before UI scale.
 | Raycast's Interpolation is a menu socket ("Interpolated" / "Nearest"), not a property | set through `menus` on the IR `node` | `compiler.query` |
 | Raycast and Sample Nearest Surface can't output the face they found | their Attribute / Value reads Face of Corner, which they evaluate on the target's corners (checked in 5.2 by `test_data_functions`) | `compiler.query` |
 | Combine Color (HSV / HSL) clamps the hue to 0–1 | a Fraction node wraps it first, like `colorsys` (which constant folding uses) | `compiler.color` |
+| A Rotation socket's own value is Euler angles, not a quaternion | constant quaternions are turned into Euler angles with `mathutils` | `builder._set_default` |
+| A Matrix socket has no value of its own | a constant matrix is a Combine Matrix node | `builder.build` (`connect`) |
+| Rotations are always unit quaternions (Quaternion to Rotation normalizes; Rotation to Quaternion may give -q); attributes store W, X, Y, Z | BEX folds constants to unit length too, and maps Houdini's x, y, z, w onto W, X, Y, Z at the node | `compiler.combine`, `compiler.member` |
+| Rotate Rotation (Global) applies Rotation, then Rotate By; Multiply Matrices is A @ B (B applies first); Axes to Rotation and Transform Point use column vectors (checked in 5.2 by `test_rotations_and_matrices`) | VEX's order (`q1 * q2` = qmultiply, `v * m1 * m2`) is mapped onto them | `compiler.qmultiply`, `compiler.matmul` |
+| Multiply Matrices' two inputs are both named "Matrix" | IR `node` inputs can be given by socket number | `builder.build` (`node`) |
 | The Mac key labelled "delete" sends `BACK_SPACE`, not `DEL` | ramp point delete is bound to both | `node.register` |
 | The Float Curve widget updates only on mouse release | moot: our ramp widget writes the curve on every move | `ramp_widget.write_curve` |
 

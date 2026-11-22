@@ -25,7 +25,7 @@ _TOKEN_RE = re.compile(
     | (?P<nl>\n)
     | (?P<comment>\#[^\n]*)
     | (?P<cont>\\[ \t\r]*\n)
-    | (?P<attr>[fivb]?@[A-Za-z_]\w*)
+    | (?P<attr>[fivbpu34]?@[A-Za-z_]\w*)
     | (?P<num>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)
     | (?P<ident>[A-Za-z_]\w*)
     | (?P<str>"[^"\n]*"|'[^'\n]*')
@@ -36,7 +36,12 @@ _TOKEN_RE = re.compile(
 )
 
 _KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "and", "or", "not", "return"})
-_PREFIX_TYPES = {"f": "float", "i": "int", "v": "vector", "b": "bool"}
+# p@ is a quaternion (Houdini's vector4 orient), 3@ / 4@ a matrix (always 4x4 in Blender),
+# u@ a vector kept as a 2D vector (Blender's UV maps).
+_PREFIX_TYPES = {"f": "float", "i": "int", "v": "vector", "b": "bool", "p": "quaternion", "3": "matrix",
+                 "4": "matrix", "u": "vector"}
+# Houdini attribute names -> the names the rest of Blender reads.
+ALIASES = {"v": "velocity", "pscale": "radius", "uv": "UVMap"}
 # TODO: s@ string attributes. Blender 5.2 and 5.3 list STRING for Store / Named Attribute
 # but refuse it, so geometry nodes can't hold text per element yet. See BLENDER_VERSIONS.md.
 
@@ -125,7 +130,8 @@ def tokenize(src):
             toks.append(Token("num", float(text) if is_float else int(text), line))
         elif kind == "attr":
             prefix, name = text.split("@")
-            toks.append(Token("attr", (name, _PREFIX_TYPES.get(prefix)), line))
+            storage = "FLOAT2" if prefix == "u" else None
+            toks.append(Token("attr", (ALIASES.get(name, name), _PREFIX_TYPES.get(prefix), storage), line))
         elif kind == "str":
             toks.append(Token("str", text[1:-1], line))
         else:

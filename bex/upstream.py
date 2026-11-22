@@ -17,6 +17,7 @@ import bpy
 _TYPES = {
     "FLOAT": "float", "INT": "int", "INT8": "int", "BOOLEAN": "bool",
     "FLOAT_VECTOR": "vector", "FLOAT_COLOR": "vector", "BYTE_COLOR": "vector", "FLOAT2": "vector",
+    "QUATERNION": "quaternion", "FLOAT4X4": "matrix",
 }
 _HIDDEN = {"position"}       # shown as the built-in @P
 CACHE_SECONDS = 0.3          # drawing asks every frame; the walk reruns at most this often

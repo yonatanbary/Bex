@@ -1443,6 +1443,86 @@ def test_data_functions():
     assert all(close(v, expected) for v in attr(mesh, "rf")), (tuple(attr(mesh, "rf")[0]), expected)
 
 
+def test_rotations_and_matrices():
+    from mathutils import Matrix, Quaternion, Vector
+    src = """
+    q = quaternion(@P.x, (0, 0, 1))
+    r = quaternion(@P.y + 0.3, (1, 0, 0))
+    p@orient = q
+    p@both = q * r                      # r first, then q
+    v@turned = (1, 0, 0) * q
+    f@qw = q.w
+    f@qx = q.x
+    p@const = quaternion(0.5, (0, 1, 0))
+    p@euler = eulertoquaternion((@P.x, @P.y, 0.4), XFORM_ZYX)
+    p@half = slerp((0, 0, 0, 1), q, 0.5)
+    m = maketransform((1, 2, 3), r, (2, 1, 1))
+    n = ident()
+    translate(n, (0, 0, @P.x))
+    v@moved = (1, 1, 0) * m * n         # m first, then n
+    4@xf = m
+    p@aim = quaternion(maketransform((1, 0, 0), (0, 0, 1)))
+    p@spin = (0, 0, 0, 1)
+    for i in range(@ptnum):
+        @spin = @spin * quaternion(0.1, (0, 0, 1))
+    v@dih = (1, 0, 0) * dihedral((1, 0, 0), @P + (0, 0, 1))
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = mesh.attributes
+    assert at["orient"].data_type == "QUATERNION" and at["xf"].data_type == "FLOAT4X4"
+
+    def same_rot(a, b):
+        return abs(abs(Quaternion(a).dot(b)) - 1) < 1e-4  # q and -q are the same rotation
+
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        q = Quaternion((0, 0, 1), x)
+        r = Quaternion((1, 0, 0), y + 0.3)
+        assert same_rot(at["orient"].data[i].value, q)
+        assert same_rot(at["both"].data[i].value, q @ r), i
+        assert close(at["turned"].data[i].vector, q @ Vector((1, 0, 0)))
+        sign = 1 if q.w >= 0 else -1  # Blender may store -q
+        assert abs(at["qw"].data[i].value * sign - q.w) < 1e-4 and abs(at["qx"].data[i].value * sign - q.x) < 1e-4
+        assert same_rot(at["const"].data[i].value, Quaternion((0, 1, 0), 0.5))
+        zyx = Quaternion((1, 0, 0), x) @ Quaternion((0, 1, 0), y) @ Quaternion((0, 0, 1), 0.4)  # Z turns first
+        assert same_rot(at["euler"].data[i].value, zyx), i
+        assert same_rot(at["half"].data[i].value, Quaternion((0, 0, 1), x / 2))
+        assert tuple(at["orient"].data[i].value)[0] == pytest_approx(q.w) or \
+            tuple(at["orient"].data[i].value)[0] == pytest_approx(-q.w)  # stored as Blender's w, x, y, z
+        m = Matrix.LocRotScale(Vector((1, 2, 3)), r, Vector((2, 1, 1)))
+        assert close(at["moved"].data[i].vector, m @ Vector((1, 1, 0)) + Vector((0, 0, x))), i
+        assert close([c for col in at["xf"].data[i].value.col for c in col], [c for col in m.col for c in col])
+        aim = Quaternion(at["aim"].data[i].value)  # local Z faces +X, local Y faces +Z
+        assert close(aim @ Vector((0, 0, 1)), (1, 0, 0)) and close(aim @ Vector((0, 1, 0)), (0, 0, 1))
+        assert same_rot(at["spin"].data[i].value, Quaternion((0, 0, 1), 0.1 * i)), i
+        target = Vector((x, y, z + 1))
+        assert close(at["dih"].data[i].vector, target.normalized()), i
+
+
+def test_houdini_names_and_storage():
+    src = """
+    @v = (1, 2, 3)
+    @pscale = 0.25
+    @uv = @P
+    @Cd = (1, 0.5, 0)
+    u@st = @P * 2
+    f@back = @v.y + @pscale
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = mesh.attributes
+    assert at["velocity"].data_type == "FLOAT_VECTOR" and at["radius"].data_type == "FLOAT"
+    assert at["UVMap"].data_type == "FLOAT2" and at["st"].data_type == "FLOAT2"
+    assert at["Cd"].data_type == "FLOAT_COLOR" and "v" not in at and "pscale" not in at
+    for i, (x, y, _z) in enumerate(original_points(obj)):
+        assert close(at["UVMap"].data[i].vector, (x, y)) and close(at["st"].data[i].vector, (2 * x, 2 * y))
+        assert close(at["Cd"].data[i].color, (1, 0.5, 0, 1))
+        assert abs(at["back"].data[i].value - 2.25) < 1e-5
+    assert node.info and "velocity" in node.info
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):
