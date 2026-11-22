@@ -908,6 +908,14 @@ def test_input_types_from_the_graph():
     assert writes('v@a = point(1, "vel", 0)')["a"].node.params["dtype"] == "float"  # no guess: a float
 
 
+def test_channel_ranges():
+    prog = compile_source('f@a = chf("amp", 1, min=0, max=10)\ni@n = chi("count", 3, min=1)')
+    assert prog.limits == {"amp": (0, 10), "count": (1, None)}
+    fails('f@a = chf("amp", 1, min=5, max=1)', "larger than")
+    fails('f@a = chf("amp", 1, low=0)', "no option 'low'")
+    fails('f@a = chf("amp", 1, min=@P.x)', "constant number")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

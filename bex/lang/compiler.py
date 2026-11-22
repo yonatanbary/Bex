@@ -77,6 +77,7 @@ class Program:
     stores: list = field(default_factory=list)  # [Store] in geometry-chain order (plan_stores)
     captures: list = field(default_factory=list)  # [(label, type, Val)] to capture on the incoming geometry
     preludes: list = field(default_factory=list)  # chunk_end IRNodes: chunked loops, run on the geometry first
+    limits: dict = field(default_factory=dict)  # ch*() name -> (min, max) of its slider, from min= / max=
     geo_ops: list = field(default_factory=list)  # [GeoOp]: added / removed elements, writes to other elements
 
 
@@ -382,7 +383,7 @@ SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemi
 # Built-in functions that take keyword options: name -> allowed keywords
 FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
 KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
-            "curlnoise": NOISE_OPTS, **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
+            "curlnoise": NOISE_OPTS, "chf": ("min", "max"), "chi": ("min", "max"), "chv": ("min", "max"), **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
 # Making and removing elements, writing to other elements (Compiler.geo_call)
 GEO_FUNCS = ("addpoint", "addprim", "addvertex", "removepoint", "removeprim", "setpointattrib", "setprimattrib",
              "setpointgroup", "setprimgroup", "setvertexattrib", "setdetailattrib")
@@ -553,7 +554,7 @@ SIGNATURES = {
     "sample_circle_edge_uniform": (("u",), "A point on the unit circle on the XY plane; u is a random number."),
     "sample_direction_cone": (("center", "angle", "u"), "A direction at most angle (radians) away from center."),
     # Node values
-    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed."),
+    "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed. min= / max= set its range."),
     "chi": (("name", "[default]"), "A whole number value on the node."),
     "chv": (("name", "[default]"), "A vector value on the node."),
     "chb": (("name", "[default]"), "A checkbox on the node."),
@@ -633,6 +634,7 @@ class Compiler:
         self.pending_line = pending_line
         self.known_params = frozenset(known_params)
         self.pending = []
+        self.limits = {}
         self.reads = []  # (name, type) read from the incoming geometry, first-read order
         self.cse = {}  # (kind, params, inputs) -> IRNode
         self.vars = {}  # variable name -> Val (Python-style: one flat namespace)
@@ -1627,8 +1629,17 @@ class Compiler:
         index = self.read_original("index", "int")
         return self.sample(n, name, type, index, self.domain)
 
-    def channel(self, name, args):
+    def channel(self, name, args, kw=None):
         type = CHANNELS[name]
+        for key, v in (kw or {}).items():
+            if isinstance(v, str) or not v.is_const or v.type not in ("int", "float"):
+                raise self.err(f"{name}()'s {key}= is a constant number")
+        if kw and args and args[0].kind == "str":
+            label = args[0].value.strip()
+            lo, hi = (kw[k].const if k in kw else None for k in ("min", "max"))
+            if lo is not None and hi is not None and lo > hi:
+                raise self.err(f"{name}(): min= is larger than max=")
+            self.limits[label] = (lo, hi)
         if not args or args[0].kind != "str":
             raise self.err(f'{name}() needs a name in quotes, e.g. {name}("amount")')
         label = args[0].value.strip()
@@ -1685,7 +1696,7 @@ class Compiler:
             kw[k.name] = k.value.value if k.value.kind == "str" else self.eval(k.value)
         arg_nodes = [a for a in arg_nodes if a.kind != "kwarg"]
         if name in CHANNELS:
-            return self.channel(name, arg_nodes)
+            return self.channel(name, arg_nodes, kw)
         if name in RAMPS:
             return self.ramp(name, arg_nodes)
         if name in SAMPLE_FUNCS:
@@ -2772,7 +2783,7 @@ class Compiler:
 
     _STATE = ("vars", "half_set", "loop_only", "attrs", "attr_types", "written", "params", "ramps",
               "reads", "pending", "inputs", "cse", "preludes", "closures", "call_counts", "calls",
-              "loop_count", "warnings", "geo_ops", "geo_counts", "prim_kinds")
+              "loop_count", "warnings", "geo_ops", "geo_counts", "prim_kinds", "limits")
 
     def _snapshot(self):
         """Copies of everything running statements can change (see _restore)."""
@@ -2786,7 +2797,7 @@ class Compiler:
         prog = Program(params=[(name, t, d) for name, (t, d) in self.params.items()], pending=list(self.pending),
                        ramps=list(self.ramps), shared_ramps={r for r, ps in self.ramps.items() if len(ps) > 1},
                        reads=list(self.reads), inputs=sorted(self.inputs), preludes=list(self.preludes),
-                       geo_ops=list(self.geo_ops))
+                       geo_ops=list(self.geo_ops), limits=dict(self.limits))
         for name in self.written:
             type, val = self.attr_types[name], self.attrs[name]
             if val != self.read_original(name, type):  # `@P = @P;` writes nothing

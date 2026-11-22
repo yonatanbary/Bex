@@ -505,6 +505,13 @@ def test_code_box_scrolls():
     assert not ce.scroll_code(short, None, wheel("WHEELDOWNMOUSE"))
 
 
+def test_channel_ranges():
+    obj, node, _ = make_setup('@P.z = chf("amp", 1, min=0, max=10)')
+    assert node.error == "", node.error
+    item = next(i for i in node.node_tree.interface.items_tree if getattr(i, "name", "") == "amp")
+    assert (item.min_value, item.max_value) == (0, 10)
+
+
 def test_channels_are_properties():
     obj, node, text = make_setup('@P.z = chf("amp", 0.5)')
     sock = node.inputs["amp"]

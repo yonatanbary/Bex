@@ -124,6 +124,14 @@ def sync_interface(tree, program, keep_stale=False):
             item = iface.new_socket(name, in_out="INPUT", socket_type=SOCKET_IDNAME[type])
             item.default_value = default
             created.append((name, default))
+    limits = getattr(program, "limits", {})
+    for name, type, _ in program.params:  # chf("amp", 1, min=0, max=10): the slider's range
+        item = find("INPUT", name)
+        if item is not None and hasattr(item, "min_value"):
+            lo, hi = limits.get(name, (None, None))
+            big = 2147483647 if type == "int" else 3.4028234663852886e38
+            item.min_value = lo if lo is not None else -big
+            item.max_value = hi if hi is not None else big
     for item in sockets():
         if item.in_out == "INPUT" and item.socket_type != geometry:
             item.hide_value = True
