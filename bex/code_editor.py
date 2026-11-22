@@ -12,6 +12,7 @@ compiler's `pending_line`). The inputs appear once the cursor leaves the line
 """
 
 import json
+import re
 from collections import namedtuple
 import sys
 import textwrap
@@ -658,14 +659,25 @@ def _draw_node(node, region, vx, vy):
     if first <= current < last:
         y_top = top - (current - first) * line_h
         _rect(x0, y_top - line_h, gutter_r, y_top, PALETTE["gutter_current"])
+    bad = error_row(node)  # the line the error is about: a red mark in the gutter
+    if bad is not None and first <= bad < last:
+        y_top = top - (bad - first) * line_h
+        _rect(x0, y_top - line_h, x0 + max(2, round(3 * px)), y_top, PALETTE["error"])
     blf.size(FONT_ID, font_px)
     for row in range(first, last):
         number = str(row + 1)
         y = top - (row - first + 1) * line_h + descent
-        blf.color(FONT_ID, *_ink(PALETTE["line_number_current" if row == current else "line_number"]))
+        ink = "error" if row == bad else "line_number_current" if row == current else "line_number"
+        blf.color(FONT_ID, *_ink(PALETTE[ink]))
         _text(gutter_r - (GUTTER_PAD + len(number)) * char_w, y, number, char_w, step)
     _draw_bars(node, region, outer, lines, view, editing)
     outline()
+
+
+def error_row(node):
+    """0-based row of the line `node.error` names ("line 3: ..."), or None."""
+    m = re.match(r"line (\d+):", node.error or "")
+    return int(m.group(1)) - 1 if m else None
 
 
 def _free_x(area, region):
