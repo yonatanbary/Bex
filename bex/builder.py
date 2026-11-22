@@ -302,7 +302,9 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             for name, v in zip(p["ins"], ins):  # a socket name, or its number when names repeat
                 sock = n.inputs[name] if isinstance(name, int) else _enabled(n.inputs, name)[0]
                 (connect_field if name in implicit else connect)(v, sock)
-            return [_enabled(n.outputs, name)[0] for name in p["outs"]]
+            # an output this node's settings hide is listed too, so indexes stay put
+            return [(_enabled(n.outputs, name) or [o for o in n.outputs if o.name == name] or [None])[0]
+                    for name in p["outs"]]
         if kind == "group":  # a library node group (library.py); geometry comes from the input
             d = library.GROUPS[p["name"]]
             n = new("GeometryNodeGroup")
@@ -367,13 +369,6 @@ def build(tree, program, domain, keep_stale=False, ramps=None):
             links.new(closure.outputs[0], ev.inputs[0])
             connect(ins[0], ev.inputs[1])
             return [ev.outputs[0]]
-        if kind == "noise":
-            n = new("ShaderNodeTexNoise")
-            n.noise_dimensions = "3D"
-            n.inputs["Scale"].default_value = 1.0
-            n.inputs["Detail"].default_value = 0.0
-            connect_field(ins[0], n.inputs["Vector"])
-            return [n.outputs[0], n.outputs[1]]
         if kind == "white_noise":
             n = new("ShaderNodeTexWhiteNoise")
             n.noise_dimensions = p["dims"]
@@ -630,6 +625,8 @@ BUTTON_ROWS = {
     "ShaderNodeClamp": 1,
     "ShaderNodeTexNoise": 3,
     "ShaderNodeTexWhiteNoise": 1,
+    "ShaderNodeTexVoronoi": 4,
+    "ShaderNodeTexGabor": 1,
     "GeometryNodeInputNamedAttribute": 1,
     "GeometryNodeStoreNamedAttribute": 2,
     "GeometryNodeCaptureAttribute": 1,

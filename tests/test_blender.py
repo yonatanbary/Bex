@@ -1523,6 +1523,53 @@ def test_houdini_names_and_storage():
     assert node.info and "velocity" in node.info
 
 
+def test_noise_family():
+    src = """
+    p = @P * 1.3 + (0.1, 0.2, 0.3)
+    f@a = noise(p, freq=2, amp=3, octaves=3)
+    f@a1 = noise(p, freq=2, octaves=3)
+    f@b = snoise(p)
+    f@b1 = noise(p)
+    v@c = curlnoise(p, freq=2)
+    h = 0.005
+    def d(axis, comp):
+        e = (0, 0, 0)
+        e[axis] = h
+        return (vnoise(p + e, 0, freq=2)[comp] - vnoise(p - e, 0, freq=2)[comp]) / (2 * h)
+    v@c1 = (d(1, 2) - d(2, 1), d(2, 0) - d(0, 2), d(0, 1) - d(1, 0))
+    f@w = wnoise(p * 3, s, f1, f2)
+    f@f1 = f1
+    f@f2 = f2
+    i@seed = s
+    v@cell = voronoicell(p * 3)
+    f@g = gabor(p, freq=3, stripes=4)
+    v@dir = sample_direction_uniform(vrand(@ptnum))
+    v@cone = sample_direction_cone((0, 1, 0), 0.3, vrand(@ptnum))
+    v@ball = sample_sphere_uniform(vrand(@ptnum))
+    f@r2 = rand(@ptnum, 3)
+    f@r4 = rand(@P, 3)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    at = lambda n: attr(mesh, n)  # noqa: E731
+    for a, a1 in zip(at("a"), at("a1")):
+        assert abs(a - 3 * a1) < 1e-4
+    for b, b1 in zip(at("b"), at("b1")):
+        assert abs(b - (2 * b1 - 1)) < 1e-4
+    for c, c1 in zip(at("c"), at("c1")):
+        assert close(c, c1, 1e-2), (c, c1)
+    assert len({round(c[0], 4) for c in at("c")}) > 5  # not constant
+    for w, f1, f2 in zip(at("w"), at("f1"), at("f2")):
+        assert w == f1 and 0 <= f1 <= f2 < 2
+    assert len(set(at("seed"))) > 3 and len({c for c in at("cell")}) > 3
+    assert all(math.isfinite(g) for g in at("g")) and len(set(at("g"))) > 3
+    for d, c, b in zip(at("dir"), at("cone"), at("ball")):
+        assert abs(math.hypot(*d) - 1) < 1e-4 and abs(math.hypot(*c) - 1) < 1e-4
+        assert c[1] >= math.cos(0.3) - 1e-4 and math.hypot(*b) <= 1 + 1e-4
+    assert len(set(at("r2"))) > 20 and len(set(at("r4"))) > 20
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

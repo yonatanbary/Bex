@@ -775,6 +775,36 @@ def test_houdini_names_and_storage():
     assert set(w) == {"orient", "transform"}
 
 
+def test_noise_family():
+    prog = compile_source('f@a = noise(@P, @Time, freq=4, octaves=3, amp=2)\nf@b = snoise(@P)\n'
+                          'f@c = ridgednoise(@P, gain=2, ridge=0.5)\nv@d = curlnoise(@P, freq=2)\n'
+                          'f@e = voronoi(@P, metric="manhattan", jitter=0.5)\nv@f = voronoicell(@P)\n'
+                          'f@g = wnoise(@P, s, f1, f2)\ni@h = s\nf@k = f2 - f1\nf@m = gabor(@P, stripes=4)\n'
+                          'f@n = nrandom(@ptnum)\nf@o = rand(@ptnum, 7)\nv@q = sample_direction_uniform(vrand(@ptnum))\n'
+                          'v@r = sample_direction_cone((0, 0, 1), 0.3, vrand(@ptnum))')
+    w = {n: v for n, _t, v in prog.writes}
+    noise = w["a"].node.inputs[0].node  # amp multiplies the texture
+    assert noise.params["idname"] == "ShaderNodeTexNoise" and ("noise_dimensions", "4D") in noise.params["props"]
+    ins = dict(zip(noise.params["ins"], noise.inputs))
+    assert ins["Scale"].const == 4.0 and ins["Detail"].const == 2.0  # octaves 3 = Detail 2
+    assert ("noise_type", "RIDGED_MULTIFRACTAL") in w["c"].node.params["props"]
+    assert dict(zip(w["c"].node.params["ins"], w["c"].node.inputs))["Gain"].const == 2.0
+    assert w["d"].node.kind == "group" and w["d"].node.params["name"] == "curl"
+    assert ("distance", "MANHATTAN") in w["e"].node.params["props"]
+    assert w["f"].node.params["outs"][w["f"].out] == "Color"
+    assert w["h"].type == "int" and w["k"].node.kind == "math"
+    assert w["m"].node.params["idname"] == "ShaderNodeTexGabor"
+    assert w["o"].node.params["idname"] == "ShaderNodeTexWhiteNoise"
+    c = writes("v@a = sample_sphere_uniform((1, 0.25, 1))\nv@b = sample_circle_edge_uniform(0.25)")
+    assert all(abs(x - y) < 1e-6 for x, y in zip(c["a"].const, (0.0, 0.0, -1.0)))
+    assert all(abs(x - y) < 1e-6 for x, y in zip(c["b"].const, (0.0, 1.0, 0.0)))
+    fails("f@a = noise(@P, frq=2)", "no option 'frq'")
+    fails("f@a = sin(@P.x, freq=2)", "takes no keyword arguments")
+    fails('f@a = voronoi(@P, metric="taxi")', "metric= is one of")
+    fails("f@a = noise(@P, freq=1, freq=2)", "twice")
+    fails("f@a = noise(@P, ridge=1)", "no option 'ridge'")
+
+
 if __name__ == "__main__":
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_")]
     for name, fn in tests:

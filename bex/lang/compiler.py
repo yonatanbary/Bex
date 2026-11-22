@@ -341,6 +341,26 @@ NODE_OUTS = {
 TRANSFORM_FUNCS = ("quaternion", "eulertoquaternion", "quaterniontoeuler", "qrotate", "qmultiply", "qinvert",
                    "slerp", "dihedral", "ident", "maketransform", "invert", "transpose", "determinant",
                    "translate", "rotate", "scale")
+# Noise (Compiler.noise_call). name -> Noise Texture type; every one takes the NOISE_OPTS keywords.
+NOISE_FUNCS = {"noise": "FBM", "vnoise": "FBM", "snoise": "FBM", "flownoise": "FBM",
+               "ridgednoise": "RIDGED_MULTIFRACTAL", "hybridnoise": "HYBRID_MULTIFRACTAL",
+               "heteronoise": "HETERO_TERRAIN", "multinoise": "MULTIFRACTAL"}
+NOISE_OPTS = ("freq", "offset", "amp", "octaves", "rough", "lacunarity", "distortion")
+FRACTAL_OPTS = ("gain", "ridge")  # the multifractal types' Gain and Offset
+# Voronoi: name -> (feature, output). wnoise() also fills seed, f1, f2 out arguments, like VEX.
+VORONOI_FUNCS = {"voronoi": ("F1", "Distance"), "voronoif2": ("F2", "Distance"),
+                 "voronoiedge": ("DISTANCE_TO_EDGE", "Distance"), "voronoicell": ("F1", "Color"),
+                 "voronoipos": ("F1", "Position"), "wnoise": ("F1", "Distance")}
+VORONOI_OPTS = ("freq", "offset", "amp", "jitter", "metric", "exponent", "octaves", "rough", "lacunarity")
+VORONOI_METRICS = {"euclidean": "EUCLIDEAN", "manhattan": "MANHATTAN", "chebyshev": "CHEBYCHEV",
+                   "chebychev": "CHEBYCHEV", "minkowski": "MINKOWSKI"}
+GABOR_OPTS = ("freq", "offset", "amp", "stripes", "anisotropy", "direction")
+SAMPLE_DIRS = ("sample_direction_uniform", "sample_sphere_uniform", "sample_hemisphere",
+               "sample_circle_uniform", "sample_circle_edge_uniform", "sample_direction_cone")
+# Built-in functions that take keyword options: name -> allowed keywords
+FRACTAL_SOCKETS = {"RIDGED_MULTIFRACTAL": FRACTAL_OPTS, "HYBRID_MULTIFRACTAL": FRACTAL_OPTS, "HETERO_TERRAIN": ("ridge",)}
+KEYWORDS = {**{n: NOISE_OPTS + FRACTAL_SOCKETS.get(t, ()) for n, t in NOISE_FUNCS.items()},
+            "curlnoise": NOISE_OPTS, **{n: VORONOI_OPTS for n in VORONOI_FUNCS}, "gabor": GABOR_OPTS}
 COLOR_MODES = {"hsvtorgb": "HSV", "rgbtohsv": "HSV", "hsltorgb": "HSL", "rgbtohsl": "HSL"}
 LUMINANCE = (0.2126, 0.7152, 0.0722)  # Rec. 709, for linear colours
 # Socket names count from 1 like a wrangle's inputs: input 1 is the socket "Input 2".
@@ -353,8 +373,8 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "noise", "vnoise", "rand", "vrand", "smooth", "smootherstep", "wrap", "range",
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
-    "luminance", "blackbody",
-}) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
+    "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
+}) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
 # BEX forms, not VEX: no types or overloads; an optional parameter is "[name]".
@@ -452,10 +472,35 @@ SIGNATURES = {
     "rotate": (("m", "angle", "axis"), "Turns the matrix variable m, after what it does."),
     "scale": (("m", "size"), "Scales the matrix variable m, after what it does."),
     # Noise and random
-    "noise": (("position",), "Smooth noise, roughly between 0 and 1."),
-    "vnoise": (("position",), "Smooth noise as a vector, one value per axis."),
-    "rand": (("seed",), "Random number between 0 and 1. Same seed, same number."),
-    "vrand": (("seed",), "Random vector, each axis between 0 and 1."),
+    "noise": (("position", "[time]"), "Smooth noise, about 0 to 1. Options: freq=, offset=, amp=, octaves=, "
+                                     "rough=, lacunarity=, distortion=."),
+    "vnoise": (("position", "[time]"), "Smooth noise as a vector, one value per axis. Same options as noise()."),
+    "snoise": (("position", "[time]"), "Signed noise, about -1 to 1. Same options as noise()."),
+    "flownoise": (("position", "flow"), "Noise that changes smoothly as flow changes. Same options as noise()."),
+    "ridgednoise": (("position", "[time]"), "Ridged multifractal noise: sharp creases. noise() options, plus gain=, ridge=."),
+    "hybridnoise": (("position", "[time]"), "Hybrid multifractal noise. noise() options, plus gain=, ridge=."),
+    "heteronoise": (("position", "[time]"), "Hetero terrain noise: smooth valleys, rough peaks. noise() options, plus ridge=."),
+    "multinoise": (("position", "[time]"), "Multifractal noise. Same options as noise()."),
+    "curlnoise": (("position", "[time]"), "A swirling vector field with no sources or sinks, for flows. "
+                                         "Same options as noise()."),
+    "voronoi": (("position", "[time]"), "Distance to the nearest cell point. Options: freq=, offset=, amp=, jitter=, "
+                                       'metric="euclidean", exponent=, octaves=, rough=, lacunarity=.'),
+    "voronoif2": (("position", "[time]"), "Distance to the second nearest cell point. Same options as voronoi()."),
+    "voronoiedge": (("position", "[time]"), "Distance to the nearest cell edge. Same options as voronoi()."),
+    "voronoicell": (("position", "[time]"), "A random colour per cell. Same options as voronoi()."),
+    "voronoipos": (("position", "[time]"), "Position of the nearest cell point. Same options as voronoi()."),
+    "wnoise": (("position", "[seed]", "[f1]", "[f2]"),
+               "Worley noise: the nearest distance. Variables as seed, f1, f2 get the cell number and both distances."),
+    "gabor": (("position",), "Gabor noise: stripes in random patches. Options: freq=, stripes=, anisotropy=, direction=, amp=."),
+    "rand": (("seed", "[seed2]"), "Random number between 0 and 1. Same seed, same number."),
+    "vrand": (("seed", "[seed2]"), "Random vector, each axis between 0 and 1."),
+    "nrandom": (("seed",), "Random number with a normal (bell curve) spread: mean 0, deviation 1."),
+    "sample_direction_uniform": (("u",), "A direction (length 1), spread evenly; u is a random vector."),
+    "sample_sphere_uniform": (("u",), "A point inside the unit sphere, spread evenly; u is a random vector."),
+    "sample_hemisphere": (("[normal]", "u"), "A direction on the half sphere around normal (default up)."),
+    "sample_circle_uniform": (("u",), "A point inside the unit circle on the XY plane."),
+    "sample_circle_edge_uniform": (("u",), "A point on the unit circle on the XY plane; u is a random number."),
+    "sample_direction_cone": (("center", "angle", "u"), "A direction at most angle (radians) away from center."),
     # Node values
     "chf": (("name", "[default]"), "A float value on the node, set by hand or keyframed."),
     "chi": (("name", "[default]"), "A whole number value on the node."),
@@ -1073,6 +1118,140 @@ class Compiler:
         return self.combine([self.gnode("float", "FunctionNodeSeparateColor", ("Red", "Green", "Blue"), i, (v,),
                                         ("Color",), props=(("mode", mode),)) for i in range(3)])
 
+    # -- noise ---------------------------------------------------------------
+    def call_val(self, name, *vals):
+        """A built-in function called with values that are already computed."""
+        return self.call(name, [N("val", self.line, val=v) for v in vals])
+
+    def _opt(self, kw, key, default, type="float"):
+        v = kw.get(key)
+        if isinstance(v, str):
+            raise self.err(f"{key}= takes a number, not text")
+        return self.conv(v, type) if v is not None else Val(type, default)
+
+    def _noise_pos(self, a, kw):
+        """The position (moved by offset=) and, with a second argument, the 4D time."""
+        p = self.conv(a[0], "vector")
+        if "offset" in kw:
+            p = self.arith("+", p, self._opt(kw, "offset", (0.0, 0.0, 0.0), "vector"))
+        if len(a) > 1:
+            return [p, self.conv(a[1], "float")], ["Vector", "W"], "4D"
+        return [p], ["Vector"], "3D"
+
+    def _amp(self, v, kw):
+        return self.arith("*", v, kw["amp"]) if "amp" in kw else v
+
+    def noise_call(self, name, a, kw):
+        """noise() and its family: one Noise Texture. octaves=N is Blender's Detail N - 1."""
+        ins, socks, dims = self._noise_pos(a, kw)
+        octaves = self.arith("-", self._opt(kw, "octaves", 1.0), Val("float", 1.0))
+        ins += [self._opt(kw, "freq", 1.0), octaves, self._opt(kw, "rough", 0.5), self._opt(kw, "lacunarity", 2.0),
+                self._opt(kw, "distortion", 0.0)]
+        socks += ["Scale", "Detail", "Roughness", "Lacunarity", "Distortion"]
+        for key, sock, default in (("ridge", "Offset", 0.0), ("gain", "Gain", 1.0)):
+            if key in KEYWORDS.get(name, ()):  # only the multifractal types have these sockets
+                ins.append(self._opt(kw, key, default))
+                socks.append(sock)
+        if name == "curlnoise":
+            if dims == "3D":
+                ins.insert(1, Val("float", 0.0))
+            return self._amp(self.node("group", "vector", tuple(ins[:7]), name="curl"), kw)
+        vector = name == "vnoise"
+        v = self.gnode("vector" if vector else "float", "ShaderNodeTexNoise", ("Factor", "Color"), int(vector),
+                       ins, socks, props=(("noise_dimensions", dims), ("noise_type", NOISE_FUNCS[name])),
+                       implicit=("Vector",))
+        if name == "snoise":
+            v = self.arith("*", self.arith("-", v, Val("float", 0.5)), Val("float", 2.0))
+        return self._amp(v, kw)
+
+    def _voronoi_node(self, a, kw, feature, out):
+        ins, socks, dims = self._noise_pos(a, kw)
+        octaves = self.arith("-", self._opt(kw, "octaves", 1.0), Val("float", 1.0))
+        ins += [self._opt(kw, "freq", 1.0), octaves, self._opt(kw, "rough", 0.5), self._opt(kw, "lacunarity", 2.0),
+                self._opt(kw, "jitter", 1.0)]
+        socks += ["Scale", "Detail", "Roughness", "Lacunarity", "Randomness"]
+        metric = kw.get("metric", "euclidean")
+        if not isinstance(metric, str) or metric.lower() not in VORONOI_METRICS:
+            raise self.err('metric= is one of "euclidean", "manhattan", "chebyshev", "minkowski"')
+        if VORONOI_METRICS[metric.lower()] == "MINKOWSKI":
+            ins.append(self._opt(kw, "exponent", 0.5))
+            socks.append("Exponent")
+        outs = ("Distance", "Color", "Position", "W", "Radius")
+        type = "float" if out == "Distance" else "vector"
+        return self.gnode(type, "ShaderNodeTexVoronoi", outs, outs.index(out), ins, socks,
+                          props=(("voronoi_dimensions", dims), ("feature", feature),
+                                 ("distance", VORONOI_METRICS[metric.lower()])), implicit=("Vector",))
+
+    def voronoi(self, name, a, kw):
+        feature, out = VORONOI_FUNCS[name]
+        return self._amp(self._voronoi_node(a, kw, feature, out), kw)
+
+    def wnoise(self, args, kw):
+        """VEX's wnoise(p, seed, f1, f2): the nearest distance, filling the out arguments."""
+        if not 1 <= len(args) <= 4:
+            raise self.err("wnoise() takes a position, then optionally variables for seed, f1 and f2")
+        p = [self.eval(args[0])]
+        f1 = self._voronoi_node(p, kw, "F1", "Distance")
+        if len(args) > 1:  # a number per cell, from the cell's random colour
+            cell = self.member(self._voronoi_node(p, kw, "F1", "Color"), 0)
+            self.out_arg("wnoise", args[1], self.conv(self.fn1(*MATH1["floor"], self.arith(
+                "*", cell, Val("float", 16777215.0))), "int"))
+        if len(args) > 2:
+            self.out_arg("wnoise", args[2], self._amp(f1, kw))
+        if len(args) > 3:
+            self.out_arg("wnoise", args[3], self._amp(self._voronoi_node(p, kw, "F2", "Distance"), kw))
+        return self._amp(f1, kw)
+
+    def gabor(self, p, kw):
+        p = self.conv(p, "vector")
+        if "offset" in kw:
+            p = self.arith("+", p, self._opt(kw, "offset", (0.0, 0.0, 0.0), "vector"))
+        ins = [p, self._opt(kw, "freq", 1.0), self._opt(kw, "stripes", 2.0), self._opt(kw, "anisotropy", 1.0),
+               self._opt(kw, "direction", (1.0, 0.0, 0.0), "vector")]
+        v = self.gnode("float", "ShaderNodeTexGabor", ("Value", "Phase", "Intensity"), 0, ins, (0, 1, 2, 3, 5),
+                       props=(("gabor_type", "3D"),), implicit=(0,))
+        return self._amp(v, kw)
+
+    def sample_dir(self, name, a, want):
+        """VEX's sample_*(): turn random numbers 0-1 into evenly spread directions and points."""
+        f = lambda x: Val("float", x)  # noqa: E731
+        mul = lambda x, y: self.arith("*", x, y)  # noqa: E731
+        sqrt, sin, cos = (lambda x: self.fn1(*MATH1["sqrt"], x)), (lambda x: self.fn1(*MATH1["sin"], x)), \
+            (lambda x: self.fn1(*MATH1["cos"], x))
+
+        def around(z, phi):  # the unit vector at height z and angle phi around the Z axis
+            r = sqrt(self.fn2(*MATH2["max"], self.arith("-", f(1.0), mul(z, z)), f(0.0)))
+            return self.combine([mul(r, cos(phi)), mul(r, sin(phi)), z])
+
+        def turned(center, v):  # v with its Z axis turned onto center
+            q = self.call_val("dihedral", Val("vector", (0.0, 0.0, 1.0)), self.conv(center, "vector"))
+            return self.qrotate(q, v)
+
+        if name == "sample_circle_edge_uniform":
+            want(1)
+            phi = mul(self.conv(a[0], "float"), f(math.tau))
+            return self.combine([cos(phi), sin(phi), f(0.0)])
+        if name == "sample_hemisphere":
+            want(1, 2)
+            u = self.conv(a[-1], "vector")
+            v = around(self.member(u, 0), mul(self.member(u, 1), f(math.tau)))
+            return turned(a[0], v) if len(a) == 2 else v
+        if name == "sample_direction_cone":
+            want(3)
+            u = self.conv(a[2], "vector")
+            span = self.arith("-", f(1.0), cos(self.conv(a[1], "float")))
+            v = around(self.arith("-", f(1.0), mul(self.member(u, 0), span)), mul(self.member(u, 1), f(math.tau)))
+            return turned(a[0], v)
+        want(1)
+        u = self.conv(a[0], "vector")
+        if name == "sample_circle_uniform":
+            r, phi = sqrt(self.member(u, 0)), mul(self.member(u, 1), f(math.tau))
+            return self.combine([mul(r, cos(phi)), mul(r, sin(phi)), f(0.0)])
+        d = around(self.arith("-", f(1.0), mul(self.member(u, 0), f(2.0))), mul(self.member(u, 1), f(math.tau)))
+        if name == "sample_direction_uniform":
+            return d
+        return mul(d, self.fn2(*MATH2["pow"], self.member(u, 2), f(1.0 / 3.0)))  # sample_sphere_uniform
+
     def read_opinput(self, n, name, prefix_type):
         if n > MAX_INPUT:
             raise self.err(f"@opinput{n}_{name}: there are only inputs 0-{MAX_INPUT}")
@@ -1127,10 +1306,18 @@ class Compiler:
     def call(self, name, arg_nodes):
         if name in self.funcs:
             return self.call_user(name, arg_nodes)
-        kw = next((a for a in arg_nodes if a.kind == "kwarg"), None)
-        if kw is not None:
-            self.line = kw.line
-            raise self.err(f"{name}() takes no keyword arguments (only your own functions do)")
+        kw = {}
+        for k in (a for a in arg_nodes if a.kind == "kwarg"):
+            self.line = k.line
+            allowed = KEYWORDS.get(name, ())
+            if not allowed:
+                raise self.err(f"{name}() takes no keyword arguments")
+            if k.name not in allowed:
+                raise self.err(f"{name}() has no option '{k.name}'; it takes {', '.join(n + '=' for n in allowed)}")
+            if k.name in kw:
+                raise self.err(f"{name}() got {k.name}= twice")
+            kw[k.name] = k.value.value if k.value.kind == "str" else self.eval(k.value)
+        arg_nodes = [a for a in arg_nodes if a.kind != "kwarg"]
         if name in CHANNELS:
             return self.channel(name, arg_nodes)
         if name in RAMPS:
@@ -1139,6 +1326,8 @@ class Compiler:
             return self.sample_call(name, arg_nodes)
         if name in ("xyzdist", "intersect"):
             return self.query(name, arg_nodes)
+        if name == "wnoise":
+            return self.wnoise(arg_nodes, kw)
         a = [self.eval(x) for x in arg_nodes]
         line = self.line = arg_nodes[0].line if arg_nodes else self.line
 
@@ -1303,10 +1492,33 @@ class Compiler:
             if a[0].type == "float" and not a[0].is_const:
                 return self.conv(self.node("math", "float", (a[0],), op="TRUNC"), "int")
             return self.conv(a[0], "int")
-        if name in ("noise", "vnoise"):
+        if name in NOISE_FUNCS or name == "curlnoise":
+            want(2) if name == "flownoise" else want(1, 2)
+            return self.noise_call(name, a, kw)
+        if name in VORONOI_FUNCS:
+            want(1, 2)
+            return self.voronoi(name, a, kw)
+        if name == "gabor":
             want(1)
-            p = self.conv(a[0], "vector")
-            return self.node("noise", "float", (p,)) if name == "noise" else self.node("noise", "vector", (p,), out=1)
+            return self.gabor(a[0], kw)
+        if name in SAMPLE_DIRS:
+            return self.sample_dir(name, a, want)
+        if name == "nrandom":
+            want(1)
+            u = self.call_val("vrand", a[0])
+            r = self.fn1(*MATH1["sqrt"], self.arith("*", Val("float", -2.0), self.fn2(
+                "LOGARITHM", math.log, self.fn2(*MATH2["max"], self.member(u, 0), Val("float", 1e-7)),
+                Val("float", math.e))))
+            return self.arith("*", r, self.fn1(*MATH1["cos"], self.arith("*", self.member(u, 1), Val("float", math.tau))))
+        if name in ("rand", "vrand") and len(a) == 2:  # two seeds: 2D (two numbers) or 4D (a vector and a number)
+            if a[0].type == "vector":
+                ins, socks, dims = (a[0], self.conv(a[1], "float")), ("Vector", "W"), "4D"
+            else:
+                ins, socks, dims = (self.combine([self.conv(a[0], "float"), self.conv(a[1], "float"),
+                                                  Val("float", 0.0)]),), ("Vector",), "2D"
+            return self.gnode("float" if name == "rand" else "vector", "ShaderNodeTexWhiteNoise", ("Value", "Color"),
+                              int(name == "vrand"), ins, socks, props=(("noise_dimensions", dims),),
+                              implicit=("Vector",))
         if name in ("rand", "vrand"):
             want(1)
             if a[0].type == "vector":
@@ -1561,6 +1773,8 @@ class Compiler:
             return Val("int" if isinstance(e.value, int) else "float", e.value)
         if k == "bool":
             return Val("bool", e.value)
+        if k == "val":  # an already computed value, see call_val()
+            return e.val
         if k == "str":
             raise self.err("text can only be used as a name inside chf(), chi(), chv() or chb()")
         if k == "var":
