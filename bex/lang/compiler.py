@@ -301,7 +301,7 @@ ARITH = {
     "%": ("FLOORED_MODULO", _floor_mod),
     "**": ("POWER", _safe_pow),
 }
-CONSTANTS = {"PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
+CONSTANTS = {"E": math.e, "M_E": math.e, "PI": math.pi, "M_PI": math.pi, "pi": math.pi, "TAU": math.tau, "tau": math.tau,
              # rotation orders, as in VEX (eulertoquaternion(r, XFORM_ZYX)): the first axis turns first
              "XFORM_XYZ": 0, "XFORM_XZY": 1, "XFORM_YXZ": 2, "XFORM_YZX": 3, "XFORM_ZXY": 4, "XFORM_ZYX": 5}
 EULER_ORDERS = ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX")
@@ -392,7 +392,7 @@ FUNCTION_NAMES = frozenset(MATH1) | frozenset(MATH2) | frozenset(CHANNELS) | fro
     "nearpoint", "xyzdist", "minpos", "intersect", "primpoint", "neighbour",
     "reflect", "refract", "faceforward", "length2", "distance2", "avg", "invlerp",
     "luminance", "blackbody", "curlnoise", "gabor", "nrandom",
-    "countof", "blur", "at", "promote", "primuv", "uvsample",
+    "countof", "blur", "at", "promote", "primuv", "uvsample", "isnan", "isfinite", "len",
 }) | frozenset(AGGREGATES) | frozenset(NOISE_FUNCS) | frozenset(VORONOI_FUNCS) | frozenset(SAMPLE_DIRS) | frozenset(TRANSFORM_FUNCS) | frozenset(BBOX) | frozenset(SAMPLE_FUNCS) | frozenset(COUNT_FUNCS) | frozenset(TOPOLOGY) | frozenset(COLOR_MODES)
 
 # Signature help shown while typing a call: name -> (parameters, one-line summary).
@@ -425,8 +425,11 @@ SIGNATURES = {
     "rint": (("value",), "Same as round()."),
     "trunc": (("value",), "Cuts off the decimals."),
     "frac": (("value",), "Just the decimals: frac(2.75) is 0.75."),
-    "min": (("a", "b"), "The smaller of the two."),
-    "max": (("a", "b"), "The larger of the two."),
+    "min": (("a", "b", "[more...]"), "The smallest value. min(v) of one vector: its smallest component."),
+    "max": (("a", "b", "[more...]"), "The largest value. max(v) of one vector: its largest component."),
+    "isnan": (("value",), "True when value is not a number (0 / 0 and the like)."),
+    "isfinite": (("value",), "True for an ordinary number: not infinite, not NaN."),
+    "len": (("vector",), "Number of components: 3 for a vector, 4 for a quaternion."),
     "clamp": (("value", "min", "max"), "Keeps value between min and max."),
     "mod": (("value", "divisor"), "Remainder after division. Never negative for a positive divisor."),
     "fmod": (("value", "divisor"), "Same as mod()."),
@@ -663,7 +666,42 @@ class Compiler:
         return Val(type, r)
 
     # -- operators ---------------------------------------------------------
+    def bitop(self, op, a, b):
+        """& | ^ << >> ~ on whole numbers (Bit Math); & | ^ on bools are and / or / xor."""
+        if a.type == "bool" and b.type == "bool" and op in ("&", "|", "^"):
+            if op == "^":
+                return self.compare("!=", self.conv(a, "int"), self.conv(b, "int"))
+            return self.logic("and" if op == "&" else "or", a, b)
+        if RANK[a.type] > 1 or RANK[b.type] > 1:
+            raise self.err(f"'{op}' works on whole numbers (int), not a {a.type if RANK[a.type] > 1 else b.type}")
+        a, b = self.conv(a, "int"), self.conv(b, "int")
+        fn = {"&": lambda x, y: x & y, "|": lambda x, y: x | y, "^": lambda x, y: x ^ y,
+              "<<": lambda x, y: x << y if y >= 0 else x >> -y, ">>": lambda x, y: x >> y if y >= 0 else x << -y,
+              "~": lambda x, y: ~x}[op]
+        folded = self.fold("int", fn, a, b)
+        if folded:
+            return folded
+        if op in ("<<", ">>"):
+            shift = b if op == "<<" else self.negate(b)
+            return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a, shift), ("A", "Shift"),
+                              props=(("operation", "SHIFT"),))
+        if op == "~":
+            return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a,), ("A",), props=(("operation", "NOT"),))
+        return self.gnode("int", "FunctionNodeBitMath", ("Value",), 0, (a, b), ("A", "B"),
+                          props=(("operation", {"&": "AND", "|": "OR", "^": "XOR"}[op]),))
+
+    def items(self, e):
+        """The values of `(a, b, c)` or a vector's components (for `in`, `for ... in`, unpacking)."""
+        if e.kind == "tuple" or (e.kind == "call" and e.name == "set"):
+            return [self.eval(x) for x in (e.items if e.kind == "tuple" else e.args)]
+        v = self.eval(e)
+        if v.type not in SIZES:
+            raise self.err(f"expected several values, like (a, b) or a vector, not a {v.type}")
+        return [self.member(v, i) for i in range(SIZES[v.type])]
+
     def arith(self, op, a, b):
+        if op in ("&", "|", "^", "<<", ">>"):
+            return self.bitop(op, a, b)
         if a.type in OPAQUE or b.type in OPAQUE:
             return self.transform_arith(op, a, b)
         bop, fn = ARITH[op]
@@ -1422,6 +1460,43 @@ class Compiler:
 
         if name == "range":
             raise self.err("range() can only be used in a for-loop: for i in range(8):")
+        if name == "$pick":  # for x in (a, b, c): the item for this pass
+            i = self.conv(a[-1], "int")
+            if i.is_const:
+                return a[i.const]
+            result = a[0]
+            for c in range(1, len(a) - 1):
+                result = self.select(self.compare("==", i, Val("int", c)), a[c], result)
+            return result
+        if name == "$len":
+            if a[0].type not in SIZES:
+                raise self.err(f"a for loop goes over range(), (a, b, c) or a vector's components, not a {a[0].type}")
+            return Val("int", SIZES[a[0].type])
+        if name in ("min", "max") and len(a) != 2:  # min(a, b, c...), or of one vector's components
+            if len(a) == 1 and a[0].type == "vector":
+                a = [self.member(a[0], i) for i in range(3)]
+            if len(a) < 2:
+                raise BexError(f"{name}() takes two or more values, or one vector", line)
+            result = a[0]
+            for x in a[1:]:
+                result = self.fn2(*MATH2[name], result, x)
+            return result
+        if name in ("isnan", "isfinite"):
+            want(1)
+            x = self.conv(a[0], "float")
+            if x.is_const:
+                return Val("bool", math.isnan(x.const) if name == "isnan" else math.isfinite(x.const))
+            nan = self.not_(self.node("compare", "bool", (x, x), op="EQUAL", dtype="FLOAT"))  # NaN never equals itself
+            if name == "isnan":
+                return nan
+            big = self.node("compare", "bool", (self.fn1("ABSOLUTE", abs, x), Val("float", 3.4e38)),
+                            op="LESS_THAN", dtype="FLOAT")
+            return big  # NaN compares false too
+        if name == "len":
+            want(1)
+            if a[0].type not in SIZES:
+                raise BexError(f"len() of a {a[0].type}: only vectors and quaternions have components", line)
+            return Val("int", SIZES[a[0].type])
         if name in MATH1:
             want(1)
             return self.fn1(*MATH1[name], a[0])
@@ -1761,7 +1836,7 @@ class Compiler:
     # return under a per-element `if` works. Recursion works when it ends while
     # compiling (its condition is known then).
 
-    def call_user(self, name, arg_nodes, want_value=True):
+    def call_user(self, name, arg_nodes, want_value=True, multi=False):
         d = self.funcs[name]
         line = self.line
         values = self._bind_args(d, name, arg_nodes)
@@ -1776,7 +1851,7 @@ class Compiler:
         # one closure per argument types, and per which arguments differ per element
         key = (name, tuple(v.type for v in args), tuple(_is_field(v) for v in args))
         recursive = any(f["name"] == name for f in self.frames)
-        if want_value and not recursive and not all(v.is_const for v in args):
+        if want_value and not multi and not recursive and not all(v.is_const for v in args):
             self.call_counts[key] = self.call_counts.get(key, 0) + 1
             if key in self.closure_keys:
                 out = self._find_closure(d, key)
@@ -1788,7 +1863,11 @@ class Compiler:
         self.line = line
         if not want_value:
             return None
-        return self._result(d, name, result, returned, has_value)
+        result = self._result(d, name, result, returned, has_value)
+        if isinstance(result, list) != multi:
+            raise self.err(f"{name}() returns {len(result)} values: unpack them, e.g. a, b = {name}(...)"
+                           if isinstance(result, list) else f"{name}() returns one value, not several")
+        return result
 
     def _bind_args(self, d, name, arg_nodes):
         names = [p for p, _ in d.params]
@@ -1821,9 +1900,14 @@ class Compiler:
         self.frames.append({"name": d.name, "live": live, "value": False,
                             "globals": self.frames[0]["globals"] if self.frames else self.vars})
         self.vars = dict(values, **{"$returned": Val("bool", False), "$ret": Val("bool", False)})
+        arity = _tuple_arity(d.body)
+        for n in range(arity):  # return a, b: one hidden variable per value
+            self.vars[f"$ret{n}"] = Val("bool", False)
         self.loops, self.half_set, self.loop_only = [], {}, {}
         self.exec(d.body)
         result, returned = self.vars["$ret"], self.vars["$returned"]
+        if arity:
+            result = [self.vars[f"$ret{n}"] for n in range(arity)]
         frame = self.frames.pop()
         self.vars, self.loops, self.half_set, self.loop_only = caller
         return result, returned, frame["value"]
@@ -1863,7 +1947,7 @@ class Compiler:
         result, returned, has_value = self._run_body(d, values, Val("bool", True))
         deps = self.reading.pop()
         self.line = line
-        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]):
+        if self.attrs != saved["attrs"] or len(self.preludes) != len(saved["preludes"]) or isinstance(result, list):
             self._restore(saved)
             return None, None
         result = self._result(d, name, result, returned, has_value)
@@ -1880,6 +1964,14 @@ class Compiler:
             return Val("bool", e.value)
         if k == "val":  # an already computed value, see call_val()
             return e.val
+        if k == "tuple":
+            raise self.err("several values in brackets are only for: x in (a, b), for x in (a, b), a, b = ... "
+                           "(a vector needs three components: (x, y, z); a quaternion four)")
+        if k == "swizzle":  # v.zyx; two components give a vector with z = 0
+            v = self.eval(e.obj)
+            self.line = e.line
+            comps = [self.member(v, c) for c in e.comps]
+            return self.combine(comps + [Val("float", 0.0)] * (len(comps) == 2))
         if k == "str":
             raise self.err("text can only be used as a name inside chf(), chi(), chv() or chb()")
         if k == "var":
@@ -1913,17 +2005,27 @@ class Compiler:
             a = self.eval(e.a)
             self.line = e.line
             if e.op == "-":
-                return self.negate(a)  # else: not
+                return self.negate(a)
+            if e.op == "~":
+                return self.bitop("~", a, a)
             return self.not_(a)
         if k == "ternary":
             cond = self.conv(self.eval(e.cond), "bool")
             a, b = self.eval(e.a), self.eval(e.b)
             self.line = e.line
             return self.select(cond, a, b)
+        if k == "binop" and e.op in ("in", "not in"):
+            a = self.eval(e.a)
+            items = self.items(e.b)
+            self.line = e.line
+            found = Val("bool", False)
+            for item in items:
+                found = self.logic("or", found, self.compare("==", a, item))
+            return self.not_(found) if e.op == "not in" else found
         if k == "binop":
             a, b = self.eval(e.a), self.eval(e.b)
             self.line = e.line
-            if e.op in ARITH:
+            if e.op in ARITH or e.op in ("&", "|", "^", "<<", ">>"):
                 return self.arith(e.op, a, b)
             if e.op in COMPARE:
                 return self.compare(e.op, a, b)
@@ -1942,6 +2044,17 @@ class Compiler:
         if k == "block":
             for child in s.body:
                 self.exec(child)
+        elif k == "assign" and s.target.kind == "tuple":  # a, b = b, a: every value first, then the targets
+            n = len(s.target.items)
+            if s.value.kind == "call" and s.value.name in self.funcs:
+                vals = self.call_user(s.value.name, s.value.args, multi=True)
+            else:
+                vals = self.items(s.value)
+            self.line = s.line
+            if len(vals) != n:
+                raise self.err(f"{n} names but {len(vals)} values")
+            for t, v in zip(s.target.items, vals):
+                self.assign(t, v)
         elif k == "assign":
             val = self.eval(s.value)
             if s.op != "=":
@@ -1971,7 +2084,18 @@ class Compiler:
             self.stmt_line = s.line
             if not self.frames:
                 raise self.err("'return' can only be used inside a function (def)")
-            if s.value is not None:
+            if s.value is not None and s.value.kind == "tuple":  # return a, b
+                vals = [self.eval(x) for x in s.value.items]
+                self.line = s.line
+                arity = self.frames[-1].get("arity")
+                if self.frames[-1]["value"] and arity != len(vals):
+                    raise self.err("every return of a function has to give the same number of values")
+                for n, val in enumerate(vals):
+                    self.assign(N("var", s.line, name=f"$ret{n}"), val)
+                self.frames[-1]["value"], self.frames[-1]["arity"] = True, len(vals)
+            elif s.value is not None:
+                if self.frames[-1].get("arity"):
+                    raise self.err("every return of a function has to give the same number of values")
                 val = self.eval(s.value)
                 self.line = s.line
                 self.assign(N("var", s.line, name="$ret"), val)
@@ -2418,6 +2542,10 @@ def _assigned(body, brk=None, cont=None, outer=()):
     names, attrs = set(), {}
 
     def target(t):
+        if t.kind == "tuple":
+            for item in t.items:
+                target(item)
+            return
         while t.kind in ("member", "index"):
             t = t.obj
         if t.kind == "var":
@@ -2433,6 +2561,8 @@ def _assigned(body, brk=None, cont=None, outer=()):
             target(s.target)
         elif k == "return":
             names.update(("$ret", "$returned", *outer))
+            if s.value is not None and s.value.kind == "tuple":
+                names.update(f"$ret{n}" for n in range(len(s.value.items)))
             if brk:
                 names.add(brk)
         elif k == "break" and not inner:
@@ -2454,6 +2584,20 @@ def _assigned(body, brk=None, cont=None, outer=()):
     walk(body, False)
     names.discard(None)
     return names, attrs
+
+
+def _tuple_arity(s):
+    """How many values `return a, b, ...` gives in this function body (0: none such)."""
+    if s is None:
+        return 0
+    if s.kind == "return":
+        return len(s.value.items) if s.value is not None and s.value.kind == "tuple" else 0
+    for child in (getattr(s, "body", None) if s.kind in ("block",) else
+                  [s.then, s.orelse] if s.kind == "if" else [s.body] if s.kind in ("for", "while") else []) or []:
+        n = _tuple_arity(child)
+        if n:
+            return n
+    return 0
 
 
 def _always_returns(s):

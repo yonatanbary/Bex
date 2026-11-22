@@ -13,7 +13,7 @@ from . import builder, code_editor, library, presets, ramp_widget
 from .lang import BexError, compile_source
 
 # Bump when the generated node layout changes, so existing nodes recompile.
-COMPILER_VERSION = 20
+COMPILER_VERSION = 21
 WATCH_INTERVAL = 1.0   # Text Editor / file check, only while a script is open or on disk
 TYPING_IDLE = 2.0      # Text Editor: a line counts as finished after this pause
 SAVED_LIMIT = 64       # remembered values of removed inputs, per node

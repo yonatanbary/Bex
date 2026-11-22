@@ -1630,6 +1630,39 @@ def test_statistics_and_lookups():
     assert set(attr(mesh, "cy")) == {1} and sorted(attr(mesh, "cp")) == list(range(6))
 
 
+def test_language_extras():
+    src = """
+    i@a = @ptnum << 2
+    i@b = @ptnum >> 1
+    i@c = (@ptnum & 3) ^ 1
+    i@n = ~@ptnum
+    b@d = @ptnum in (2, 5)
+    def mm(v):
+        if v.x > v.y:
+            return v.y, v.x
+        return v.x, v.y
+    lo, hi = mm(@P)
+    f@lo = lo
+    f@hi = hi
+    s = 0.0
+    for c in @P:
+        s += c
+    f@s = s
+    v@sw = @P.yxz
+    f@m = max(@P.x, @P.y, 0.25)
+    """
+    obj, node, _ = make_setup(src)
+    assert node.error == "", node.error
+    mesh = evaluate(obj)
+    for i, (x, y, z) in enumerate(original_points(obj)):
+        assert attr(mesh, "a")[i] == i << 2 and attr(mesh, "b")[i] == i >> 1
+        assert attr(mesh, "c")[i] == (i & 3) ^ 1 and attr(mesh, "n")[i] == ~i
+        assert attr(mesh, "d")[i] == (i in (2, 5))
+        assert abs(attr(mesh, "lo")[i] - min(x, y)) < 1e-5 and abs(attr(mesh, "hi")[i] - max(x, y)) < 1e-5
+        assert abs(attr(mesh, "s")[i] - (x + y + z)) < 1e-5 and close(attr(mesh, "sw")[i], (y, x, z))
+        assert abs(attr(mesh, "m")[i] - max(x, y, 0.25)) < 1e-5
+
+
 class pytest_approx(float):
     """A float equal to anything within `tol` (default 1e-4)."""
     def __new__(cls, value, tol=1e-4):

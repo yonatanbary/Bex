@@ -29,8 +29,9 @@ _TOKEN_RE = re.compile(
     | (?P<num>(?:\d+\.\d*|\.\d+|\d+)(?:[eE][+-]?\d+)?)
     | (?P<ident>[A-Za-z_]\w*)
     | (?P<str>"[^"\n]*"|'[^'\n]*')
-    | (?P<op>\*\*=|//=|\*\*|//|[+\-*/%]=|==|!=|<=|>=|[-+*/%<>=:;,.()\[\]])
-    | (?P<bad>&&|\|\||\+\+|!|\?|[{}]|.)
+    | (?P<cbad>&&|\|\|)
+    | (?P<op>\*\*=|//=|<<=|>>=|\*\*|//|<<|>>|[+\-*/%&|^]=|==|!=|<=|>=|[-+*/%<>=:;,.()\[\]&|^~])
+    | (?P<bad>\+\+|!|\?|[{}]|.)
     """,
     re.X,
 )
@@ -120,7 +121,7 @@ def tokenize(src):
             line += 1
         elif kind in ("ws", "comment"):
             pass
-        elif kind == "bad":
+        elif kind in ("bad", "cbad"):
             raise BexError(_HINTS.get(text, f"unexpected character {text!r}"), line)
         elif kind == "num" and _is_component(text, src, m.start(), toks):
             toks.append(Token("op", ".", line))  # @P.1 is @P[1], not @P followed by 0.1

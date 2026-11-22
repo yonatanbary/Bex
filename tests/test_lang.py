@@ -441,7 +441,7 @@ def test_errors():
     fails("@a = true", "True")
     fails("v@a = (1, 2)", "three components")
     fails("@a = range(3)", "for-loop")
-    fails("for i in (1, 2, 3):\n    pass", "range(")
+    fails("for i in 5:\n    pass", "a for loop goes over range()")
     fails("import math", "not supported")
     fails("@a = (1 +\n2", "never closed", 1)
 
@@ -819,6 +819,36 @@ def test_statistics_and_lookups():
     fails('f@p = promote(@P.x, "volume")', "promote() takes a value and a domain")
     fails("f@m = mean(quaternion(0.1, (0, 0, 1)))", "works on numbers and vectors")
     fails('v@u = primuv(1, P, 0, 0.5)', "attribute name in quotes")
+
+
+def test_language_extras():
+    w = writes("v@a = (1, 2, 3).zyx\nv@b = (1, 2, 3).xy\nf@c = min(4, 2, 8)\nf@d = max((1, 5, 2))\n"
+               "x, y = 1, 2\nx, y = y, x\nf@e = x * 10 + y\n"
+               "def split(v):\n    return v.x, v.y + 1\np, q = split((3, 4, 5))\nf@f = p * 10 + q\n"
+               "t = 0\nfor k in (1, 2, 5):\n    t += k\nf@g = t\n"
+               "u = 0\nfor c in (1, 2, 3) * 2:\n    u += c\nf@h = u\n"
+               "b@i = 3 in (1, 2, 3)\nb@j = 4 not in (1, 2, 3)\ni@k = (6 & 3) | (1 << 4) ^ 1\ni@l = ~5 >> 1\n"
+               "f@m = E\nb@n = isnan(1.0)\ni@o = len(@P)\nx2, y2, z2 = (7, 8, 9)\nf@p = z2")
+    assert w["a"].const == (3.0, 2.0, 1.0) and w["b"].const == (1.0, 2.0, 0.0)
+    assert w["c"].const == 2 and w["d"].const == 5
+    assert w["e"].const == 21 and w["f"].const == 35 and w["g"].const == 8 and w["h"].const == 12
+    assert w["i"].const is True and w["j"].const is True
+    assert w["k"].const == ((6 & 3) | (1 << 4) ^ 1) and w["l"].const == (~5 >> 1)
+    assert abs(w["m"].const - math.e) < 1e-9 and w["n"].const is False and w["o"].const == 3 and w["p"].const == 9
+    # per element
+    w = writes("i@a = @ptnum & 3\ni@b = @ptnum << 2\nb@c = @ptnum in (2, 5)\n"
+               "def mm(v):\n    if v.x > 0:\n        return v.x, v.y\n    return v.y, v.x\nlo, hi = mm(@P)\nf@d = hi\n"
+               "s = 0\nfor c in @P:\n    s += c\nf@e = s\nv@f = @P.zxy\nb@g = isfinite(@P.x)")
+    assert w["a"].node.params["idname"] == "FunctionNodeBitMath" and w["b"].node.params["props"] == (("operation", "SHIFT"),)
+    assert w["c"].node.kind == "bmath" and w["d"].node.kind == "switch" and w["e"].node.kind == "math"
+    assert w["f"].node.kind == "combine"
+    fails("a, b = 1, 2, 3", "2 names but 3 values")
+    fails("def f():\n    return 1, 2\n@a = f()", "returns 2 values")
+    fails("def f():\n    return 1\na, b = f()", "returns one value")
+    fails("x = 1, 2", "only for")
+    fails("f@a = 1.5 & 2", "works on whole numbers")
+    fails("a, b += 1", "needs a single target")
+    fails("1, 2", "do nothing")
 
 
 if __name__ == "__main__":
