@@ -42,7 +42,7 @@ _KEYWORDS = frozenset({"if", "elif", "else", "for", "in", "while", "and", "or", 
 _PREFIX_TYPES = {"f": "float", "i": "int", "v": "vector", "b": "bool", "p": "quaternion", "3": "matrix",
                  "4": "matrix", "u": "vector"}
 # Houdini attribute names -> the names the rest of Blender reads.
-ALIASES = {"v": "velocity", "pscale": "radius", "uv": "UVMap"}
+ALIASES = {"v": "velocity", "uv": "UVMap"}
 # TODO: s@ string attributes. Blender 5.2 and 5.3 list STRING for Store / Named Attribute
 # but refuse it, so geometry nodes can't hold text per element yet. See BLENDER_VERSIONS.md.
 

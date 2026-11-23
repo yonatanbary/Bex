@@ -132,8 +132,142 @@ def _build_curl(tree, gin, gout):
     links.new(curl.outputs[0], gout.inputs["Curl"])
 
 
+def _build_copy_to_points(tree, gin, gout):
+    """Houdini's Copy to Points: one copy per target point, placed by its instance attributes.
+
+    Instance on Points puts the copies on the points and hands every point attribute to
+    its instance. Set Instance Transform then builds each copy's matrix from those
+    attributes, in Houdini's order (as column-vector matrices):
+
+        T(P + trans) . O . R . S . T(-pivot)
+
+    O is `orient`, else +Z turned to N (or `v` without N), keeping +Y towards `up` when
+    there is one; R is `rot`; S is `scale` times `pscale` (or `radius` with Scale by
+    Radius on: Blender fills radius on every point it makes). A `transform` attribute
+    replaces O . R . S. Missing attributes leave their part out.
+    """
+    nodes, links = tree.nodes, tree.links
+
+    def new(idname, x, y, **props):
+        n = nodes.new(idname)
+        n.location = (x, y)
+        for k, v in props.items():
+            setattr(n, k, v)
+        return n
+
+    def attr(name, data_type, y):
+        n = new("GeometryNodeInputNamedAttribute", -1400, y, data_type=data_type)
+        n.inputs["Name"].default_value = name
+        return n
+
+    def switch(input_type, cond, off, on, x, y):
+        n = new("GeometryNodeSwitch", x, y, input_type=input_type)
+        links.new(cond, n.inputs["Switch"])
+        for sock, v in ((n.inputs["False"], off), (n.inputs["True"], on)):
+            if isinstance(v, bpy.types.NodeSocket):
+                links.new(v, sock)
+            elif v is not None:
+                sock.default_value = v
+        return n.outputs[0]
+
+    def boolean(op, a, b, x, y):
+        n = new("FunctionNodeBooleanMath", x, y, operation=op)
+        links.new(a, n.inputs[0])
+        links.new(b, n.inputs[1])
+        return n.outputs[0]
+
+    # Instance on Points leaves radius behind, so it is captured on the points first
+    radius = new("GeometryNodeInputNamedAttribute", -1400, 500, data_type="FLOAT")
+    radius.inputs["Name"].default_value = "radius"
+    cap = new("GeometryNodeCaptureAttribute", -1000, 400)
+    cap.capture_items.new("FLOAT", "Radius")
+    cap.capture_items.new("BOOLEAN", "Has Radius")
+    links.new(gin.outputs["Target Points"], cap.inputs["Geometry"])
+    links.new(radius.outputs["Attribute"], cap.inputs["Radius"])
+    links.new(radius.outputs["Exists"], cap.inputs["Has Radius"])
+
+    inst = new("GeometryNodeInstanceOnPoints", -200, 300)
+    links.new(cap.outputs["Geometry"], inst.inputs["Points"])
+    links.new(gin.outputs["Selection"], inst.inputs["Selection"])
+    links.new(gin.outputs["Geometry"], inst.inputs["Instance"])
+
+    # The instance attributes, read on the instances (they carry their point's attributes).
+    n_, v_, up = attr("N", "FLOAT_VECTOR", 0), attr("v", "FLOAT_VECTOR", -160), attr("up", "FLOAT_VECTOR", -320)
+    vel = attr("velocity", "FLOAT_VECTOR", -480)  # BEX's @v, and Blender's own name for it
+    orient, rot = attr("orient", "QUATERNION", -640), attr("rot", "QUATERNION", -800)
+    scale, pscale = attr("scale", "FLOAT_VECTOR", -960), attr("pscale", "FLOAT", -1120)
+    trans, pivot = attr("trans", "FLOAT_VECTOR", -1280), attr("pivot", "FLOAT_VECTOR", -1440)
+    xform = attr("transform", "FLOAT4X4", -1600)
+
+    # O: orient, else N (or v) with up
+    has_v = boolean("OR", v_.outputs["Exists"], vel.outputs["Exists"], -1200, -200)
+    v_dir = switch("VECTOR", v_.outputs["Exists"], vel.outputs["Attribute"], v_.outputs["Attribute"], -1050, -200)
+    has_dir = boolean("OR", n_.outputs["Exists"], has_v, -1050, -60)
+    direction = switch("VECTOR", n_.outputs["Exists"], v_dir, n_.outputs["Attribute"], -900, -100)
+    turn = new("FunctionNodeAlignRotationToVector", -750, -40)  # the shortest turn of +Z onto N
+    links.new(direction, turn.inputs["Vector"])
+    axes = new("FunctionNodeAxesToRotation", -750, -220, primary_axis="Z", secondary_axis="Y")
+    links.new(direction, axes.inputs["Primary Axis"])
+    links.new(up.outputs["Attribute"], axes.inputs["Secondary Axis"])
+    aligned = switch("ROTATION", up.outputs["Exists"], turn.outputs[0], axes.outputs[0], -600, -100)
+    aligned = switch("ROTATION", has_dir, None, aligned, -450, -100)
+    o = switch("ROTATION", orient.outputs["Exists"], aligned, orient.outputs["Attribute"], -300, -300)
+    r = switch("ROTATION", rot.outputs["Exists"], None, rot.outputs["Attribute"], -300, -460)
+    o_r = new("FunctionNodeRotateRotation", -150, -360, rotation_space="LOCAL")  # O . R: rot first
+    links.new(o, o_r.inputs["Rotation"])
+    links.new(r, o_r.inputs["Rotate By"])
+
+    # S: scale * pscale
+    s = switch("VECTOR", scale.outputs["Exists"], (1.0, 1.0, 1.0), scale.outputs["Attribute"], -450, -900)
+    # Blender gives every point a radius, so it only stands in for pscale when asked to
+    use_radius = boolean("AND", gin.outputs["Scale by Radius"], cap.outputs["Has Radius"], -600, -1160)
+    ps = switch("FLOAT", use_radius, 1.0, cap.outputs["Radius"], -600, -1060)
+    ps = switch("FLOAT", pscale.outputs["Exists"], ps, pscale.outputs["Attribute"], -450, -1060)
+    s_ps = _vmath(nodes, "SCALE", -300, -950)
+    links.new(s, s_ps.inputs[0])
+    links.new(ps, s_ps.inputs["Scale"])
+
+    # T(P + trans) and T(-pivot)
+    pos = new("GeometryNodeInputPosition", -450, -1250)
+    moved = _vmath(nodes, "ADD", -300, -1250)
+    links.new(pos.outputs[0], moved.inputs[0])
+    links.new(trans.outputs["Attribute"], moved.inputs[1])
+    back = _vmath(nodes, "SCALE", -300, -1450)
+    links.new(pivot.outputs["Attribute"], back.inputs[0])
+    back.inputs["Scale"].default_value = -1.0
+    unpivot = new("FunctionNodeCombineTransform", -150, -1450)
+    links.new(back.outputs[0], unpivot.inputs["Translation"])
+
+    trs = new("FunctionNodeCombineTransform", 0, -700)  # T . O . R . S
+    links.new(moved.outputs[0], trs.inputs["Translation"])
+    links.new(o_r.outputs[0], trs.inputs["Rotation"])
+    links.new(s_ps.outputs[0], trs.inputs["Scale"])
+    place = new("FunctionNodeCombineTransform", 0, -1250)  # T alone
+    links.new(moved.outputs[0], place.inputs["Translation"])
+    t_x = new("FunctionNodeMatrixMultiply", 150, -1350)  # T . transform
+    links.new(place.outputs[0], t_x.inputs[0])
+    links.new(xform.outputs["Attribute"], t_x.inputs[1])
+    oriented = switch("MATRIX", xform.outputs["Exists"], trs.outputs[0], t_x.outputs[0], 300, -800)
+    m = switch("MATRIX", gin.outputs["Use Point Orientations"], place.outputs[0], oriented, 450, -800)
+    full = new("FunctionNodeMatrixMultiply", 600, -800)  # ... . T(-pivot)
+    links.new(m, full.inputs[0])
+    links.new(unpivot.outputs[0], full.inputs[1])
+
+    set_xform = new("GeometryNodeSetInstanceTransform", 100, 300)
+    links.new(inst.outputs[0], set_xform.inputs["Instances"])
+    links.new(full.outputs[0], set_xform.inputs["Transform"])
+    realize = new("GeometryNodeRealizeInstances", 300, 200)
+    realize.inputs["Realize All"].default_value = False  # only the copies; instances inside them stay
+    realize.inputs["Depth"].default_value = 1  # Depth counts levels realized: 0 realizes nothing
+    links.new(set_xform.outputs[0], realize.inputs["Geometry"])
+    out = switch("GEOMETRY", gin.outputs["Pack and Instance"], realize.outputs[0], set_xform.outputs[0], 500, 300)
+    links.new(out, gout.inputs["Geometry"])
+    gin.location, gout.location = (-1700, 300), (700, 300)
+
+
 VEC = "NodeSocketVector"
 FLOAT = "NodeSocketFloat"
+BOOL = "NodeSocketBool"
 
 # key -> definition. The compiler emits IR `group` nodes with these keys; output
 # order here is the IR output index.
@@ -154,6 +288,15 @@ GROUPS = {
          Socket("Detail", FLOAT), Socket("Roughness", FLOAT, default=0.5), Socket("Lacunarity", FLOAT, default=2.0),
          Socket("Distortion", FLOAT)],
         [Socket("Curl", VEC)], _build_curl, icon="FORCE_VORTEX",
+    ),
+    "copy_to_points": GroupDef(
+        "BEX Copy to Points",
+        "Copy the geometry onto each target point, placed by its attributes like Houdini "
+        "(P, orient, N, up, v, rot, scale, pscale, trans, pivot, transform)",
+        [GEOMETRY, Socket("Target Points", "NodeSocketGeometry"), Socket("Selection", BOOL, default=True),
+         Socket("Pack and Instance", BOOL, default=False), Socket("Use Point Orientations", BOOL, default=True),
+         Socket("Scale by Radius", BOOL, default=False)],
+        [GEOMETRY], _build_copy_to_points, icon="PARTICLE_POINT",
     ),
 }
 

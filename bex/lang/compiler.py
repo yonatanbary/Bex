@@ -168,7 +168,7 @@ COUNT_ATTRS = {"numpt": "POINT", "numprim": "FACE", "numvtx": "CORNER"}
 READ_ONLY = {"ptnum", "elemnum", "primnum", "curvenum", "vtxnum", "edgenum", "index", "Time", "Frame",
              "curveu", "curvelength", "tangent", "area", "island", "edgeangle", "cyclic", "curveptnum",
              "TimeInc"} | set(COUNT_ATTRS)
-KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "UVMap": "vector",
+KNOWN_TYPES = {"velocity": "vector", "Cd": "vector", "up": "vector", "radius": "float", "pscale": "float", "UVMap": "vector",
                "scale": "vector", "orient": "quaternion", "rot": "quaternion", "transform": "matrix",
                "Alpha": "float"}
 # Attributes stored as another Blender data type than their BEX type, so the rest of Blender

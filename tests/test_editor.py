@@ -14,7 +14,7 @@ sys.modules.setdefault("bex", _pkg)
 
 from bex.editor.buffer import TextBuffer  # noqa: E402
 from bex.editor.highlight import KINDS, highlight, highlight_line  # noqa: E402
-from bex.editor.complete import suggest  # noqa: E402
+from bex.editor.complete import complete, match, suggest  # noqa: E402
 from bex.editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, Clipboard, View, handle_key  # noqa: E402
 
 
@@ -446,6 +446,41 @@ def test_suggest_inline_completion():
     assert at_end("# amplitude\n@P.z = amp") == ""                    # comments don't count
     assert at_end("@P.z = 3") == "" and at_end("@P.z = ") == ""
     assert suggest(["x = amp;"], 0, 5) == ""                            # mid-word: nothing
+
+
+def test_complete_menu():
+    def names(text, **kw):
+        lines = text.split("\n")
+        comp = complete(lines, len(lines) - 1, len(lines[-1]), **kw)
+        return None if comp is None else [i.name for i in comp.items]
+
+    found = names("x = lerp")
+    assert found[0] == "lerp" and {"slerp", "invlerp"} <= set(found)   # found inside a name too
+    assert found.index("slerp") < found.index("invlerp")               # shorter first among equals
+    found = names("x = fit")
+    assert found[0] == "fit" and found[1].startswith("fit") and "efit" in found  # prefixes before the rest
+    # The script's own names come before language names of the same rank.
+    assert names("smoothie = 1\nx = smoo")[0] == "smoothie"
+    comp = complete(["def wobble(p):", "    return p", "x = wob"], 2, 7)
+    assert comp.items[0] == ("wobble", "function", (0, 1, 2)) and comp.start == 4
+    comp = complete(["x = lerp"], 0, 8)
+    kinds = {i.name: i.kind for i in comp.items}
+    assert kinds["lerp"] == "function"
+    assert {i.kind for i in complete(["x = ch"], 0, 6).items} >= {"channel"}
+    comp = complete(["@P.z = v@ve"], 0, 11, attributes=["velocity"])
+    assert comp.start == 9 and comp.items[0] == ("velocity", "attribute", (0, 1))
+    assert names("x = ") is None and names("x = ", force=True)               # Ctrl+Space lists everything
+    assert complete(["x = amp;"], 0, 5) is None and names("x = 3") is None
+    assert len(names("x = e")) <= 50
+
+
+def test_match_ranks():
+    assert match("lerp", "lerp") == (0, (0, 1, 2, 3))
+    assert match("ler", "lerp")[0] == 1
+    assert match("lerp", "slerp") == (2, (1, 2, 3, 4))
+    assert match("lrp", "lerp") == (3, (0, 2, 3))   # letters in order
+    assert match("LERP", "lerp")[0] == 0             # case is ignored
+    assert match("x", "lerp") is None and match("pl", "lerp") is None
 
 
 def test_view_follow_and_hit():
