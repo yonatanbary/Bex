@@ -10,6 +10,7 @@ import traceback
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import bex  # noqa: E402
@@ -190,6 +191,124 @@ def test_library_groups():
     assert hasattr(bpy.types, "NODE_MT_bex_library") and hasattr(bpy.ops.bex, "add_library_node")
 
 
+def _copy_setup(points, attrs, pack=False, orientations=True, selection=None, to_points=False):
+    """A mesh of `points` with `attrs` {name: (type, domain values)}; a cube (±1) copied onto them."""
+    from bex import library
+    mesh = bpy.data.meshes.new("Targets")
+    mesh.from_pydata(points, [], [])
+    for name, (dtype, values) in attrs.items():
+        a = mesh.attributes.new(name, dtype, "POINT")
+        for d, v in zip(a.data, values):
+            setattr(d, {"FLOAT": "value", "BOOLEAN": "value", "QUATERNION": "value", "FLOAT4X4": "value"}.get(dtype, "vector"), v)
+    obj = bpy.data.objects.new("Targets", mesh)
+    bpy.context.scene.collection.objects.link(obj)
+    tree = bpy.data.node_groups.new("Copy", "GeometryNodeTree")
+    tree.interface.new_socket("Geometry", in_out="INPUT", socket_type="NodeSocketGeometry")
+    tree.interface.new_socket("Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry")
+    gin, gout = tree.nodes.new("NodeGroupInput"), tree.nodes.new("NodeGroupOutput")
+    cube = tree.nodes.new("GeometryNodeMeshCube")
+    cube.inputs["Size"].default_value = (2, 2, 2)
+    copy = tree.nodes.new("GeometryNodeGroup")
+    copy.node_tree = library.ensure("copy_to_points")
+    target = gin.outputs[0]
+    if to_points:  # a point cloud: Blender gives it a radius, which must not scale the copies
+        m2p = tree.nodes.new("GeometryNodeMeshToPoints")
+        tree.links.new(target, m2p.inputs["Mesh"])
+        target = m2p.outputs[0]
+    tree.links.new(cube.outputs[0], copy.inputs["Geometry"])
+    tree.links.new(target, copy.inputs["Target Points"])
+    copy.inputs["Pack and Instance"].default_value = pack
+    copy.inputs["Use Point Orientations"].default_value = orientations
+    if selection is not None:
+        cmp = tree.nodes.new("FunctionNodeCompare")
+        cmp.data_type, cmp.operation = "INT", "LESS_THAN"
+        tree.links.new(tree.nodes.new("GeometryNodeInputIndex").outputs[0], cmp.inputs["A"])
+        cmp.inputs["B"].default_value = selection
+        tree.links.new(cmp.outputs[0], copy.inputs["Selection"])
+    tree.links.new(copy.outputs[0], gout.inputs[0])
+    obj.modifiers.new("Copy", "NODES").node_group = tree
+    return obj
+
+
+def _cube():
+    return [Vector((x, y, z)) for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)]
+
+
+def _check_copies(obj, matrices):
+    """Each copy's vertices are its matrix times the cube's, in point order."""
+    verts = [Vector(v.co) for v in evaluate(obj).vertices]
+    assert len(verts) == 8 * len(matrices), (len(verts), len(matrices))
+    for k, m in enumerate(matrices):
+        got = sorted(tuple(round(c, 3) for c in v) for v in verts[8 * k:8 * k + 8])
+        want = sorted(tuple(round(c, 3) for c in m @ v) for v in _cube())
+        assert all(close(a, b, 1e-3) for a, b in zip(got, want)), (k, got, want)
+
+
+def test_copy_to_points():
+    from mathutils import Matrix, Quaternion
+    T, S = Matrix.Translation, lambda v: Matrix.Diagonal((*v, 1))
+    pts = [(0, 0, 0), (3, 0, 0), (0, 4, 1)]
+    # no attributes: copies at P, full size, also on a point cloud whose radius is 0.05
+    _check_copies(_copy_setup(pts, {}), [T(p) for p in pts])
+    obj = _copy_setup(pts, {}, to_points=True)
+    _check_copies(obj, [T(p) for p in pts])
+    # Scale by Radius: radius stands in for pscale, but a real pscale still wins
+    obj.modifiers[0].node_group.nodes["Group"].inputs["Scale by Radius"].default_value = True
+    _check_copies(obj, [T(p) @ S((0.05,) * 3) for p in pts])
+    obj = _copy_setup(pts, {"pscale": ("FLOAT", [2, 2, 2])}, to_points=True)
+    obj.modifiers[0].node_group.nodes["Group"].inputs["Scale by Radius"].default_value = True
+    _check_copies(obj, [T(p) @ S((2,) * 3) for p in pts])
+
+    # orient, rot, scale, pscale, trans, pivot in Houdini's order: T(P+trans) O R S T(-pivot)
+    orient = [Quaternion((0, 0, 1), 0.5 * k) for k in range(3)]
+    rot = [Quaternion((1, 0, 0), 0.3 * k + 0.2) for k in range(3)]
+    scale = [(1, 2, 3), (0.5, 0.5, 2), (2, 1, 1)]
+    pscale, trans, pivot = [0.5, 2, 1], [(0, 0, 1), (1, 1, 0), (0, 0, 0)], [(1, 0, 0), (0, 0, 0), (0, 1, 1)]
+    obj = _copy_setup(pts, {"orient": ("QUATERNION", orient), "rot": ("QUATERNION", rot),
+                            "scale": ("FLOAT_VECTOR", scale), "pscale": ("FLOAT", pscale),
+                            "trans": ("FLOAT_VECTOR", trans), "pivot": ("FLOAT_VECTOR", pivot)})
+    want = [T(Vector(p) + Vector(t)) @ o.to_matrix().to_4x4() @ r.to_matrix().to_4x4() @ S(Vector(s) * ps) @ T(-Vector(pv))
+            for p, o, r, s, ps, t, pv in zip(pts, orient, rot, scale, pscale, trans, pivot)]
+    _check_copies(obj, want)
+    # Use Point Orientations off: only P, trans and pivot
+    obj.modifiers[0].node_group.nodes["Group"].inputs["Use Point Orientations"].default_value = False
+    _check_copies(obj, [T(Vector(p) + Vector(t)) @ T(-Vector(pv)) for p, t, pv in zip(pts, trans, pivot)])
+
+    # N alone: the shortest turn of +Z onto N; N with up: +Y towards up; v (velocity) stands in for N
+    normals = [(1, 0, 0), (0, 1, 1), (0, 0, 1)]
+    turn = [Vector((0, 0, 1)).rotation_difference(Vector(n)).to_matrix().to_4x4() for n in normals]
+    _check_copies(_copy_setup(pts, {"N": ("FLOAT_VECTOR", normals)}), [T(p) @ m for p, m in zip(pts, turn)])
+    _check_copies(_copy_setup(pts, {"velocity": ("FLOAT_VECTOR", normals)}), [T(p) @ m for p, m in zip(pts, turn)])
+    ups = [(0, 0, 1), (1, 0, 0), (1, 1, 0)]
+
+    def lookat(n, up):
+        z = Vector(n).normalized()
+        y = (Vector(up) - z * Vector(up).dot(z)).normalized()
+        return Matrix((y.cross(z), y, z)).transposed().to_4x4()
+    _check_copies(_copy_setup(pts, {"N": ("FLOAT_VECTOR", normals), "up": ("FLOAT_VECTOR", ups)}),
+                  [T(p) @ lookat(n, u) for p, n, u in zip(pts, normals, ups)])
+    # orient wins over N
+    _check_copies(_copy_setup(pts, {"N": ("FLOAT_VECTOR", normals), "orient": ("QUATERNION", orient)}),
+                  [T(p) @ o.to_matrix().to_4x4() for p, o in zip(pts, orient)])
+
+    # transform replaces orient, rot, scale and pscale
+    mats = [Matrix.Rotation(0.4 * k, 4, "Y") @ S((1, 1 + k, 1)) for k in range(3)]
+    obj = _copy_setup(pts, {"transform": ("FLOAT4X4", [[list(col) for col in m.col] for m in mats]),
+                            "pscale": ("FLOAT", pscale)})
+    _check_copies(obj, [T(p) @ m for p, m in zip(pts, mats)])
+
+    # target attributes reach the copies; Selection; Pack and Instance keeps instances
+    obj = _copy_setup(pts, {"heat": ("FLOAT", [1, 2, 3])}, selection=2)
+    mesh = evaluate(obj)
+    assert attr(mesh, "heat") == [1] * 8 + [2] * 8
+    obj = _copy_setup(pts, {}, pack=True)
+    deps = bpy.context.evaluated_depsgraph_get()
+    deps.update()
+    geo = obj.evaluated_get(deps).evaluated_geometry()
+    assert (geo.mesh is None or len(geo.mesh.vertices) == 0) and geo.instances_pointcloud() is not None
+    assert len(geo.instances_pointcloud().points) == 3
+
+
 def test_error_keeps_last_good_nodes():
     obj, node, text = make_setup("@P.z = 1;")
     count = len(node.node_tree.nodes)
@@ -368,8 +487,66 @@ def test_code_editor_esc_hides_signature_first():
     assert ce._session.signature() is None
     press("BACK_SPACE")                                       # back in: it shows again
     assert ce._session.signature().name == "fit"
+    assert ce._session.menu is not None                       # (and completions for "a")
+    press("ESC")                                              # Esc closes the menu first
     press("ESC")
     assert press("ESC") == {"FINISHED"} and ce._session is None  # the second Esc leaves
+
+def test_code_editor_completion_menu():
+    import types
+    from bex import code_editor as ce
+
+    obj, node, text = make_setup("@P.z = 1")
+    ce._session = ce.Session(node)
+    op = types.SimpleNamespace()
+    for name in ("_key", "_after_change", "_end"):
+        setattr(op, name, getattr(ce.BEX_OT_code_edit, name).__get__(op))
+
+    def press(key, ch="", **mods):
+        ev = types.SimpleNamespace(type=key, unicode=ch, ctrl=False, shift=False, alt=False, oskey=False)
+        for k, v in mods.items():
+            setattr(ev, k, v)
+        return op._key(bpy.context, node, ev)
+
+    def type_text(s):
+        for ch in s:
+            press(ch.upper() if ch.isalpha() else ch, ch)
+
+    s = ce._session
+    s.buf.move_doc_end()
+    press("RET")
+    type_text("x = lerp")
+    names = [i.name for i in s.menu.items]
+    assert names[0] == "lerp" and "slerp" in names and "invlerp" in names
+    assert s.suggestion == ""                       # "lerp" is already whole: no ghost text
+    press("DOWN_ARROW")
+    picked = s.selected().name
+    assert picked != "lerp" and s.buf.cursor[0] == 1  # the arrows move the highlight, not the cursor
+    press("UP_ARROW")
+    press("UP_ARROW")                               # wraps to the last entry
+    assert s.menu_index == len(names) - 1
+    press("DOWN_ARROW")
+    press("DOWN_ARROW")
+    press("RET")                                    # Enter takes the highlighted name
+    assert text.as_string() == f"@P.z = 1\nx = {picked}" and s.menu is None
+    press("BACK_SPACE")
+    assert s.menu is not None
+    assert press("ESC") is None and s.menu is None and ce._session is s  # Esc closes the menu only
+    type_text("(1, 2, 3")
+    assert s.menu is None                           # a non-word key closes it
+    s.buf.move_doc_end()                            # past the auto-closed ")"
+    press("RET")
+    type_text("y = sin")                            # an exact name: Enter breaks the line
+    if s.menu is not None:
+        assert s.selected().name == "sin"
+    press("RET")
+    assert text.as_string().endswith("\ny = sin\n")
+    press("SPACE", " ", ctrl=True)                  # Ctrl+Space: the menu with nothing typed
+    assert s.menu is not None and len(s.menu.items) > 10
+    press("ESC")
+    press("ESC")
+    assert ce._session is None
+
 
 def test_code_editor_undo_survives_refocus():
     import types
@@ -1527,9 +1704,9 @@ def test_houdini_names_and_storage():
     assert node.error == "", node.error
     mesh = evaluate(obj)
     at = mesh.attributes
-    assert at["velocity"].data_type == "FLOAT_VECTOR" and at["radius"].data_type == "FLOAT"
+    assert at["velocity"].data_type == "FLOAT_VECTOR" and at["pscale"].data_type == "FLOAT"
     assert at["UVMap"].data_type == "FLOAT2" and at["st"].data_type == "FLOAT2"
-    assert at["Cd"].data_type == "FLOAT_COLOR" and "v" not in at and "pscale" not in at
+    assert at["Cd"].data_type == "FLOAT_COLOR" and "v" not in at and "radius" not in at
     for i, (x, y, _z) in enumerate(original_points(obj)):
         assert close(at["UVMap"].data[i].vector, (x, y)) and close(at["st"].data[i].vector, (2 * x, 2 * y))
         assert close(at["Cd"].data[i].color, (1, 0.5, 0, 1))

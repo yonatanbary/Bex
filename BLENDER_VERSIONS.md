@@ -121,6 +121,9 @@ Units are node-editor units at zoom 1, before UI scale.
 |---|---|---|
 | No way to read widget positions | measured sizes (above) | `code_editor.box_rect`, `ramp_widget.ramp_rects` |
 | `layout.split` only splits by fraction | the fraction is computed from `node.width` for a fixed label column | `node._field` |
+| Instance on Points copies point attributes to the instances, but not `radius` | Copy to Points captures `radius` (and whether it exists) on the points first | `library._build_copy_to_points` |
+| Every point Blender makes has a `radius` (0.05 from Distribute Points / Mesh to Points, 0.1 from Points), so Named Attribute's Exists can't tell a set radius from the default | Copy to Points reads a real `pscale`; `radius` only behind its Scale by Radius toggle; `@pscale` is no longer an alias of `radius` | `library._build_copy_to_points`, `lexer.ALIASES` |
+| Realize Instances with Realize All off: Depth 0 realizes nothing; Depth 1 realizes one level | Copy to Points uses Depth 1, so instances inside the copied geometry stay instances | `library._build_copy_to_points` |
 | No vertical double-arrow / small fold icons built in | our own icons as previews (`icon_value`); their pixels must be **premultiplied** alpha, or transparent parts draw white | `ramp_icons.raster` |
 | `path_from_id()` can't make paths into a custom node's properties | the owner of a ramp key is found by pointer | `ramp_widget._owner` |
 | Tab only enters built-in group nodes | `bex.edit_nodes` pushes the path itself, bound to Tab | `node.py` |

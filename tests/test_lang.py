@@ -766,10 +766,10 @@ def test_rotations_and_matrices():
 def test_houdini_names_and_storage():
     prog = compile_source("@v = (1, 2, 3)\n@pscale = 0.5\n@uv = @P\n@Cd = (1, 0, 0)\nu@st = @P\n"
                           "f@a = point(1, \"v@v\", 0).x + @opinput1_pscale")
-    assert [n for n, _t, _v in prog.writes] == ["velocity", "radius", "UVMap", "Cd", "st", "a"]
-    assert {st.name: st.storage for st in prog.stores} == {"velocity": None, "radius": None, "UVMap": "FLOAT2",
+    assert [n for n, _t, _v in prog.writes] == ["velocity", "pscale", "UVMap", "Cd", "st", "a"]
+    assert {st.name: st.storage for st in prog.stores} == {"velocity": None, "pscale": None, "UVMap": "FLOAT2",
                                                            "Cd": "FLOAT_COLOR", "st": "FLOAT2", "a": None}
-    assert {n.params["name"] for n in _ir_nodes(prog) if n.kind == "attr"} == {"velocity", "radius"}
+    assert {n.params["name"] for n in _ir_nodes(prog) if n.kind == "attr"} == {"velocity", "pscale"}
     assert [t for n, t, _v in prog.writes] == ["vector", "float", "vector", "vector", "vector", "float"]
     w = writes("p@orient = @orient * quaternion(0.1, (0, 0, 1))\n4@transform = ident()")  # known types
     assert set(w) == {"orient", "transform"}
@@ -953,7 +953,7 @@ def test_review_fixes():
     w = writes("q = (0, 0, @P.x * 0, 2)\nf@w = q.w")
     assert w["w"].node.params["idname"] == "FunctionNodeRotationToQuaternion"  # normalized, like a stored one
     prog = compile_source("f@a = 1", group="pscale > 0.5")
-    assert ("radius", "float") in prog.reads and not any(n == "pscale" for n, _t in prog.reads)
+    assert ("pscale", "float") in prog.reads  # its own attribute: Blender fills radius on every point
     prog = compile_source('pr = addprim(0, "polyline")\nif @P.x > 0:\n    pr = addprim(0, "polyline")\n'
                           'addvertex(0, pr, @ptnum)')
     assert prog.geo_ops[-1].info["ptype"] == "polyline"
