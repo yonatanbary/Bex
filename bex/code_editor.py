@@ -12,6 +12,7 @@ compiler's `pending_line`). The inputs appear once the cursor leaves the line
 """
 
 import json
+import math
 import re
 from collections import namedtuple
 import sys
@@ -24,12 +25,12 @@ import gpu
 from gpu_extras.batch import batch_for_shader
 
 from .editor.buffer import TextBuffer, is_word_char
-from .editor.complete import suggest
+from .editor.complete import complete
 from .editor.highlight import highlight
 from .editor.signature import signature_at
 from .upstream import incoming_attributes
 from . import ramp_widget
-from .lang.compiler import BUILTINS
+from .lang.compiler import BUILTINS, SIGNATURES
 from .editor.keys import EXIT, ZOOM_IN, ZOOM_OUT, ZOOM_RESET, View, handle_key, thumb, thumb_first
 
 FONT_ID = 1             # Blender's built-in monospace font
@@ -83,7 +84,7 @@ PALETTE = {
     "attr": (0.96, 0.78, 0.55, 1.0),       # light orange: @attributes
     "number": (0.93, 0.58, 0.30, 1.0),     # orange
     "string": (0.55, 0.82, 0.45, 1.0),     # green
-    "function": (0.88, 0.86, 0.78, 1.0),
+    "function": (0.42, 0.73, 0.96, 1.0),   # blue: function calls
     "selection": (0.30, 0.42, 0.62, 0.55),
     "cursor": (0.90, 0.90, 0.90, 1.0),
     "ghost": (0.50, 0.50, 0.52, 0.85),
@@ -104,6 +105,17 @@ SIG_GAP = 2.0           # between the cursor line and the popup
 SIG_MARGIN = 8.0        # kept free between the popup and the region edge
 SIG_SUMMARY = 0.9       # summary font size relative to the code
 SIG_WRAP = 60           # the summary wraps after this many characters
+# The completion menu, drawn like a Blender menu (theme colours, UI font). Sizes
+# are UI units × UI scale, not zoomed with the node, like Blender's own menus.
+MENU_ROWS = 10          # visible entries; more scroll
+MENU_ROW = 20.0         # entry height (UI_UNIT_Y)
+MENU_FONT = 11.0        # Blender's widget text size
+MENU_PAD = 4.0          # around the entries
+MENU_MIN_W = 160.0
+MENU_MAX_W = 420.0
+MENU_FOOTER_LINES = 2   # a function's summary wraps onto at most this many lines
+MENU_LETTERS = {"function": "F", "channel": "P", "keyword": "K", "type": "T",
+                "constant": "C", "variable": "V", "attribute": "@"}
 _COLOR_OF = {
     "comment": "comment", "string": "string", "number": "number", "constant": "number",
     "attr": "attr", "function": "function", "channel": "function",
@@ -126,6 +138,8 @@ _highlight_cache = {}    # text -> highlighted spans
 _ratio = None            # monospace character width / font size, measured once (_char_ratio)
 _fade = 1.0              # alpha multiplier while drawing a node (MUTED_ALPHA when muted)
 _popup = None            # signature help to draw over everything, set by _draw_node
+_menu_popup = None       # completion menu anchor (x, line y0, line y1), set by _draw_node
+_menu_box = None         # the drawn completion menu, for mouse hits (see _draw_menu)
 _buffers = {}            # Text.session_uid -> TextBuffer: each script's undo history, kept between sessions
 _views = {}              # (tree name, node name) -> View: each code box's scroll, kept between sessions
 
@@ -445,7 +459,10 @@ class Session:
         self.dragging = False
         self.clicks = 0                # presses in the current multi-click run (1, 2, 3)
         self.last_press = None         # (time, x, y) of the last press, to count multi-clicks
-        self.suggestion = ""           # inline completion shown after the cursor
+        self.suggestion = ""           # ghost text after the cursor: the rest of the menu's entry
+        self.menu = None               # the completion menu (complete.Completion), or None
+        self.menu_index = 0            # its highlighted entry
+        self.menu_top = 0              # its first visible entry
         self.sig_hidden = None         # (row, col) of the call whose signature help Esc hid
         self.bar = None                # ("v" | "h", grab offset) while dragging a scrollbar
         self.repeat = None             # [axis, step, pressed, last tick, carry] while an arrow is held
@@ -472,6 +489,52 @@ class Session:
             self.sig_hidden = None
             return sig
         return None
+
+    def open_menu(self, node, force=False):
+        """List the names matching the word before the cursor (Ctrl+Space: `force`,
+        also with nothing typed). Nothing to offer, or only the word itself, closes it."""
+        incoming = [name for name, _type in incoming_attributes(node)]
+        comp = complete(self.buf.lines, *self.buf.cursor, attributes=incoming, force=force)
+        if comp is None or not comp.items or (len(comp.items) == 1 and comp.items[0].name == comp.partial):
+            self.close_menu()
+            return
+        self.menu, self.menu_index, self.menu_top = comp, 0, 0
+        self._ghost()
+
+    def close_menu(self):
+        self.menu = None
+        self.suggestion = ""
+
+    def menu_move(self, step, wrap=True):
+        """Move the highlight `step` entries, keeping it visible."""
+        n = len(self.menu.items)
+        i = self.menu_index + step
+        self.menu_index = i % n if wrap and abs(step) == 1 else min(max(i, 0), n - 1)
+        if self.menu_index < self.menu_top:
+            self.menu_top = self.menu_index
+        elif self.menu_index >= self.menu_top + MENU_ROWS:
+            self.menu_top = self.menu_index - MENU_ROWS + 1
+        self._ghost()
+
+    def menu_scroll(self, step):
+        n = len(self.menu.items)
+        self.menu_top = min(max(self.menu_top + step, 0), max(0, n - MENU_ROWS))
+
+    def selected(self):
+        return self.menu.items[self.menu_index] if self.menu else None
+
+    def _ghost(self):
+        name, partial = self.selected().name, self.menu.partial
+        self.suggestion = name[len(partial):] if name.startswith(partial) else ""
+
+    def accept(self, index=None):
+        """Replace the word being typed with the menu entry (the highlighted one)."""
+        item = self.menu.items[self.menu_index if index is None else index]
+        row, col = self.buf.cursor
+        self.buf.click(row, self.menu.start)
+        self.buf.click(row, col, select=True)
+        self.buf.insert(item.name)
+        self.close_menu()
 
     def push(self, node):
         if self.buf.text != self.written:
@@ -520,11 +583,11 @@ def _draw():
     tree = getattr(context.space_data, "edit_tree", None)
     if tree is None or tree.bl_idname != "GeometryNodeTree":
         return
-    global _popup, _fade
+    global _popup, _fade, _menu_popup, _menu_box
     gpu.state.blend_set("ALPHA")
     old_scissor = gpu.state.scissor_get()
     vx, vy = gpu.state.viewport_get()[:2]
-    _popup = None
+    _popup = _menu_popup = _menu_box = None
     try:
         for node in tree.nodes:
             if _shows_code(node):
@@ -535,6 +598,9 @@ def _draw():
         if _popup:  # after every node, so no other code box covers it
             gpu.state.scissor_test_set(False)
             _draw_signature(context.region, _free_x(context.area, context.region), *_popup)
+        if _menu_popup and _session is not None and _session.menu is not None:
+            gpu.state.scissor_test_set(False)
+            _draw_menu(context, *_menu_popup)
     finally:
         _fade = 1.0
         gpu.state.scissor_set(*old_scissor)
@@ -556,7 +622,7 @@ def _clip(region, vx, vy, x0, y0, x1, y1):
 
 
 def _draw_node(node, region, vx, vy):
-    global _popup
+    global _popup, _menu_popup
     outer = box_rect(node, region)
     ox0, oy0, ox1, _oy1, px = outer
     x0, y0, x1, y1, _ = code_rect(outer)
@@ -649,9 +715,12 @@ def _draw_node(node, region, vx, vy):
             y_top = top - (row - first) * line_h
             cx, w = round(col_x(col)), max(1, round(1.5 * px))
             _rect(cx, y_top - line_h, cx + w, y_top, PALETTE["cursor"])
-            sig = _session.signature()
-            if sig:
-                _popup = (sig, max(left, col_x(sig.col)), y_top - line_h, y_top, font_px, px)
+            if _session.menu is not None:  # the menu replaces the signature help while open
+                _menu_popup = (col_x(_session.menu.start), y_top - line_h, y_top)
+            else:
+                sig = _session.signature()
+                if sig:
+                    _popup = (sig, max(left, col_x(sig.col)), y_top - line_h, y_top, font_px, px)
     # Line numbers, painted last so code scrolled sideways slides under them.
     gutter_r = round(x0 + gutter_width(len(lines), char_w))
     _rect(x0, y0, gutter_r, y1, PALETTE["gutter"])
@@ -744,6 +813,176 @@ def _draw_signature(region, free, sig, x, line_y0, line_y1, font_px, px):
         ty -= small_h
         blf.position(FONT_ID, x0 + pad, ty + (small_h - small) * 0.5 + 0.2 * small, 0)
         blf.draw(FONT_ID, text)
+    gpu.state.blend_set("ALPHA")
+
+
+def _round_rect(x0, y0, x1, y1, radius, color, segments=4):
+    """A filled rectangle with rounded corners (a circle when it is square and
+    `radius` is half its size)."""
+    r = max(0.0, min(radius, (x1 - x0) / 2, (y1 - y0) / 2))
+    if r < 0.5:
+        _rect(x0, y0, x1, y1, color)
+        return
+    pts = []
+    for cx, cy, a0 in ((x1 - r, y1 - r, 0), (x0 + r, y1 - r, 90), (x0 + r, y0 + r, 180), (x1 - r, y0 + r, 270)):
+        for i in range(segments + 1):
+            a = math.radians(a0 + 90 * i / segments)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+    n = len(pts)
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    batch = batch_for_shader(shader, "TRIS", {"pos": [((x0 + x1) / 2, (y0 + y1) / 2)] + pts},
+                             indices=[(0, i, i % n + 1) for i in range(1, n + 1)])
+    gpu.state.blend_set("ALPHA")
+    shader.uniform_float("color", _ink(color))
+    batch.draw(shader)
+
+
+def _rgba(color, alpha=1.0):
+    c = tuple(color)
+    return c if len(c) == 4 else (*c[:3], alpha)
+
+
+def _menu_theme():
+    """The colours of Blender's menus from the user's theme (dark defaults
+    when the theme can't be read)."""
+    try:
+        ui = bpy.context.preferences.themes[0].user_interface
+        back, item = ui.wcol_menu_back, ui.wcol_menu_item
+        return {"back": _rgba(back.inner), "outline": _rgba(back.outline), "round": back.roundness,
+                "sel": _rgba(item.inner_sel), "text": _rgba(item.text), "text_sel": _rgba(item.text_sel)}
+    except (AttributeError, IndexError, TypeError):
+        return {"back": (0.09, 0.09, 0.09, 0.94), "outline": (0.0, 0.0, 0.0, 1.0), "round": 0.4,
+                "sel": (0.28, 0.45, 0.70, 1.0), "text": (0.85, 0.85, 0.85, 1.0), "text_sel": (1.0, 1.0, 1.0, 1.0)}
+
+
+def _menu_hit(x, y):
+    """For a point in the region: the index of the menu entry under it, -1 on
+    the menu but not on an entry, None off the menu."""
+    if _menu_box is None:
+        return None
+    (x0, y0, x1, y1), rows_top, row_h, first, count = _menu_box
+    if not (x0 <= x <= x1 and y0 <= y <= y1):
+        return None
+    i = int((rows_top - y) // row_h)
+    return first + i if 0 <= i < count and y <= rows_top else -1
+
+
+def _draw_menu(context, x, line_y0, line_y1):
+    """The completion menu, in the style of a Blender menu: theme colours,
+    rounded corners, a soft shadow, the UI font. Each entry has a round badge
+    with its kind's letter in its syntax colour, the name (the letters the word
+    matched brighter) and its kind on the right, greyed like a shortcut. A
+    function's signature and summary sit in a footer under the list. It opens
+    under the cursor line with the names lined up under the word, or above the
+    line when there's no room below."""
+    global _menu_box
+    region = context.region
+    menu = _session.menu
+    theme = _menu_theme()
+    ui = _ui_scale()
+    font = 0  # Blender's UI font
+    row_h, pad, size = MENU_ROW * ui, MENU_PAD * ui, MENU_FONT * ui
+    badge = round(row_h * 0.62)
+    gap = round(row_h * 0.3)
+    blf.size(font, size)
+    items, first = menu.items, _session.menu_top
+    shown = items[first:first + MENU_ROWS]
+    name_w = max(blf.dimensions(font, i.name)[0] for i in items)
+    hint_w = max(blf.dimensions(font, i.kind)[0] for i in items)
+    scroll = len(items) > MENU_ROWS
+    bar = round(4 * ui) if scroll else 0
+    width = pad + gap * 0.5 + badge + gap + name_w + 2 * gap + hint_w + gap + bar + pad
+    free_x0, free_x1 = _free_x(context.area, region)
+    margin = SIG_MARGIN * ui
+    width = min(max(width, MENU_MIN_W * ui), MENU_MAX_W * ui, free_x1 - free_x0 - 2 * margin)
+    # The footer: the highlighted function's signature and summary.
+    item = _session.selected()
+    footer = []
+    if item.kind in ("function", "channel") and item.name in SIGNATURES:
+        params, summary = SIGNATURES[item.name]
+        footer.append((f"{item.name}({', '.join(params)})", "text"))
+        avg = blf.dimensions(font, "abcdefghijklmnopqrstuvwxyz")[0] / 26 or size * 0.5
+        wrapped = textwrap.wrap(summary, max(10, int((width - 2 * pad - 2 * gap) / avg)))
+        if len(wrapped) > MENU_FOOTER_LINES:
+            wrapped = wrapped[:MENU_FOOTER_LINES]
+            wrapped[-1] = _fit(wrapped[-1] + "…", len(wrapped[-1]))
+        footer += [(line, "hint") for line in wrapped]
+    foot_h = (len(footer) * row_h * 0.85 + pad) if footer else 0
+    height = 2 * pad + len(shown) * row_h + foot_h
+    x0 = x - pad - gap * 0.5 - badge - gap  # the names line up under the word
+    x0 = max(free_x0 + margin, min(x0, free_x1 - margin - width))
+    y1 = line_y0 - 2 * ui
+    if y1 - height < margin and line_y1 + 2 * ui + height <= region.height - margin:
+        y1 = line_y1 + 2 * ui + height  # no room below: open above the line
+    y0, x1 = y1 - height, x0 + width
+    radius = theme["round"] * row_h * 0.5
+    # Shadow, then the outline and the back.
+    for k in range(1, 5):
+        s = k * ui * 1.5
+        _round_rect(x0 - s, y0 - s * 1.4, x1 + s, y1 + s * 0.4, radius + s, (0, 0, 0, 0.07))
+    edge = max(1.0, ui)
+    _round_rect(x0, y0, x1, y1, radius, theme["outline"])
+    _round_rect(x0 + edge, y0 + edge, x1 - edge, y1 - edge, max(0, radius - edge), theme["back"])
+    rows_top = y1 - pad
+    _menu_box = ((x0, y0, x1, y1), rows_top, row_h, first, len(shown))
+    text, text_sel = theme["text"], theme["text_sel"]
+    hint = (*text[:3], text[3] * 0.5)
+    for i, entry in enumerate(shown):
+        ry1 = rows_top - i * row_h
+        ry0 = ry1 - row_h
+        selected = first + i == _session.menu_index
+        if selected:
+            _round_rect(x0 + pad, ry0, x1 - pad - bar, ry1, radius * 0.8, theme["sel"])
+        bx = x0 + pad + gap * 0.5
+        by = ry0 + (row_h - badge) / 2
+        color = PALETTE["attr" if entry.kind == "attribute" else _COLOR_OF.get(entry.kind, "text")]
+        _round_rect(bx, by, bx + badge, by + badge, badge / 2, color)
+        ty = ry0 + (row_h - size) * 0.5 + 0.18 * size
+        letter = MENU_LETTERS.get(entry.kind, "?")
+        blf.size(font, size * 0.72)
+        lw, lh = blf.dimensions(font, letter)
+        blf.color(font, 0.08, 0.08, 0.09, _fade)
+        blf.position(font, bx + (badge - lw) / 2, by + (badge - lh) / 2 + 0.5, 0)
+        blf.draw(font, letter)
+        blf.size(font, size)
+        # The name: letters the word matched in full colour, the rest a little dimmer.
+        tx = bx + badge + gap
+        ink = text_sel if selected else text
+        dim = (*ink[:3], ink[3] * 0.72)
+        hits = set(entry.match)
+        limit = x1 - pad - bar - gap - hint_w - 2 * gap
+        name = entry.name
+        while name and tx + blf.dimensions(font, name)[0] > limit:
+            name = name[:-1]
+        if name != entry.name:
+            name = name[:-1] + "…"
+        for j, ch in enumerate(name):
+            blf.color(font, *(ink if j in hits and ch != "…" else dim))
+            blf.position(font, tx, ty, 0)
+            blf.draw(font, ch)
+            # Advance by the width of the text so far, so kerning stays right.
+            tx = bx + badge + gap + blf.dimensions(font, name[:j + 1])[0]
+        blf.color(font, *(((*text_sel[:3], 0.6)) if selected else hint))
+        kw = blf.dimensions(font, entry.kind)[0]
+        blf.position(font, x1 - pad - bar - gap - kw, ty, 0)
+        blf.draw(font, entry.kind)
+    if scroll:  # a thin scrollbar, like a long Blender menu's
+        track_y0, track_y1 = rows_top - len(shown) * row_h, rows_top
+        span = track_y1 - track_y0
+        h = max(span * MENU_ROWS / len(items), 8 * ui)
+        top = track_y1 - (span - h) * first / max(1, len(items) - MENU_ROWS)
+        _round_rect(x1 - pad - bar, track_y0, x1 - pad, track_y1, bar / 2, (*text[:3], 0.08))
+        _round_rect(x1 - pad - bar, top - h, x1 - pad, top, bar / 2, (*text[:3], 0.35))
+    if footer:
+        fy = rows_top - len(shown) * row_h - pad * 0.5
+        _rect(x0 + pad, fy, x1 - pad, fy + edge, (*text[:3], 0.12))
+        small = size * 0.92
+        for line, role in footer:
+            fy -= row_h * 0.85
+            blf.size(font, small if role == "hint" else size)
+            blf.color(font, *(text if role == "text" else hint))
+            blf.position(font, x0 + pad + gap, fy + (row_h * 0.85 - size) * 0.5 + 0.18 * size, 0)
+            blf.draw(font, line)
     gpu.state.blend_set("ALPHA")
 
 
@@ -900,6 +1139,22 @@ class BEX_OT_code_edit(bpy.types.Operator):
         if kind == "TIMER" and _session.repeat is not None:
             self._repeat(node, box_rect(node, context.region), event)
             return None
+        if _session.menu is not None and not _session.dragging:
+            hit = _menu_hit(x, y)
+            if hit is not None:  # the completion menu takes the mouse while over it
+                if kind == "MOUSEMOVE" and hit >= 0 and hit != _session.menu_index:
+                    _session.menu_index = hit  # hover highlights, like a Blender menu
+                    _session._ghost()
+                elif kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE"):
+                    _session.menu_scroll(-1 if kind == "WHEELUPMOUSE" else 1)
+                elif kind == "TRACKPADPAN":
+                    _session.menu_scroll(-round((event.mouse_y - event.mouse_prev_y) / (MENU_ROW * _ui_scale())) or 0)
+                elif kind == "LEFTMOUSE" and value == "PRESS" and hit >= 0:
+                    version, row_before = _session.buf.version, _session.buf.cursor[0]
+                    _session.accept(hit)
+                    self._after_change(node, version, row_before)
+                if kind in ("MOUSEMOVE", "WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN", "LEFTMOUSE"):
+                    return None
         if kind in _PASS:
             if kind in ("WHEELUPMOUSE", "WHEELDOWNMOUSE", "TRACKPADPAN"):
                 hit, _ = wrangle_at(context, x, y)
@@ -945,16 +1200,32 @@ class BEX_OT_code_edit(bpy.types.Operator):
     def _key(self, context, node, event):
         buf = _session.buf
         version, row_before = buf.version, buf.cursor[0]
+        plain = not (event.ctrl or event.oskey or event.alt or event.shift)
+        if _session.menu is not None:
+            t = event.type
+            if t == "ESC":
+                _session.close_menu()
+                return None
+            if t in ("UP_ARROW", "DOWN_ARROW") and plain:
+                _session.menu_move(-1 if t == "UP_ARROW" else 1)
+                return None
+            if t in ("PAGE_UP", "PAGE_DOWN") and plain:
+                _session.menu_move((MENU_ROWS - 1) * (-1 if t == "PAGE_UP" else 1), wrap=False)
+                return None
+            if (t == "TAB" and not event.shift) or (t in ("RET", "NUMPAD_ENTER") and plain):
+                if _session.selected().name != _session.menu.partial:
+                    _session.accept()
+                    self._after_change(node, version, row_before)
+                    return None
+                _session.close_menu()  # already the whole name: Tab indents, Enter breaks the line
+        if event.type == "SPACE" and (event.ctrl or event.oskey):
+            _session.open_menu(node, force=True)  # Ctrl+Space: the menu even with nothing typed
+            return None
         if event.type == "ESC":
             sig = _session.signature()
             if sig:  # the first Esc only hides the signature help; the next one leaves
                 _session.sig_hidden = (sig.row, sig.col)
                 return None
-        if event.type == "TAB" and not event.shift and _session.suggestion and not buf.has_selection:
-            buf.insert(_session.suggestion)  # accept the inline completion
-            _session.suggestion = ""
-            self._after_change(node, version, row_before)
-            return None
         typed = event.type == "TEXTINPUT" or (
             event.unicode and event.unicode.isprintable() and not (event.ctrl or event.oskey))
         if event.type == "TEXTINPUT":
@@ -969,14 +1240,13 @@ class BEX_OT_code_edit(bpy.types.Operator):
             )
         if done == EXIT:
             return self._end(context, node, {"FINISHED"})
-        # Typing a word character (or deleting one) asks for a fresh completion;
-        # anything else hides it.
+        # Typing a word character (or deleting one) asks for fresh completions;
+        # anything else closes the menu.
         changed = buf.version != version
         if changed and (typed and is_word_char(event.unicode[-1:]) or event.type == "BACK_SPACE"):
-            incoming = [name for name, _type in incoming_attributes(node)]
-            _session.suggestion = suggest(buf.lines, *buf.cursor, attributes=incoming)
+            _session.open_menu(node)
         else:
-            _session.suggestion = ""
+            _session.close_menu()
         if done in (ZOOM_IN, ZOOM_OUT, ZOOM_RESET):
             step = {ZOOM_IN: ZOOM_STEP, ZOOM_OUT: -ZOOM_STEP}.get(done)
             node.code_scale = 1.0 if step is None else round(node.code_scale + step, 2)
@@ -1001,7 +1271,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
         code_x = text_left(x0, len(buf.lines), char_w, px)
         row, col = _session.view.hit(mx - code_x, y1 - PAD * px - my, line_h, char_w)
         version, row_before = buf.version, buf.cursor[0]
-        _session.suggestion = ""
+        _session.close_menu()
         if drag:
             view = _session.view
             left = view.left
@@ -1064,7 +1334,7 @@ class BEX_OT_code_edit(bpy.types.Operator):
                 continue
             if bar.thumb is None:
                 return True  # nothing to scroll: the press does nothing
-            _session.suggestion = ""
+            _session.close_menu()
             step = -1 if inside(bar.minus) else 1 if inside(bar.plus) else 0
             if step:
                 _scroll_bar(view, axis, bar, step)
